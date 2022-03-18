@@ -28,5 +28,5 @@ resolver: lts-18.14
 compiler: ghc-8.10.7
 
 nix:
-  shell-file: shell-stack.nix
-  path: ["nixpkgs=./nixpkgs.nix"]
+  enable: false
+  packages: [cacert, haskell.compiler.ghc8107, z3]
