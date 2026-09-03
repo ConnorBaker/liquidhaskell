@@ -7,6 +7,7 @@
   [#1693](https://github.com/ucsd-progsys/liquidhaskell/issues/1693)
 - Make the positivity checker's variance lookup total, so a type's positivity
   verdict no longer depends on which module is being compiled
+- Restore the `--check-derived` flag, with tests
 - Reject `ple` and `automatic-instances` annotations in modules that enable
   neither `--ple-local` nor `--ple`
   [#2737](https://github.com/ucsd-progsys/liquidhaskell/issues/2737)

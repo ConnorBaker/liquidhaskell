@@ -69,7 +69,7 @@ import           Language.Haskell.Liquid.Transforms.CoreToLogic (weakenResult, r
 import           Language.Haskell.Liquid.Bare.DataType (dataConMap, makeDataConChecker)
 import Language.Haskell.Liquid.UX.Config
     ( HasConfig(getConfig),
-      Config(typeclass, extensionality,
+      Config(typeclass, checkDerived, extensionality,
              nopolyinfer, dependantCase, rankNTypes, warnOnTermHoles),
       patternFlag,
       higherOrderFlag, warnOnTermHoles )
@@ -341,7 +341,7 @@ consCBTop cfg info cgenv cb
        xs   = bindersOf cb
        tt   = trueTy (typeclass cfg) . varType
        addB γ x = tt x >>= (\t -> γ += ("derived", F.symbol x, t))
-       trustVar x = derivedVar (giSrc info) x
+       trustVar x = not (checkDerived cfg) && derivedVar (giSrc info) x
 
 consCBTop _ _ γ cb
   = do oldtcheck <- gets tcheck

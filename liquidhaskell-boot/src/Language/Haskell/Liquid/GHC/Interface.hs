@@ -69,6 +69,7 @@ import Language.Haskell.Liquid.Types.PrettyPrint
 import Language.Haskell.Liquid.Types.Specs
 import Language.Haskell.Liquid.Types.Types
 import Language.Haskell.Liquid.Types.Visitors
+import Language.Haskell.Liquid.UX.Config
 import Language.Haskell.Liquid.UX.Tidy
 
 
@@ -80,9 +81,10 @@ classCons :: Maybe [ClsInst] -> [Id]
 classCons Nothing   = []
 classCons (Just cs) = concatMap (dataConImplicitIds . head . tyConDataCons . classTyCon . is_cls) cs
 
-derivedVars :: [Ghc.SrcSpan] -> MGIModGuts -> [Var]
-derivedVars instSpans mg =
-    filter isGeneratedBinding (concatMap bindersOf (mgi_binds mg))
+derivedVars :: Config -> [Ghc.SrcSpan] -> MGIModGuts -> [Var]
+derivedVars cfg instSpans mg
+  | checkDerived cfg = []
+  | otherwise        = filter isGeneratedBinding (concatMap bindersOf (mgi_binds mg))
   where
     isGeneratedBinding v =
       let occ = Ghc.getOccName v
