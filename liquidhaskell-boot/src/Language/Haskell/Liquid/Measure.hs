@@ -137,6 +137,18 @@ makeDataConType allowTC ds
 -- | If there are any dummy symbols in the type, replace them with fresh
 -- variables.
 --
+-- Since 63ac730e5 this leans on 'subst' to do the renaming, and it renames
+-- one binder fewer than the name suggests. 'mkSubst' drops every @(x, EVar x)@
+-- pair, so @su@ is empty; 'subst' then reduces to @substr (syms t) mempty t@,
+-- and 'syms' on an 'RType' DELETES bound binders, so 'dummySymbol' is not in
+-- the initial scope set. 'freshInNS' hands the FIRST dummy binder back
+-- unrenamed and inserts it, so the second and later ones collide and do get
+-- fresh names.
+--
+-- Leaving the first one named 'dummySymbol' is load bearing: 'isDummy' is a
+-- prefix test, but @Constraint.Env.(+=)@, @Types.Fresh.refreshRefType@ and
+-- @Parse.hs@ each compare for exact equality with 'dummySymbol'.
+--
 -- WARNING: the current implementation might rename variables named as
 -- dummySymbols event if they are not in the scope of the binder of a
 -- dummy symbol. Might not be a problem at the places where noDummySyms is used,
