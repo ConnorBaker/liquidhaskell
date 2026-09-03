@@ -2360,6 +2360,8 @@ executable import-cli
                     , LiquidArrayNullTerm
                     , ListClient
                     , NameClashClient
+                    , PositivityImport
+                    , PositivityImportNeg
                     , RC1015
                     , ReproUse
                     , ReExportClient
@@ -2408,6 +2410,7 @@ executable import-cli
                     , RewriteLib
                     , STLib
                     , SpecLib
+                    , PositivityLib
                     , T1096_TypesLib
                     , T1104Lib
                     , T1117Lib
