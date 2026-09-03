@@ -886,7 +886,7 @@ consEApp γ e'@(App e a@(Type τ))
     isPos α = not (extensionality (getConfig γ)) || rtv_is_pol (ty_var_info α)
 
 consEApp γ e'@(App e a) | Just aDict <- getExprDict γ a
-  = case dhasinfo (dlookup (denv γ) aDict) (getExprFun γ e) of
+  = case getExprFun e >>= dhasinfo (dlookup (denv γ) aDict) of
       Just riSig -> return $ fromRISig riSig
       _          -> do
         ([], πs, te) <- bkUniv <$> consE γ e
@@ -920,13 +920,26 @@ updateEnvironment γ a
   | otherwise
   = return γ
 
-getExprFun :: CGEnv -> CoreExpr -> Var
-getExprFun γ e          = go e
+-- | The 'Var' a class-method application is applying, when that can be read
+-- off the 'CoreExpr', and 'Nothing' when it cannot.
+--
+-- This used to 'panic' instead of answering 'Nothing' (issue #1693). Every
+-- input it now answers 'Nothing' for was bottom before, so no non-bottom
+-- result changes; 'consEApp' takes the same alternative an ordinary lookup
+-- miss takes, which checks the application without the instance refinement.
+--
+-- It sees through type applications and ticks. The sibling 'getExprDict' below
+-- additionally sees through a 'Let', which this deliberately does NOT copy:
+-- widening what the function position matches would change which applications
+-- acquire an instance refinement, and that is a behaviour change rather than a
+-- totality fix.
+getExprFun :: CoreExpr -> Maybe Var
+getExprFun              = go
   where
     go (App x (Type _)) = go x
-    go (Var x)          = x
-    go _                = panic (Just (getLocation γ)) msg
-    msg                 = "getFunName on \t" ++ GM.showPpr e
+    go (Tick _ x)       = go x
+    go (Var x)          = Just x
+    go _                = Nothing
 
 -- | `exprDict e` returns the dictionary `Var` inside the expression `e`
 getExprDict :: CGEnv -> CoreExpr -> Maybe Var
