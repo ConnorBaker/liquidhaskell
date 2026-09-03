@@ -101,10 +101,15 @@ makeOccurrences tycons
 makeOccurrence :: M.HashMap TyCon VarianceInfo -> [Type] -> TyConOccurrence
 makeOccurrence tcInfo = foldl (go Covariant) mempty
   where
+    -- `tcInfo` memoises `makeTyConVariance` over `tycons'`, which unfolds the
+    -- input tycons' definitions only ONE level, so a tycon two levels out
+    -- misses. Falling back to the memoised function gives a miss exactly the
+    -- value a hit would have had, so the verdict stops depending on which
+    -- module is being compiled.
     go :: Variance -> TyConOccurrence -> Type -> TyConOccurrence
     go p m (TyConApp tc ts)  = addOccurrence p tc
                              $ foldl (\m' (t, v) -> go (v <> p) m' t) m
-                                (zip ts (M.lookupDefault (repeat Bivariant) tc tcInfo))
+                                (zip ts (M.lookupDefault (makeTyConVariance tc) tc tcInfo))
     go _ m (TyVarTy _ )      = m
     go _ m (AppTy t1 t2)     = go Bivariant (go Bivariant m t1) t2
     go p m (ForAllTy _ t)    = go p m t
