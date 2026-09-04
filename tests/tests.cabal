@@ -780,6 +780,7 @@ executable names-pos
                     , Shadow01
                     , T1521
                     , T675
+                    , Text00
                     , TransitivePredAliases
                     , TupleParse
                     , TypeAliasShadowing
@@ -787,12 +788,14 @@ executable names-pos
                     , Vector04
                     , Vector0
                     , Vector1
+                    , Text04
 
     build-depends:    base
                     , liquid-prelude
                     , liquid-vector
                     , containers
                     , bytestring
+                    , text
                     , liquidhaskell
                     , vector
 
@@ -820,15 +823,21 @@ executable names-neg
                     , Set01
                     , Set02
                     , T1078
+                    , Text00
+                    , Text01
+                    , Text02
+                    , Text03
                     , UnqualifiedTypeAlias
                     , Vector0
                     , Vector1
+                    , Text04
 
     build-depends:    base
                     , liquid-prelude
                     , liquid-vector
                     , bytestring
                     , containers
+                    , text
                     , liquidhaskell
                     , vector
 
