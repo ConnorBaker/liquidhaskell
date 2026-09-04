@@ -8,6 +8,7 @@
 - Make the positivity checker's variance lookup total, so a type's positivity
   verdict no longer depends on which module is being compiled
 - Restore the `--check-derived` flag, with tests
+- Add `Data.Text_LHAssumptions`, so `Data.Text` needs no per-package `assume`
 - Reject `ple` and `automatic-instances` annotations in modules that enable
   neither `--ple-local` nor `--ple`
   [#2737](https://github.com/ucsd-progsys/liquidhaskell/issues/2737)
