@@ -254,8 +254,8 @@ dataConDecl d     = {- F.notracepp msg $ -} DataCtor dx (F.symbol <$> as) [] xts
 --   the selectors and checkers that then enable reflection.
 --------------------------------------------------------------------------------
 
-makeMeasureSelectors :: Config -> Bare.DataConMap -> Located DataConP -> [Measure SpecType Ghc.DataCon]
-makeMeasureSelectors cfg dm (Loc l l' c)
+makeMeasureSelectors :: Config -> F.TCEmb Ghc.TyCon -> Bare.DataConMap -> Located DataConP -> [Measure SpecType Ghc.DataCon]
+makeMeasureSelectors cfg embs dm (Loc l l' c)
   = checker : Mb.mapMaybe go' fields --  internal measures, needed for reflection
  ++ Misc.condNull autofields (Mb.mapMaybe go fields) --  user-visible measures.
   where
@@ -267,6 +267,8 @@ makeMeasureSelectors cfg dm (Loc l l' c)
       -- do not make selectors for functional fields
       | isFunTy t && not (higherOrderFlag cfg)
       = Nothing
+      | resortedByUnpacking i
+      = Nothing
       | otherwise
         -- TODO: Use as origin module the module where the measure is created
       = Just $ makeMeasureSelector (Loc l l' x) (projT i) dc n i
@@ -275,8 +277,28 @@ makeMeasureSelectors cfg dm (Loc l l' c)
       -- do not make selectors for functional fields
       | isFunTy t && not (higherOrderFlag cfg)
       = Nothing
+      | resortedByUnpacking i
+      = Nothing
       | otherwise
       = Just $ makeMeasureSelector (Loc l l' (makeGeneratedLogicLHName $ Bare.makeDataConSelector (Just dm) dc i)) (projT i) dc n i
+
+    -- | Does GHC's worker/wrapper unpacking change the SORT of field @i@,
+    -- so that it can carry no selector in the logic?
+    --
+    -- The decision itself is 'Bare.resortedFields', which is also what
+    -- 'CoreToLogic' consults before lifting an equation that would project
+    -- through such a field. The extra guard here is local: it checks that
+    -- LiquidHaskell's own view of the constructor's fields (@xts@, from
+    -- @dcpTyArgs@) agrees with GHC's before indexing into the answer.
+    --
+    -- Dropping the selector is the sound direction: the field simply has no
+    -- name in the logic, exactly as if the user had written a function-typed
+    -- field. Nothing that could have been proved with it becomes provable.
+    resortedByUnpacking i
+      | length origTys /= length xts = False
+      | otherwise = Mb.fromMaybe False (Misc.getNth (i - 1) resorted)
+    resorted = Bare.resortedFields embs dc
+    origTys = Ghc.irrelevantMult <$> Ghc.dataConOrigArgTys dc
 
     fields   = zip (reverse xts) [1..]
     n        = length xts

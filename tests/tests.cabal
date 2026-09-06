@@ -1062,6 +1062,9 @@ executable datacon-pos
                     , UnpackedFieldBinders
                     , UnpackedFieldReft
                     , UnpackedFieldReftMixed
+                    , ConstrainedFieldResort
+                    , ConstrainedFieldSorts
+                    , UnpackedFieldSorts
 
     build-depends:    base
                     , liquid-prelude
@@ -1093,6 +1096,8 @@ executable datacon-neg
                     , NewTypes
                     , UnpackedFieldBinders
                     , UnpackedFieldReft
+                    , UnpackedFieldReftSort
+                    , UnpackedFieldSorts
 
     build-depends:    base
                     , liquid-prelude
