@@ -20,6 +20,7 @@ module Language.Haskell.Liquid.Transforms.CoreToLogic
   , measureSpecType
   , weakenResult
   , normalizeCoreExpr
+  , workerApp
   ) where
 
 import           Data.Bifunctor (first)
@@ -47,7 +48,7 @@ import qualified Language.Haskell.Liquid.GHC.Misc      as GM
 
 import           Language.Haskell.Liquid.Bare.Types
 import           Language.Haskell.Liquid.Bare.DataType
-import           Language.Haskell.Liquid.Measure          (unpackInto)
+import           Language.Haskell.Liquid.Measure          (fieldRepTys, unpackInto)
 import           Language.Haskell.Liquid.Bare.Misc     (simpleSymbolVar)
 import           Language.Haskell.Liquid.Types.Errors
 import           Language.Haskell.Liquid.Types.Names
@@ -653,13 +654,89 @@ toLogicApp e = do
   allowTC <- reader (typeclass . lsConfig)
   let (f, es) = splitArgs allowTC e
   case f of
-    C.Var _ -> do args <- mapM coreToLg es
-                  lmap <- lsSymMap <$> getState
-                  def  <- (`mkEApp` args) <$> tosymbol f
-                  (\x -> makeApp def lmap x args) <$> tosymbol' f
+    C.Var v -> do args <- mapM coreToLg es
+                  embs <- reader lsEmb
+                  dm   <- reader lsDCMap
+                  cfg  <- reader lsConfig
+                  case workerApp cfg embs dm v args of
+                    Just w  -> return w
+                    Nothing -> do
+                      lmap <- lsSymMap <$> getState
+                      def  <- (`mkEApp` args) <$> tosymbol f
+                      (\x -> makeApp def lmap x args) <$> tosymbol' f
     _       -> do fe   <- coreToLg f
                   args <- mapM coreToLg es
                   return $ foldl EApp fe args
+
+-- | A saturated application of a data constructor's WRAPPER, re-expressed over
+-- its WORKER.
+--
+-- The logic has exactly ONE symbol per data constructor -- @'F.Symbolic'
+-- 'DataCon'@ is @'F.symbol' . 'Ghc.dataConWorkId'@ -- and every fact the solver
+-- is given about a constructor is stated over it: the @match@ equations lifted
+-- from its selectors, and the result refinement of its spec type. Haskell has
+-- TWO argument lists, though. Below @-O1@ they coincide and GHC builds no
+-- wrapper at all, so lifting @'C.Var'@ by @'symbol'@ happens to name the
+-- worker. From @-O1@ up, @-funbox-small-strict-fields@ makes them differ, GHC
+-- compiles a construction as a call to the wrapper, and lifting that by
+-- @'symbol'@ names @$WT@ -- a SECOND, unrelated uninterpreted constant, at the
+-- SOURCE field sorts:
+--
+-- > constant M.$WDep : func(0, [M.Prio; M.Notes;            M.Dep])
+-- > constant M.Dep   : func(0, [M.Prio; (Set_Set M.Text);   M.Dep])
+--
+-- Nothing relates the two, so a reflected body that CONSTRUCTS is disconnected
+-- from every fact in scope about what it constructed. It is well sorted, so
+-- there is no error -- the obligation is merely undischargeable, far from the
+-- constructor, and only above @-O0@.
+--
+-- This is the construction direction of the seam 'unpackedFieldSubst' handles
+-- for projection, and it reuses the same expansion: each source argument
+-- becomes the representation arguments it unpacks to, so @$WDep p n@ lifts to
+-- @Dep p (notesSet n)@. Where nothing unpacks the expansion is the identity and
+-- this is a pure rename, which is exactly the @-O0@ shape.
+--
+-- ALL OF THAT IS CONDITIONAL ON @'adtFlag'@ BEING OFF, and the condition is
+-- not a preference. @'Constraint.ToFixpoint'@ declares the datatype to the SMT
+-- solver exactly when @'adtFlag'@ is on (its @makeDecls@), and it declares it
+-- from the SOURCE fields -- so under @--reflection@ or @--adt@ the logic's
+-- constructor symbol is bound at the SOURCE sorts and there is no seam to
+-- close. Rewriting there produces the ill-sorted @Dep p (notesSet n)@ against
+-- a @Dep : func([Prio; Notes; Dep])@, which liquid-fixpoint reports as
+-- @Cannot unify Notes with (Array_t Text bool)@ from @evalCandsLoop@ at
+-- @dummyLoc@, naming no binder. Measured on
+-- @tests/datacon/pos/UnpackedFieldWorkerReflect.hs@.
+--
+-- Returns 'Nothing' -- leaving the pre-existing behaviour untouched -- unless
+-- the application is saturated and the expansion lands on the worker's own
+-- value arguments, in COUNT and in SORT. A constructor with a context needs
+-- the count check: @'Ghc.dataConRepArgTys'@ leads with one argument per class
+-- constraint while @'Ghc.dataConOrigArgTys'@ carries none. The sort check is
+-- the one that is not obvious, and counting alone is measurably not enough --
+-- @'unpackInto'@ refuses a newtype and an embedded type, so
+-- @data T = T !(IORef Int) !Int@ has ONE expansion per field either way while
+-- the worker's first argument is a @MutVar#@. Emitting @T r n@ there is
+-- ill-sorted and takes down the whole module with
+-- @Cannot unify MutVar# with IORef@; see 'fieldRepTys' and
+-- @tests/datacon/pos/UnpackedFieldSorts.hs@, which is the arm that caught it.
+workerApp :: Config -> TCEmb TyCon -> DataConMap -> Var -> [Expr] -> Maybe Expr
+workerApp cfg embs dm v args
+  | not (adtFlag cfg)
+  , Ghc.DataConWrapId d <- Ghc.idDetails v
+  , let srcTys  = Ghc.irrelevantMult <$> Ghc.dataConOrigArgTys d
+  , let bangs   = Ghc.dataConImplBangs d
+  , length args == length srcTys
+  , length bangs == length srcTys
+  , let repArgs = concat (zipWith3 (fieldRepProjs embs dm) srcTys bangs args)
+  , let repTys  = concat (zipWith  (fieldRepTys   embs)    srcTys bangs)
+  , let valTys  = filter (not . Ghc.isPredTy)
+                         (Ghc.irrelevantMult <$> Ghc.dataConRepArgTys d)
+  , length repArgs == length valTys
+  , length repTys  == length valTys
+  , and (zipWith (\s r -> typeSort embs s == typeSort embs r) repTys valTys)
+  = Just (F.mkEApp (GM.namedLocSymbol d) repArgs)
+  | otherwise
+  = Nothing
 
 makeApp :: Expr -> LogicMap -> Located Symbol-> [Expr] -> Expr
 makeApp _ _ f [e]

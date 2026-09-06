@@ -1082,6 +1082,8 @@ executable datacon-pos
                     , UnpackedFieldWorkerReflect
                     , UnpackedFieldWorkerSingleton
                     , UnpackedFieldExpandedOnly
+                    , UnpackedFieldWorkerApp
+                    , UnpackedFieldWrapperSimplify
 
     build-depends:    base
                     , liquid-prelude
@@ -1120,6 +1122,8 @@ executable datacon-neg
                     , UnpackedFieldRebuild
                     , UnpackedFieldUpdate
                     , UnpackedFieldWorkerSingleton
+                    , UnpackedFieldWorkerApp
+                    , UnpackedFieldWrapperSimplify
 
     build-depends:    base
                     , liquid-prelude
