@@ -1065,6 +1065,14 @@ executable datacon-pos
                     , ConstrainedFieldResort
                     , ConstrainedFieldSorts
                     , UnpackedFieldSorts
+                    , NestedCaseProjection
+                    , UnpackedFieldBindersMulti
+                    , UnpackedFieldExpandedSorts
+                    , UnpackedFieldRebuild
+                    , UnpackedFieldUpdate
+                    , UnpackedFieldWorkerReflect
+                    , UnpackedFieldWorkerSingleton
+                    , UnpackedFieldExpandedOnly
 
     build-depends:    base
                     , liquid-prelude
@@ -1098,6 +1106,11 @@ executable datacon-neg
                     , UnpackedFieldReft
                     , UnpackedFieldReftSort
                     , UnpackedFieldSorts
+                    , NestedCaseProjectionSort
+                    , UnpackedFieldExpandedSorts
+                    , UnpackedFieldRebuild
+                    , UnpackedFieldUpdate
+                    , UnpackedFieldWorkerSingleton
 
     build-depends:    base
                     , liquid-prelude

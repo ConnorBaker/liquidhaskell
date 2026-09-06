@@ -9,6 +9,9 @@
 - Drop a field's selector when unpacking changes that field's sort, rebuilding
   the source-to-worker correspondence rather than abandoning it when an
   `{-# UNPACK #-}`ed product makes the two argument counts disagree
+- Rebuild every lifted measure equation over a data constructor's
+  representation arguments, and give its wrapper the generated selector
+  equations as well as the user-written ones
 - Reject `ple` and `automatic-instances` annotations in modules that enable
   neither `--ple-local` nor `--ple`
   [#2737](https://github.com/ucsd-progsys/liquidhaskell/issues/2737)

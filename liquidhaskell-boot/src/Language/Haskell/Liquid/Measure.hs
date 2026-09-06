@@ -95,16 +95,16 @@ checkDuplicateMeasure measures
 -- | Returns the specification types of all data constructors augmented with
 -- the refinements from the measures. Also returns the specification types of
 -- the measures in the second component of the result.
-dataConTypes :: Bool -> MSpec (RRType Reft) DataCon -> ([(Var, RRType Reft)], [(F.Located LHName, RRType Reft)])
-dataConTypes allowTC  s = (ctorTys, measTys)
+dataConTypes :: Bool -> F.TCEmb TyCon -> MSpec (RRType Reft) DataCon -> ([(Var, RRType Reft)], [(F.Located LHName, RRType Reft)])
+dataConTypes allowTC embs s = (ctorTys, measTys)
   where
     measTys     = [(msName m, msSort m) | m <- M.elems (measMap s) ++ imeas s]
-    ctorTys     = concatMap (makeDataConType allowTC . notracepp "HOHOH" . snd) (M.toList (ctorMap s))
+    ctorTys     = concatMap (makeDataConType allowTC embs . notracepp "HOHOH" . snd) (M.toList (ctorMap s))
 
-makeDataConType :: Bool -> [Def (RRType Reft) DataCon] -> [(Var, RRType Reft)]
-makeDataConType _ []
+makeDataConType :: Bool -> F.TCEmb TyCon -> [Def (RRType Reft) DataCon] -> [(Var, RRType Reft)]
+makeDataConType _ _ []
   = []
-makeDataConType allowTC ds | Mb.isNothing (dataConWrapId_maybe dc)
+makeDataConType allowTC _ ds | Mb.isNothing (dataConWrapId_maybe dc)
   = notracepp _msg [(woId, notracepp _msg $ combineDCTypes "cdc0" t ts)]
   where
     dc   = ctor (head ds)
@@ -113,30 +113,115 @@ makeDataConType allowTC ds | Mb.isNothing (dataConWrapId_maybe dc)
     ts   = defRefType allowTC t <$> ds
     _msg  = "makeDataConType0" ++ showpp (woId, t, ts)
 
-makeDataConType allowTC ds
+makeDataConType allowTC embs ds
   = [(woId, noDummySyms woRType), (wrId, noDummySyms wrRType)]
   where
     -- A measure with missing argument types comes from a selector or checker
-    -- measure that describes the worker data constructor. A measure
-    -- with all the argument types available comes from a user definition
-    -- and describes both the worker and the wrapper.
-    (workerOnlyDs, bothDs) = L.partition hasMissingFieldTypes ds
-    wo       = workerOnlyDs ++ bothDs
-    wr       = bothDs
+    -- measure. A measure with all the argument types available comes from a
+    -- user definition.
+    --
+    -- BOTH kinds describe the wrapper, and withholding the selectors from it
+    -- was harmless only while the wrapper and the worker took the same
+    -- arguments. UNPACKing breaks that: from @-O1@ up GHC builds a record --
+    -- @s { f = e }@ compiles to a construction -- through the WRAPPER, whose
+    -- arguments are the SOURCE fields, which is exactly what a selector
+    -- equation is written over. With the equations on the worker alone, a
+    -- refinement naming a lifted selector is unprovable at every such site:
+    -- the inferred type quotes @$WT ...@ while every @sel (T ...) == x@ fact
+    -- in scope is about @T@. See 'tests/datacon/pos/UnpackedFieldUpdate.hs'.
+    wr       = ds
     dc       = ctor $ head ds
     woId     = dataConWorkId dc
     wot      = varType woId
     wrId     = dataConWrapId dc
     wrt      = varType wrId
-    wots     = defRefType allowTC wot <$> wo
+    -- A lifted measure equation is written over the constructor's SOURCE
+    -- fields. That is also the WORKER's argument list -- unless GHC UNPACKed a
+    -- strict field, from @-O1@ up, in which case the worker takes the
+    -- components the field expanded to and the equation has to be rebuilt over
+    -- them. See 'unpackedFieldRecon'.
+    --
+    -- BOTH kinds need that rebuild, for the mirror image of the reason the
+    -- wrapper needs both. A selector equation is written over the SOURCE
+    -- fields just as a user equation is; the two differ only in whether the
+    -- binders carry types, which 'toWorkerDef' does not consult -- it reads
+    -- their names and 'dataConRepArgTys', and emits untyped binders itself.
+    -- Rebuilding only the user ones left every @{-@ data @-}@-generated
+    -- selector equation stated over source fields while the worker takes
+    -- components, so 'stitchArgs' counted
+    -- one binder against two arguments and rejected the declaration outright:
+    -- @Requires 2 fields but given 1@. See
+    -- 'tests/datacon/pos/UnpackedFieldBindersMulti.hs'.
+    wots     = defRefType allowTC wot . toWorkerDef embs dc <$> ds
     wrts     = defRefType allowTC wrt <$> wr
 
     wrRType  = combineDCTypes "cdc1" wrt wrts
     woRType  = combineDCTypes "cdc2" wot wots
 
-    -- types are missing for arguments, so the definition came from a logical
-    -- measure and it is for the worker datacon only
-    hasMissingFieldTypes def = any (Mb.isNothing . snd) (binds def)
+-- | The inverse of 'unpackedFieldSubst', for the other direction of the same
+-- mismatch.
+--
+-- 'Language.Haskell.Liquid.Measure.makeDataConType' gives a lifted measure
+-- equation to BOTH the wrapper and the worker of a data constructor, on the
+-- assumption that the two take the same arguments. UNPACKing breaks that
+-- assumption, so re-express the equation -- which after 'unpackedFieldSubst' is
+-- written over the SOURCE fields -- over the worker's representation arguments
+-- @xs@, by rebuilding each unpacked field from the components it expanded to.
+--
+-- Returns one expression per source field, or 'Nothing' when the constructor
+-- has no unpacked field or @xs@ does not account for the expansion exactly --
+-- in which case the caller must leave the equation alone.
+unpackedFieldRecon :: F.TCEmb TyCon -> DataCon -> [Symbol] -> Maybe [Expr]
+unpackedFieldRecon embs d xs
+  | length srcTys == length bangs
+  , Just (es, []) <- go (zip srcTys bangs) xs
+  , any (not . isEVar) es
+  = Just es
+  | otherwise
+  = Nothing
+  where
+    srcTys        = Ghc.irrelevantMult <$> Ghc.dataConOrigArgTys d
+    bangs         = Ghc.dataConImplBangs d
+    isEVar EVar{} = True
+    isEVar _      = False
+
+    go [] ys              = Just ([], ys)
+    go ((t, b) : tbs) ys  = do
+      (e , ys' ) <- one t b ys
+      (es, ys'') <- go tbs ys'
+      return (e : es, ys'')
+
+    -- One source field. Note the application is FLAT: @d'@ is applied to every
+    -- leaf the field expanded to, with no intermediate constructor, however
+    -- many levels down those leaves were found.
+    --
+    -- That is not a shortcut, it is what the logic's @d'@ takes.
+    -- 'expandProductType' rewrites EVERY constructor's spec, @d'@ included, so
+    -- if GHC unpacked a field of @d'@ then the logic's @d'@ already takes that
+    -- field's components rather than the field. Rebuilding the intermediate
+    -- constructor here hands it a value of the SOURCE field's sort where it
+    -- expects the component's, and the declaration is rejected with
+    -- @Cannot unify (Array_t int bool) with Keys@. The two descents agree by
+    -- construction because both are driven by 'dataConImplBangs', which
+    -- reports the decision GHC actually made.
+    one t b ys
+      | Just (d', ftbs) <- unpackInto embs t b
+      = do (ls, ys') <- leaves ftbs ys
+           return (F.mkEApp (namedLocSymbol d') (EVar <$> ls), ys')
+    one _ _ (y : ys) = Just (EVar y, ys)
+    one _ _ []       = Nothing
+
+    -- The leaves one field expands to, in worker-argument order.
+    leaves [] ys             = Just ([], ys)
+    leaves ((t, b) : tbs) ys = do
+      (l , ys' ) <- leaf t b ys
+      (ls, ys'') <- leaves tbs ys'
+      return (l ++ ls, ys'')
+
+    leaf t b ys
+      | Just (_, ftbs) <- unpackInto embs t b = leaves ftbs ys
+    leaf _ _ (y : ys) = Just ([y], ys)
+    leaf _ _ []       = Nothing
 
 -- | Does GHC's UNPACKing of this field expand it into the fields of a single
 -- constructor, and if so which?
@@ -175,6 +260,24 @@ fieldRepTys :: F.TCEmb TyCon -> Type -> Ghc.HsImplBang -> [Type]
 fieldRepTys embs t b = case unpackInto embs t b of
   Nothing        -> [t]
   Just (_, ftbs) -> concat [ fieldRepTys embs ft b' | (ft, b') <- ftbs ]
+
+-- | Rewrite a measure equation from the constructor's source fields to the
+-- WORKER's representation arguments. The identity unless GHC unpacked a strict
+-- field; see 'unpackedFieldRecon', which decides that and supplies the
+-- reconstruction.
+toWorkerDef :: F.TCEmb TyCon -> DataCon -> Def (RRType Reft) DataCon -> Def (RRType Reft) DataCon
+toWorkerDef embs dc def@(Def f d mt xs body)
+  | Just es <- unpackedFieldRecon embs dc repXs
+  , length es == length xs
+  -- 'subst' is simultaneous, so it is safe for 'repXs' to reuse the names in
+  -- 'xs': a binder introduced by the reconstruction is never itself rewritten.
+  = Def f d mt [(x, Nothing) | x <- repXs] (subst (mkSubst (zip (fst <$> xs) es)) body)
+  | otherwise
+  = def
+  where
+    repVTys = filter (not . Ghc.isPredTy) (irrelevantMult <$> dataConRepArgTys dc)
+    repXs   = [ F.tempSymbol (lhNameToResolvedSymbol (F.val f)) i
+              | i <- [0 .. toInteger (length repVTys) - 1] ]
 
 -- | If there are any dummy symbols in the type, replace them with fresh
 -- variables.

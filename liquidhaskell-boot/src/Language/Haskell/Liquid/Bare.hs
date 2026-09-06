@@ -1490,7 +1490,7 @@ makeMeasEnv env tycEnv sigEnv specs = do
   let dms      = Bare.makeDefaultMethods env mts
   measures0   <- mapM (Bare.makeMeasureSpec env sigEnv name) (M.toList specs)
   let measures = mconcat (Ms.mkMSpec' dcSelectors : measures0)
-  let (cs, ms) = Bare.makeMeasureSpec'  (typeclass $ getConfig env)   measures
+  let (cs, ms) = Bare.makeMeasureSpec'  (typeclass $ getConfig env) embs measures
   let cms      = Bare.makeClassMeasureSpec measures
   let cms'     = [ (val l, cSort t <$ l)  | (l, t) <- cms ]
   let ms'      = [ (lhNameToResolvedSymbol (F.val lx), F.atLoc lx t)
@@ -1540,7 +1540,7 @@ addOpaqueReflMeas cfg tycEnv env spec measEnv specs eqs = do
   -- Rest of the code is the same idea as for makeMeasEnv, only we just care on how to get
   -- `meSyms` (no class, data constructor or other stuff here).
   let measures = mconcat (Ms.mkMSpec' dcSelectors : measures0)
-  let (cs, ms) = Bare.makeMeasureSpec'  (typeclass $ getConfig env)   measures
+  let (cs, ms) = Bare.makeMeasureSpec'  (typeclass $ getConfig env) embs measures
   let ms'      = [ (lhNameToResolvedSymbol (F.val lx), F.atLoc lx t) | (lx, t) <- ms ]
   let cs'      = [ (v, txRefs v t) | (v, t) <- Bare.meetDataConSpec (typeclass (getConfig env)) embs cs (val <$> datacons)]
   return $ measEnv <> mempty
