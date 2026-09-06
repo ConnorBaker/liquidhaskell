@@ -13,6 +13,9 @@
   constructor's spec type, so `-funbox-small-strict-fields` no longer equates
   two fields through a shared binder, silently drops a written refinement, or
   expands a field GHC left alone
+- Drop a field's selector when unpacking changes that field's sort, rebuilding
+  the source-to-worker correspondence rather than abandoning it when an
+  `{-# UNPACK #-}`ed product makes the two argument counts disagree
 - Reject `ple` and `automatic-instances` annotations in modules that enable
   neither `--ple-local` nor `--ple`
   [#2737](https://github.com/ucsd-progsys/liquidhaskell/issues/2737)

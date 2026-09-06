@@ -1458,7 +1458,7 @@ makeTycEnv0 cfg myName env embs mySpec iSpecs = (diag0 <> diag1, datacons, Bare.
     tds           = [(name, tcpCon tcp, dd) | (name, tcp, Just dd) <- tcDds]
     (diag1, adts) = Bare.makeDataDecls embs myName tds       datacons
     dm            = Bare.dataConMap adts
-    dcSelectors   = concatMap (Bare.makeMeasureSelectors cfg dm) (if reflection cfg then charDataCon:datacons else datacons)
+    dcSelectors   = concatMap (Bare.makeMeasureSelectors cfg embs dm) (if reflection cfg then charDataCon:datacons else datacons)
     fiTcs         = _gsFiTcs (Bare.reSrc env)
 
 
@@ -1536,7 +1536,7 @@ addOpaqueReflMeas :: Config -> Bare.TycEnv -> Bare.Env -> Ms.BareSpec -> Bare.Me
 addOpaqueReflMeas cfg tycEnv env spec measEnv specs eqs = do
   dcs   <- snd <$> Bare.makeConTypes'' env name spec dataDecls []
   let datacons      = Bare.makePluggedDataCon (typeclass cfg) embs tyi <$> concat dcs
-  let dcSelectors   = concatMap (Bare.makeMeasureSelectors cfg dm) datacons
+  let dcSelectors   = concatMap (Bare.makeMeasureSelectors cfg embs dm) datacons
   -- Rest of the code is the same idea as for makeMeasEnv, only we just care on how to get
   -- `meSyms` (no class, data constructor or other stuff here).
   let measures = mconcat (Ms.mkMSpec' dcSelectors : measures0)

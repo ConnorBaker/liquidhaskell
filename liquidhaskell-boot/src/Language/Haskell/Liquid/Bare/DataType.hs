@@ -8,6 +8,7 @@ module Language.Haskell.Liquid.Bare.DataType
   -- * Names for accessing Data Constuctors
   , makeDataConChecker
   , makeDataConSelector
+  , resortedFields
   , addClassEmbeds
 
   -- * Constructors
@@ -81,6 +82,79 @@ makeDataConChecker = F.testSymbol . F.symbol
 --   e.g. `select$Cons$1` and `select$Cons$2` are respectively
 --   equivalent to `head` and `tail`.
 --------------------------------------------------------------------------------
+-- | One entry per SOURCE field of @d@: does GHC's worker/wrapper unpacking
+-- change that field's SORT?
+--
+-- A field selector is declared at the field's SOURCE type -- 'bkDataCon' reads
+-- 'Ghc.dataConFullSig' -- while the constructor's own spec is bound at the
+-- WORKER's argument types. The result refinement states @sel_i VV == b_i@
+-- across the two, so a field whose sort MOVES can carry no selector in the
+-- logic and 'makeMeasureSelectors' drops it.
+--
+-- This is the single authority on that question. 'CoreToLogic' needs the same
+-- answer -- an equation it lifts from Core may want to project through a field
+-- whose selector was dropped -- and deciding it twice is how the two would
+-- drift apart.
+--
+-- @dataConRepArgTys@ leads with one argument per class constraint, which
+-- 'Ghc.isPredTy' drops; what is left corresponds to the source fields
+-- one-to-one, and comparing them positionally is the whole answer -- WHILE
+-- they correspond. An @{-# UNPACK #-}@ed multi-field product contributes
+-- SEVERAL, and this used to answer 'False' throughout as soon as that made the
+-- counts disagree.
+--
+-- That read as the conservative choice and was not one. 'False' KEEPS a
+-- selector, so a constructor carrying both a resorted field and an expanding
+-- one had this guard silently disarmed, and was rejected at its own
+-- declaration with @Illegal type specification@ -- the very error dropping the
+-- selector exists to prevent. Loud rather than unsound, but reached by exactly
+-- the shape the old comment named as out of scope.
+--
+-- So the correspondence is REBUILT rather than abandoned: the worker's value
+-- arguments are regrouped along each field's own expansion, 'Ms.fieldRepTys',
+-- the same descent 'CoreToLogic' projects along, so the two agree by
+-- construction. What is NOT the answer is comparing a field against its own
+-- expansion -- those match by construction too, and asking that question here
+-- silently disarms the refusal for @data C = C !W@, which is 'workerApp'\'s
+-- question ("is the rewrite well typed") rather than this one ("can this field
+-- carry a selector").
+resortedFields :: F.TCEmb Ghc.TyCon -> Ghc.DataCon -> [Bool]
+resortedFields embs d
+  | sameValueArity                            = zipWith differs origTys valTys
+  | Just grouped <- regroup expansions valTys = zipWith moved origTys grouped
+  | otherwise                                 = replicate (length origTys) False
+  where
+    differs s r    = RT.typeSort embs s /= RT.typeSort embs r
+    sameValueArity = length valTys == length origTys
+
+    -- A field represented by SEVERAL worker arguments still has a selector:
+    -- the result refinement rebuilds it, @sel_i VV == C b_j b_k@, which is
+    -- well sorted because the reconstruction is at the field's own type. Only
+    -- a field standing on ONE worker argument of a DIFFERENT sort has none.
+    moved t [r] = differs t r
+    moved _ _   = False
+
+    expansions
+      | length bangs == length origTys = zipWith (Ms.fieldRepTys embs) origTys bangs
+      | otherwise                      = [ [t] | t <- origTys ]
+    bangs   = Ghc.dataConImplBangs d
+    origTys = Ghc.irrelevantMult <$> Ghc.dataConOrigArgTys d
+    valTys  = filter (not . Ghc.isPredTy)
+                     (Ghc.irrelevantMult <$> Ghc.dataConRepArgTys d)
+
+-- | Cut @rs@ into one group per expansion, or 'Nothing' if it does not divide
+-- exactly -- in which case the expansion does not explain the worker's shape
+-- and no field can be judged.
+regroup :: [[a]] -> [b] -> Maybe [[b]]
+regroup []       [] = Just []
+regroup []       _  = Nothing
+regroup (g : gs) rs
+  | length rs >= n = (here :) <$> regroup gs there
+  | otherwise      = Nothing
+  where
+    n             = length g
+    (here, there) = splitAt n rs
+
 makeDataConSelector :: Maybe Bare.DataConMap -> Ghc.DataCon -> Int -> F.Symbol
 makeDataConSelector dmMb d i = M.lookupDefault def (F.symbol d, i) dm
   where

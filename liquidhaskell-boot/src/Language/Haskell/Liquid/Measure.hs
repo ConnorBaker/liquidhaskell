@@ -21,6 +21,10 @@ module Language.Haskell.Liquid.Measure (
   , dataConTypes
   , defRefType
   , bodyPred
+
+  -- * UNPACKed fields
+  , unpackInto
+  , fieldRepTys
   ) where
 
 import           GHC                                    hiding (Located)
@@ -133,6 +137,44 @@ makeDataConType allowTC ds
     -- types are missing for arguments, so the definition came from a logical
     -- measure and it is for the worker datacon only
     hasMissingFieldTypes def = any (Mb.isNothing . snd) (binds def)
+
+-- | Does GHC's UNPACKing of this field expand it into the fields of a single
+-- constructor, and if so which?
+--
+-- An EMBEDDED type -- @Int@ as @int@, @Text@ as @Str@ -- has no datatype in the
+-- logic, hence no constructor to rebuild it with and no selectors to take it
+-- apart, so the expansion stops there and the component stands for the field.
+-- Its sort is the embedded one either way, which is what makes that sound.
+unpackInto :: F.TCEmb TyCon -> Type -> Ghc.HsImplBang
+           -> Maybe (DataCon, [(Type, Ghc.HsImplBang)])
+unpackInto embs t Ghc.HsUnpack{}
+  | Just (tc, _) <- Ghc.splitTyConApp_maybe t
+  , not (Ghc.isNewTyCon tc)
+  , not (F.tceMember tc embs)
+  , Just d <- Ghc.tyConSingleDataCon_maybe tc
+  , let fts = Ghc.irrelevantMult <$> Ghc.dataConOrigArgTys d
+  , let bs  = Ghc.dataConImplBangs d
+  , not (null fts)
+  , length fts == length bs
+  = Just (d, zip fts bs)
+unpackInto _ _ _ = Nothing
+
+-- | The TYPES of the representation arguments one source field expands to: the
+-- twin of 'fieldRepProjs', driven by the same 'unpackInto' so the two descents
+-- agree by construction.
+--
+-- 'workerApp' needs it because matching the expansion's LENGTH against the
+-- worker's value arguments is not enough. 'unpackInto' REFUSES a newtype and an
+-- embedded type, so a field GHC unpacked through one of those passes through at
+-- its SOURCE type while the worker takes the component -- @IORef Int@ against
+-- @MutVar# RealWorld Int@, one argument either way. That is the same
+-- source/worker sort split 'Bare.resortedFields' answers for selectors; here
+-- the answer has to be per EXPANSION rather than per field, because a field
+-- that does expand contributes several.
+fieldRepTys :: F.TCEmb TyCon -> Type -> Ghc.HsImplBang -> [Type]
+fieldRepTys embs t b = case unpackInto embs t b of
+  Nothing        -> [t]
+  Just (_, ftbs) -> concat [ fieldRepTys embs ft b' | (ft, b') <- ftbs ]
 
 -- | If there are any dummy symbols in the type, replace them with fresh
 -- variables.
