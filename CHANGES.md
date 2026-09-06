@@ -2,6 +2,10 @@
 
 ## Next
 
+- Keep an unpacked field's binder, sort and refinement when expanding a data
+  constructor's spec type, so `-funbox-small-strict-fields` no longer equates
+  two fields through a shared binder, silently drops a written refinement, or
+  expands a field GHC left alone
 - Reject `ple` and `automatic-instances` annotations in modules that enable
   neither `--ple-local` nor `--ple`
   [#2737](https://github.com/ucsd-progsys/liquidhaskell/issues/2737)

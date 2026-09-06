@@ -373,7 +373,7 @@ meetDataConSpec :: Bool -> F.TCEmb Ghc.TyCon -> [(Ghc.Var, SpecType)] -> [DataCo
 --------------------------------------------------------------------------------
 meetDataConSpec allowTC emb xts dcs  = M.toList $ snd <$> L.foldl' upd dcm0 xts
   where
-    dcm0                     = M.fromListWith meetM (dataConSpec' allowTC dcs)
+    dcm0                     = M.fromListWith meetM (dataConSpec' allowTC emb dcs)
     upd dcm (x, t)           = M.insert x (Ghc.getSrcSpan x, tx') dcm
                                 where
                                   tx' = maybe t (meetX x t) (M.lookup x dcm)
@@ -381,11 +381,11 @@ meetDataConSpec allowTC emb xts dcs  = M.toList $ snd <$> L.foldl' upd dcm0 xts
     meetX x t (sp', t')      = F.notracepp (_msg x t t') $ meetVarTypes emb (pprint x) (Ghc.getSrcSpan x, t) (sp', t')
     _msg x t t'              = "MEET-VAR-TYPES: " ++ showpp (x, t, t')
 
-dataConSpec' :: Bool -> [DataConP] -> [(Ghc.Var, (Ghc.SrcSpan, SpecType))]
-dataConSpec' allowTC = concatMap tx
+dataConSpec' :: Bool -> F.TCEmb Ghc.TyCon -> [DataConP] -> [(Ghc.Var, (Ghc.SrcSpan, SpecType))]
+dataConSpec' allowTC emb = concatMap tx
   where
     tx dcp   =  [ (x, res) | (x, t0) <- dataConPSpecType allowTC dcp
-                          , let t    = RT.expandProductType x t0
+                          , let t    = RT.expandProductType emb x t0
                           , let res  = (GM.fSrcSpan dcp, t)
                 ]
 --------------------------------------------------------------------------------

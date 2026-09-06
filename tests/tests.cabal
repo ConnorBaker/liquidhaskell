@@ -1059,10 +1059,15 @@ executable datacon-pos
                     , T1476
                     , T1477
                     , T1777
+                    , UnpackedFieldBinders
+                    , UnpackedFieldReft
+                    , UnpackedFieldReftMixed
 
     build-depends:    base
                     , liquid-prelude
                     , liquidhaskell
+                    , containers
+                    , text
 
     hs-source-dirs:   app
                     , datacon/pos
@@ -1086,10 +1091,14 @@ executable datacon-neg
                     , Date
                     -- , NewTypes0
                     , NewTypes
+                    , UnpackedFieldBinders
+                    , UnpackedFieldReft
 
     build-depends:    base
                     , liquid-prelude
                     , liquidhaskell
+                    , containers
+                    , text
 
     hs-source-dirs:   app
                     , datacon/neg
