@@ -369,12 +369,12 @@ makeMeasureChecker x s0 dc n = M { msName = x, msSort = s, msEqns = eqn : (eqns 
 
 
 ----------------------------------------------------------------------------------------------
-makeMeasureSpec' :: Bool -> MSpec SpecType Ghc.DataCon -> ([(Ghc.Var, SpecType)], [(Located LHName, RRType F.Reft)])
+makeMeasureSpec' :: Bool -> F.TCEmb Ghc.TyCon -> MSpec SpecType Ghc.DataCon -> ([(Ghc.Var, SpecType)], [(Located LHName, RRType F.Reft)])
 ----------------------------------------------------------------------------------------------
-makeMeasureSpec' allowTC mspec0 = (ctorTys, measTys)
+makeMeasureSpec' allowTC embs mspec0 = (ctorTys, measTys)
   where
     ctorTys             = fmap RT.uRType <$> ctorTys0
-    (ctorTys0, measTys) = Ms.dataConTypes allowTC mspec
+    (ctorTys0, measTys) = Ms.dataConTypes allowTC embs mspec
     mspec               = first (mapReft ur_reft) mspec0
 
 ----------------------------------------------------------------------------------------------
