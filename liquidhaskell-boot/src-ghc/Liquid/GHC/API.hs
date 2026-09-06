@@ -290,9 +290,11 @@ import GHC.Core.ConLike               as Ghc
     ( ConLike(RealDataCon) )
 import GHC.Core.DataCon               as Ghc
     ( FieldLabel(flSelector)
+    , HsImplBang(HsUnpack)
     , classDataCon
     , dataConExTyCoVars
     , dataConFullSig
+    , dataConImplBangs
     , dataConImplicitTyThings
     , dataConInstArgTys
     , dataConName

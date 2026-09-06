@@ -1626,15 +1626,50 @@ grabArgs τs τ
 
 expandProductType :: (PPrint r, IsReft r, SubsTy RTyVar (RType RTyCon RTyVar NoReft) r,
                       ReftBind r ~ Symbol, ReftVar r ~ Symbol, Variable r ~ Symbol)
-                  => Var -> RType RTyCon RTyVar r -> RType RTyCon RTyVar r
-expandProductType x t
+                  => F.TCEmb TyCon -> Var -> RType RTyCon RTyVar r -> RType RTyCon RTyVar r
+expandProductType embs x t
   | isTrivial'      = t
   | otherwise       = fromRTypeRep $ trep {ty_binds = xs', ty_info=is', ty_args = ts', ty_refts = rs'}
      where
       isTrivial'    = ofType (varType x) == toRSort t
       τs            = map irrelevantMult $ fst $ splitFunTys $ snd $ splitForAllTyCoVars $ toType False t
       trep          = toRTypeRep t
-      (xs',is',ts',rs') = unzip4 $ concatMap mkProductTy $ zip5 τs (ty_binds trep) (ty_info trep) (ty_args trep) (ty_refts trep)
+      (xs',is',ts',rs') = unzip4 $ concat
+                        $ zipWith expandOne (unpackedFields x τs)
+                        $ zip5 τs (ty_binds trep) (ty_info trep) (ty_args trep) (ty_refts trep)
+      expandOne unpacked q@(_, x0, i0, t0, r0)
+        | unpacked  = mkProductTy embs q
+        | otherwise = [(x0, i0, t0, r0)]
+
+-- | GHC's OWN per-field unpacking decision, one 'Bool' per argument of @x@'s
+-- spec type.
+--
+-- 'mkProductTy' expands anything 'deepSplitProductType' can take apart, which
+-- is every single-constructor type application -- and that is strictly more
+-- than @-funbox-small-strict-fields@ actually unpacks. @Data.Text.Text@ is the
+-- case that shows it: three fields, so GHC leaves it alone, but it splits
+-- perfectly well, and expanding it puts THREE arguments in the spec where the
+-- worker has one. The whole constructor is then rejected with
+-- @Illegal type specification@ -- or, worse, accepted with the remaining
+-- fields' refinements sitting one position out.
+--
+-- Nothing below @-O1@ reaches this, because 'expandProductType' short-circuits
+-- while the worker's type still equals the spec's; a record mixing an unpacked
+-- @!Int@ with an untouched @!Text@ is what makes the two disagree, and the two
+-- decisions are then independent per field.
+--
+-- Conservative when it cannot ask: a 'Var' that is not a data constructor, or
+-- an argument count that does not match the source fields (a constructor with
+-- a class context carries its dictionaries here and @dataConImplBangs@ does
+-- not), keeps the previous behaviour rather than guessing.
+unpackedFields :: Var -> [Type] -> [Bool]
+unpackedFields x τs = case Ghc.isDataConId_maybe x of
+  Just dc | length bangs == length τs -> map isUnpack bangs
+    where bangs = Ghc.dataConImplBangs dc
+  _ -> replicate (length τs) True
+  where
+    isUnpack Ghc.HsUnpack{} = True
+    isUnpack _              = False
 
 -- splitFunTys :: Type -> ([Type], Type)
 
@@ -1647,12 +1682,62 @@ data DataConAppContext
   }
 
 mkProductTy :: forall t r. (IsReft t, IsReft r)
-            => (Type, Symbol, RFInfo, RType RTyCon RTyVar r, t)
+            => F.TCEmb TyCon
+            -> (Type, Symbol, RFInfo, RType RTyCon RTyVar r, t)
             -> [(Symbol, RFInfo, RType RTyCon RTyVar r, t)]
-mkProductTy (τ, x, i, t, r) = maybe [(x, i, t, r)] f (deepSplitProductType menv τ)
+mkProductTy embs (τ, x, i, t, r) = maybe [(x, i, t, r)] f (deepSplitProductType menv τ)
   where
     f    :: DataConAppContext -> [(Symbol, RFInfo, RType RTyCon RTyVar r, t)]
-    f    DataConAppContext{..} = map ((dummySymbol, defRFInfo, , trueReft) . ofType . fst) dcac_arg_tys
+    -- KEEP THE BINDER. Naming every expanded component `dummySymbol` discards
+    -- the caller's binder AND makes the components indistinguishable from one
+    -- another, because `dummySymbol` is ONE FIXED NAME rather than a fresh one.
+    --
+    -- That matters because the binders of a data constructor's type are
+    -- REFERENCED BY NAME from its result refinement, which says
+    -- `select_i VV == b_i` for each field. Give two fields the same `b_i` and
+    -- the refinement equates them. Where their sorts differ and cannot unify,
+    -- LiquidHaskell rejects the data declaration outright with
+    -- `Illegal type specification`; where the sorts happen to agree it is
+    -- ACCEPTED, and silently asserts a field equality nobody wrote.
+    --
+    -- Only reachable from `-O1` upward, because `expandProductType` is a no-op
+    -- while the worker's type still equals the spec's (its `isTrivial` guard).
+    -- At `-O1` GHC unpacks a small strict field -- `!Int` becomes `Int#` --
+    -- the two stop being equal, and every binder of the constructor is
+    -- rewritten through here. `data R = R { f1 :: !Int, f2 :: Text }` is
+    -- enough: at `-O0` the fields bind to distinct `lq_tmp$x##455` and
+    -- `lq_tmp$x##456`, and at `-O1` both bound to `LIQUID$dummy` and the
+    -- module failed with `Cannot unify Text with int`.
+    --
+    -- A SINGLE-component expansion keeps `x` itself, so the result refinement
+    -- still names the field it always named; that is the `!Int -> Int#` case,
+    -- and it is the common one. A genuine MULTI-component expansion cannot
+    -- preserve one name for several values, so each component is suffixed and
+    -- the names stay pairwise distinct.
+    f    DataConAppContext{..} = case dcac_arg_tys of
+      [t1] -> [(x, defRFInfo, keepReft (fst t1), trueReft)]
+      tys  -> [ (intSymbol (suffixSymbol x "expand") j, defRFInfo, ofType (fst ty), trueReft)
+              | (j, ty) <- zip [1 :: Int ..] tys
+              ]
+    -- KEEP THE FIELD'S OWN REFINEMENT. `ofType` alone returns the component's
+    -- type with a TRIVIAL refinement, so a user-written
+    -- `{-@ data F = F [Int] {v : Int | v <= lim} @-}` silently loses its
+    -- `v <= lim` the moment `-funbox-small-strict-fields` makes the field
+    -- unpackable -- and, unlike the binder defect above, it is quiet in both
+    -- directions: the declaration is accepted and every obligation that the
+    -- field's bound would have discharged simply becomes unprovable at the
+    -- CONSUMER.
+    --
+    -- Guarded on the SORT, which is the same criterion `makeMeasureSelectors`
+    -- uses to decide whether the field keeps a name in the logic at all. A
+    -- `!Int -> Int#` expansion embeds to `int` on both sides, so the
+    -- refinement transfers verbatim; an `IORef a -> MutVar# ...` one does not,
+    -- and carrying the refinement across would reintroduce exactly the
+    -- `Illegal type specification` that dropping the selector removed.
+    keepReft t1 = case stripRTypeBase t of
+      Just r0 | typeSort embs τ == typeSort embs t1
+                -> strengthenWith (\_ new -> new) (ofType t1) r0
+      _         -> ofType t1
     menv = (emptyFamInstEnv, emptyFamInstEnv)
 
 -- Copied from GHC 9.0.2.
