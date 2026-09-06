@@ -143,8 +143,29 @@ import           Language.Haskell.Liquid.GHC.TypeRep () -- Eq Type instance
 
 
 
-strengthenDataConType :: (Var, SpecType) -> (Var, SpecType)
-strengthenDataConType (x, t) = (x, fromRTypeRep trep {ty_res = tres})
+-- | Give a data constructor's spec type the singleton result
+-- @{v | v == x b1 .. bn}@ over its own argument binders.
+--
+-- @wApp@ decides the term when @'symbol' x@ is the WRONG symbol to state it
+-- over. There is one logic symbol per data constructor and it is bound at the
+-- WORKER's argument sorts, but @'Constraint.Init'@ calls this for the WRAPPER
+-- entry too, and from @-O1@ up @-funbox-small-strict-fields@ makes the two
+-- take different arguments. Stating the singleton over @$WT@ then declares a
+-- SECOND, unrelated constant at the source field sorts: nothing relates it to
+-- the @match@ rules, the lifted selector equations or a reflected body, all of
+-- which are about @T@, so a construction is disconnected from every fact in
+-- scope about what it constructed.
+--
+-- There is no error and no message -- the term is well sorted, so the
+-- obligation is merely undischargeable at some distant binder. Below @-O1@
+-- there is no wrapper and @'symbol' x@ already names the worker, which is why
+-- @-O0@ is the oracle here.
+--
+-- See 'Language.Haskell.Liquid.Transforms.CoreToLogic.workerApp', which is
+-- what 'Constraint.Init' passes and which returns 'Nothing' -- leaving the
+-- pre-existing behaviour untouched -- for everything else.
+strengthenDataConType :: (Var -> [Symbol] -> Maybe Expr) -> (Var, SpecType) -> (Var, SpecType)
+strengthenDataConType wApp (x, t) = (x, fromRTypeRep trep {ty_res = tres})
   where
     tres     = F.notracepp _msg $ ty_res trep `strengthen` MkUReft (exprReft expr') mempty
     trep     = toRTypeRep t
@@ -154,7 +175,7 @@ strengthenDataConType (x, t) = (x, fromRTypeRep trep {ty_res = tres})
     x'       = symbol x
     expr' :: Expr
     expr' | null xs && null as = EVar x'
-          | otherwise          = mkEApp (dummyLoc x') (EVar <$> xs)
+          | otherwise          = fromMaybe (mkEApp (dummyLoc x') (EVar <$> xs)) (wApp x xs)
 
 
 dataConArgs :: SpecRep -> ([Symbol], [SpecType])

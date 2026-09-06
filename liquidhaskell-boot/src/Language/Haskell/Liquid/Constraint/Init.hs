@@ -46,6 +46,8 @@ import           Language.Haskell.Liquid.Types.RTypeOp
 import           Language.Haskell.Liquid.Types.Specs
 import           Language.Haskell.Liquid.Types.Types hiding (binds)
 import           Language.Haskell.Liquid.Types.Visitors
+import           Language.Haskell.Liquid.Transforms.CoreToLogic (workerApp)
+import           Language.Haskell.Liquid.Bare.DataType          (dataConMap)
 import           Language.Haskell.Liquid.UX.Config
 
 --------------------------------------------------------------------------------
@@ -96,7 +98,14 @@ initEnv info
     is autoinv   = mkRTyConInv    (gsInvariants (gsData sp) ++ ((Nothing,) <$> autoinv))
     addPolyInfo' = if reflection (getConfig info) then map (fmap addPolyInfo) else id
 
-    strengthenDc = map strengthenDataConType
+    -- A data constructor's singleton result must be stated over the WORKER's
+    -- symbol, which is the only one the logic has; 'workerApp' rewrites the
+    -- WRAPPER entry onto it, and declines -- leaving the previous behaviour --
+    -- for everything it cannot expand exactly. See
+    -- 'RT.strengthenDataConType'.
+    strengthenDc = map (strengthenDataConType workerSingleton)
+    workerSingleton x xs = workerApp (getConfig info) (gsTcEmbeds (gsName sp)) dcm x (F.EVar <$> xs)
+    dcm          = dataConMap (gsADTs (gsName sp))
 
 addPolyInfo :: SpecType -> SpecType
 addPolyInfo t = mkUnivs (go <$> as) ps t'

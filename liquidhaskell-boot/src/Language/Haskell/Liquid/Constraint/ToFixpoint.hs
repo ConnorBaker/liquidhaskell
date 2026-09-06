@@ -237,6 +237,37 @@ doExpand sp cfg sub = allowGlobalPLE cfg
 -- guard inside @go@, so the emitted 'F.SMeasure' entries are already
 -- worker-keyed.
 
+-- | Does this binder's argument list disagree with the one the LOGIC uses?
+--
+-- The logic has exactly ONE symbol per data constructor -- @F.Symbolic DataCon@
+-- is @F.symbol . dataConWorkId@ -- and 'RefType.mkProductTy' binds it at the
+-- WORKER's argument types. The wrapper's arguments are the SOURCE fields, and
+-- from @-O1@ up @-funbox-small-strict-fields@ makes the two lists differ.
+--
+-- 'makeSimplify' re-keys a wrapper's rewrites onto the worker symbol (see the
+-- note above), which is sound only while the two lists agree. When they do not,
+-- the emitted 'F.SMeasure' states the equation over SOURCE-sorted binders while
+-- PLE fires it at the worker's expanded sorts, and the body carries the wrong
+-- sort with it: for @data N = N !(Set Text)@ as a strict field of a two-field
+-- record, PLE reports @Cannot unify N with (Array_t Text bool)@ from
+-- @evalCandsLoop@, at @dummyLoc@, naming no binder.
+--
+-- Emitting nothing loses no fact. 'Measure.makeDataConType' hands the same
+-- equations to the WORKER as well, rebuilt over its representation arguments by
+-- 'Measure.toWorkerDef', and it is that entry which carries the correct rule.
+-- This drops a duplicate, not a rewrite. The wrapper's refinement TYPE is
+-- untouched, which is what a record update needs -- see
+-- @tests/datacon/pos/UnpackedFieldUpdate.hs@.
+wrapperArgsDiffer :: Var -> Bool
+wrapperArgsDiffer var = case Ghc.idDetails var of
+  Ghc.DataConWrapId dc ->
+    let origTys = Ghc.irrelevantMult <$> Ghc.dataConOrigArgTys dc
+        repTys  = Ghc.irrelevantMult <$> Ghc.dataConRepArgTys  dc
+        valTys  = drop (length repTys - length origTys) repTys
+    in length repTys - length (filter Ghc.isPredTy repTys) /= length origTys
+       || not (and (zipWith Ghc.eqType origTys valTys))
+  _ -> False
+
 -- | Given @(dc, t)@ where @dc@ is a data constructor and @t@ is its spec type,
 -- generate PLE rewrite rules for measures keyed on the worker DataCon symbol.
 --
@@ -255,6 +286,8 @@ doExpand sp cfg sub = allowGlobalPLE cfg
 makeSimplify :: (Var, SpecType) -> [F.Rewrite]
 makeSimplify (var, t)
   | not (GM.isDataConId var)
+  = []
+  | wrapperArgsDiffer var
   = []
   | otherwise
   = go $ specTypeToResultRef eVal t

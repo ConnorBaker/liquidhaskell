@@ -12,6 +12,9 @@
 - Rebuild every lifted measure equation over a data constructor's
   representation arguments, and give its wrapper the generated selector
   equations as well as the user-written ones
+- Lift a construction onto a data constructor's worker rather than its
+  wrapper, and stop re-keying the wrapper's PLE rewrites onto the worker when
+  the two take different arguments
 - Reject `ple` and `automatic-instances` annotations in modules that enable
   neither `--ple-local` nor `--ple`
   [#2737](https://github.com/ucsd-progsys/liquidhaskell/issues/2737)
