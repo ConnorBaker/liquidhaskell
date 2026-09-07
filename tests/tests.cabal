@@ -1084,6 +1084,7 @@ executable datacon-pos
                     , UnpackedFieldExpandedOnly
                     , UnpackedFieldWorkerApp
                     , UnpackedFieldWrapperSimplify
+                    , UnpackedFieldSubstUnused
 
     build-depends:    base
                     , liquid-prelude
@@ -1124,6 +1125,8 @@ executable datacon-neg
                     , UnpackedFieldWorkerSingleton
                     , UnpackedFieldWorkerApp
                     , UnpackedFieldWrapperSimplify
+                    , UnpackedFieldSubstSort
+                    , NestedCaseProjectionDeep
 
     build-depends:    base
                     , liquid-prelude

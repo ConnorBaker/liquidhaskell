@@ -58,6 +58,7 @@ import           Language.Haskell.Liquid.Types.RTypeOp
 import           Language.Haskell.Liquid.Types.Types
 
 import qualified Data.HashMap.Strict                   as M
+import qualified Data.HashSet                          as HS
 import Control.Monad.Reader
 import Language.Fixpoint.Types.Visitor (mapExprOnExpr)
 import Language.Haskell.Liquid.UX.Config
@@ -207,16 +208,26 @@ coreAltToDef locSym z zs y t alts
           -- fields -- which is what the logic knows @d@ to take. The two agree
           -- unless GHC has UNPACKed a strict field, so re-express the body over
           -- source-field binders whenever it has. See 'unpackedFieldSubst'.
-          return $ case unpackedFieldSubst embs dm d xs' x of
+          case unpackedFieldSubst embs dm d xs' x of
             Nothing ->
-              Def x {- (toArgs id args) -} d (Just $ varRType dx) (toArgs Just xs')
+              return
+                . Def x {- (toArgs id args) -} d (Just $ varRType dx) (toArgs Just xs')
                 . ctor
                 $ body `subst1` (F.symbol dx, F.mkEApp (GM.namedLocSymbol d) (F.eVar <$> xs'))
             Just (srcArgs, rewrite) ->
-              Def x d (Just $ varRType dx) srcArgs
-                . ctor
-                $ rewrite body
-                    `subst1` (F.symbol dx, F.mkEApp (GM.namedLocSymbol d) (F.eVar . fst <$> srcArgs))
+              -- ...unless the composition reaches through a field that has no
+              -- selector, exactly as 'altToLg' refuses for the nested-case
+              -- twin. Without this the equation is lifted around an undeclared
+              -- symbol and the failure surfaces as @Unbound symbol@ at the DATA
+              -- DECLARATION, naming neither the measure nor the field.
+              case namesDroppedSelector (droppedSelectors embs dm d) (rewrite body) of
+                Just (d', i) -> throw (noSelectorMsg d' i)
+                Nothing      ->
+                  return
+                    . Def x d (Just $ varRType dx) srcArgs
+                    . ctor
+                    $ rewrite body
+                        `subst1` (F.symbol dx, F.mkEApp (GM.namedLocSymbol d) (F.eVar . fst <$> srcArgs))
     mkAlt _ _ _ _ alt
       = throw $ "Bad alternative" ++ GM.showPpr alt
 
@@ -479,14 +490,16 @@ altToLg de (Alt a@(C.DataAlt d) xs e) = do
         -- name for it, but 'makeMeasureSelectors' never declared it, so the
         -- equation would be lifted around an @Unbound symbol@ reported at the
         -- DATA DECLARATION rather than here. Refusing names the measure and
-        -- the field instead. See 'Bare.resortedFields', the one authority on
-        -- which fields those are.
-        if or (resortedFields embs d)
-          then throw $ "field " ++ show (1 + length (takeWhile not (resortedFields embs d)))
-                    ++ " of " ++ GM.showPpr d
-                    ++ " has no selector in the logic: unpacking changes its sort"
-          else return (a, etaCollapse ctorSels
-                            (subst (mkSubst (concat (zipWith bind xs' projs))) p))
+        -- the field instead. See 'droppedSelectors', which asks
+        -- 'Bare.resortedFields' -- the one authority on which fields those
+        -- are -- at every constructor the descent passes through, not only at
+        -- this one, and 'namesDroppedSelector', which refuses only when the
+        -- equation this actually emits names one of them.
+        let out = etaCollapse ctorSels
+                    (subst (mkSubst (concat (zipWith bind xs' projs))) p)
+        in case namesDroppedSelector (droppedSelectors embs dm d) out of
+             Just (d', i) -> throw (noSelectorMsg d' i)
+             Nothing      -> return (a, out)
       else do
         let su = mkSubst $ concat [ dataConProj dm de d x i | (x, i) <- zip xs' [1..]]
         return (a, subst su p)
@@ -540,6 +553,71 @@ unpackedFieldSubst embs dm d xs x
     bind v p    = [(symbol v, p), (GM.simplesymbol v, p)]
     isEVar EVar{} = True
     isEVar _      = False
+
+-- | Every selector symbol the projection composition can NAME and
+-- 'Bare.makeMeasureSelectors' never DECLARED, each with the field it belongs
+-- to, over every constructor the 'unpackInto' descent from @d@ passes through.
+--
+-- 'Bare.resortedFields' answers that question for ONE constructor. Asking it
+-- only about the constructor a caller happens to hold is not enough, because
+-- 'fieldRepProjs' descends TRANSITIVELY: a field standing on several worker
+-- arguments carries a selector itself -- @moved _ _ = False@ -- while a field of
+-- the type it expands INTO may have lost one, and the composition then names a
+-- symbol nobody declared.
+--
+-- A field that has itself lost its selector is recorded AND still descended
+-- through. It is tempting not to -- every deeper selector 'altToLg' names is
+-- applied TO this one, so this one would be present whenever a deeper one is --
+-- but that reasoning holds only for 'altToLg', which starts its composition by
+-- applying @d@'s own selector to the SCRUTINEE. 'unpackedFieldSubst' starts
+-- from the source ARGUMENT BINDER, so the descent begins INSIDE the field and
+-- the outer selector never appears at all. Measured 2026-09-06: with the
+-- shortcut, @tests/datacon/neg/UnpackedFieldSubstSort.hs@ still reported
+-- @Unbound symbol@ at its data declaration while the three deeper shapes were
+-- caught.
+--
+-- Guarded by @tests/datacon/neg/UnpackedFieldSubstSort.hs@ (the site) and
+-- @tests/datacon/neg/NestedCaseProjectionDeep.hs@ (the depth); the precision
+-- half is @tests/datacon/pos/UnpackedFieldSubstUnused.hs@.
+droppedSelectors :: TCEmb TyCon -> DataConMap -> DataCon -> [(Symbol, (DataCon, Int))]
+droppedSelectors embs dm = go
+  where
+    go d = concat
+      [ [ (makeDataConSelector (Just dm) d i, (d, i)) | resorts ] ++ deeper t b
+      -- @ftbs@ and 'resortedFields' are both one entry per SOURCE field of the
+      -- same constructor, so 'zip3' truncates nothing here.
+      | (i, (t, b), resorts) <- zip3 [1 :: Int ..] (fieldsOf d) (resortedFields embs d)
+      ]
+    fieldsOf d = zip (Ghc.irrelevantMult <$> Ghc.dataConOrigArgTys d) (Ghc.dataConImplBangs d)
+    deeper t b = maybe [] (go . fst) (unpackInto embs t b)
+
+-- | The first dropped selector an EMITTED expression actually names, if any.
+--
+-- Deciding the refusal on the expression rather than on the constructor is the
+-- whole point, and getting that wrong is loud: a guard that refuses whenever
+-- the CONSTRUCTOR has a resorted field rejects every equation that simply does
+-- not project through it, which is most of them. Measured 2026-09-06, that
+-- spelling turned ELEVEN passing modules in @tests/datacon@ red -- the five
+-- @Dep@ ones project field 1 while field 2 is the @Set@ that resorts -- while
+-- passing every arm written for the defect it was meant to fix.
+--
+-- The check runs after 'etaCollapse', so a selector the reconstruction cancels
+-- is correctly not a reason to refuse.
+namesDroppedSelector :: [(Symbol, (DataCon, Int))] -> Expr -> Maybe (DataCon, Int)
+namesDroppedSelector tbl e
+  | null tbl  = Nothing
+  -- @tbl@ is in descent order and 'F.syms' is an unordered set, so the scan
+  -- goes this way round: which field gets NAMED in the message would otherwise
+  -- depend on a hash.
+  | otherwise = listToMaybe [ field | (sel, field) <- tbl, sel `HS.member` named ]
+  where
+    named = F.syms e
+
+-- | The refusal both projection sites report, so the two cannot drift apart.
+noSelectorMsg :: DataCon -> Int -> String
+noSelectorMsg d i
+  =  "field " ++ show i ++ " of " ++ GM.showPpr d
+  ++ " has no selector in the logic: unpacking changes its sort"
 
 -- | The logic expressions denoting the representation arguments that one source
 -- field expands to, given the expression denoting the field itself. Unpacking
