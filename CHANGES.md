@@ -15,6 +15,12 @@
 - Lift a construction onto a data constructor's worker rather than its
   wrapper, and stop re-keying the wrapper's PLE rewrites onto the worker when
   the two take different arguments
+- Refuse a lifted equation that projects through a field with no selector at
+  BOTH projection sites and at every constructor the expansion descends
+  through, deciding it from the equation actually emitted rather than from the
+  constructor, so an unpacked field neither escapes the refusal as
+  `Unbound symbol` at a data declaration nor triggers it when nothing projects
+  through it
 - Reject `ple` and `automatic-instances` annotations in modules that enable
   neither `--ple-local` nor `--ple`
   [#2737](https://github.com/ucsd-progsys/liquidhaskell/issues/2737)
