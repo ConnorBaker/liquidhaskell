@@ -21,6 +21,10 @@
   constructor, so an unpacked field neither escapes the refusal as
   `Unbound symbol` at a data declaration nor triggers it when nothing projects
   through it
+- Keep a field's written refinement when unpacking changes its sort, by
+  rebuilding the field from the components it expanded to, instead of dropping
+  it: a `{-@ data @-}` bound on a strict field no longer stops being enforced
+  because GHC unboxed it
 - Reject `ple` and `automatic-instances` annotations in modules that enable
   neither `--ple-local` nor `--ple`
   [#2737](https://github.com/ucsd-progsys/liquidhaskell/issues/2737)

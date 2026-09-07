@@ -1076,6 +1076,9 @@ executable datacon-pos
                     , UnpackedFieldWorkerApp
                     , UnpackedFieldWrapperSimplify
                     , UnpackedFieldSubstUnused
+                    , UnpackedFieldReftSort
+                    , UnpackedFieldReftMulti
+                    , UnpackedFieldReftMulti3
 
     build-depends:    base
                     , liquid-prelude
@@ -1108,6 +1111,7 @@ executable datacon-neg
                     , UnpackedFieldBinders
                     , UnpackedFieldReft
                     , UnpackedFieldReftSort
+                    , UnpackedFieldReftMulti
                     , UnpackedFieldSorts
                     , NestedCaseProjectionSort
                     , UnpackedFieldExpandedSorts
