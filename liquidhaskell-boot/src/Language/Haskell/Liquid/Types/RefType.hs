@@ -1702,7 +1702,7 @@ data DataConAppContext
   , dcac_co      :: !Coercion
   }
 
-mkProductTy :: forall t r. (IsReft t, IsReft r)
+mkProductTy :: forall t r. (IsReft t, IsReft r, ReftBind r ~ Symbol, ReftVar r ~ Symbol)
             => F.TCEmb TyCon
             -> (Type, Symbol, RFInfo, RType RTyCon RTyVar r, t)
             -> [(Symbol, RFInfo, RType RTyCon RTyVar r, t)]
@@ -1736,10 +1736,11 @@ mkProductTy embs (τ, x, i, t, r) = maybe [(x, i, t, r)] f (deepSplitProductType
     -- preserve one name for several values, so each component is suffixed and
     -- the names stay pairwise distinct.
     f    DataConAppContext{..} = case dcac_arg_tys of
-      [t1] -> [(x, defRFInfo, keepReft (fst t1), trueReft)]
-      tys  -> [ (intSymbol (suffixSymbol x "expand") j, defRFInfo, ofType (fst ty), trueReft)
-              | (j, ty) <- zip [1 :: Int ..] tys
-              ]
+      [t1] -> [(x, defRFInfo, keepReft dcac_dc (fst t1), trueReft)]
+      tys  -> reftOnLast dcac_dc
+                [ (intSymbol (suffixSymbol x "expand") j, defRFInfo, ofType (fst ty), trueReft)
+                | (j, ty) <- zip [1 :: Int ..] tys
+                ]
     -- KEEP THE FIELD'S OWN REFINEMENT. `ofType` alone returns the component's
     -- type with a TRIVIAL refinement, so a user-written
     -- `{-@ data F = F [Int] {v : Int | v <= lim} @-}` silently loses its
@@ -1755,10 +1756,90 @@ mkProductTy embs (τ, x, i, t, r) = maybe [(x, i, t, r)] f (deepSplitProductType
     -- refinement transfers verbatim; an `IORef a -> MutVar# ...` one does not,
     -- and carrying the refinement across would reintroduce exactly the
     -- `Illegal type specification` that dropping the selector removed.
-    keepReft t1 = case stripRTypeBase t of
-      Just r0 | typeSort embs τ == typeSort embs t1
-                -> strengthenWith (\_ new -> new) (ofType t1) r0
-      _         -> ofType t1
+    keepReft dc t1
+      | Just r0 <- stripRTypeBase t
+      , typeSort embs τ == typeSort embs t1
+      = strengthenWith (\_ new -> new) (ofType t1) r0
+      -- ...and where the sorts DIFFER, relate them instead of dropping the
+      -- refinement. See 'rebuiltOverComponent'.
+      | Just r0 <- stripRTypeBase t
+      = strengthenWith (\_ new -> new) (ofType t1) (rebuiltOverComponent dc r0)
+      | otherwise
+      = ofType t1
+
+    -- | The multi-component twin of 'rebuiltOverComponent'.
+    --
+    -- A field expanded into SEVERAL components has the same problem and had no
+    -- comment admitting it: every component got 'ofType', so the field's
+    -- refinement was dropped outright. Measured 2026-09-06 on
+    -- @data H = H [Int] {-# UNPACK #-} !P2@ with @P2 !Int !Int@ -- @SAFE (1)@
+    -- at @-O0@, @UNSAFE (1)@ at @-O1@ and @-O2@, identical count -- so it is
+    -- the same optimisation-dependent loss, in the shape an explicit
+    -- @{-# UNPACK #-}@ produces, which is the common one.
+    --
+    -- The refinement relates ALL the components at once, so it cannot sit on
+    -- any one of them in isolation. It goes on the LAST, which is the only
+    -- position where every earlier binder is in scope: a constructor's spec is
+    -- a dependent function type and an argument's refinement may name the
+    -- arguments before it. @{v : P2 | p2Fst v <= 10}@ on a field expanding to
+    -- @a, b@ becomes @{v : int | p2Fst (P2 a v) <= 10}@ on @b@.
+    reftOnLast dc comps
+      | Just r0 <- stripRTypeBase t
+      , (pre, [(xn, iN, tn, rn)]) <- splitAt (length comps - 1) comps
+      = pre ++ [(xn, iN, strengthenWith (\_ new -> new) tn (rebuild pre r0), rn)]
+      | otherwise
+      = comps
+      where
+        -- the earlier binders come from @pre@, which the pattern above has
+        -- already split off, rather than from @init comps@: the guard proves
+        -- @comps@ non-empty, but a total expression needs no such proof and
+        -- this is the only partial call this module would otherwise contain.
+        rebuild before = mapReftField (\(F.Reft (v, p)) -> F.Reft (v, F.subst1 p (v, app before v)))
+        app before v   = F.mkEApp (GM.namedLocSymbol dc)
+                                  ([ F.EVar n | (n, _, _, _) <- before ] ++ [F.EVar v])
+
+    -- | Re-express the field's own refinement over the COMPONENT it expanded
+    -- to, by rebuilding the field from it: @{v : W | wOf v <= 10}@ on a field
+    -- that unpacks to its @Int@ becomes @{v : int | wOf (W v) <= 10}@.
+    --
+    -- Dropping it instead is sound and was what this did until 2026-09-06, but
+    -- it is a real optimisation-dependent difference rather than a repair: the
+    -- same module is @SAFE (1)@ at @-O0@ and @UNSAFE (1)@ at @-O1@ and @-O2@,
+    -- at an IDENTICAL constraint count, so the obligation is raised either way
+    -- and only its discharge moves. A user-written bound that stops being
+    -- enforced because GHC unpacked a field is exactly the class of
+    -- @-funbox-small-strict-fields@ damage the rest of this series exists to
+    -- remove.
+    --
+    -- The substitution goes UNDER the refinement's own binder, which is why it
+    -- is 'mapReftField' plus an explicit 'F.Reft' match rather than 'F.subst1'
+    -- on @r0@ -- a 'Subable' substitution respects that binder and would be a
+    -- no-op.
+    --
+    -- The application is single-argument because @dc@ has exactly one field in
+    -- this branch, so @dc v@ IS the field and the fact transferred is the fact
+    -- that was written. The multi-component case is the SAME defect and is
+    -- handled one branch up, in 'reftOnLast' -- see the note there for why the
+    -- refinement goes on the LAST component. It was measured separately rather
+    -- than assumed: before that half, @tests/datacon/pos/UnpackedFieldReftMulti.hs@
+    -- read @SAFE (1) / UNSAFE (1) / UNSAFE (1)@ across @-O0@\/@-O1@\/@-O2@,
+    -- the identical signature this branch had.
+    --
+    -- THERE IS DELIBERATELY NO GUARD ON @dc@ HERE, and the guard that looked
+    -- obviously required is measured INERT. Copying 'Measure.unpackInto''s two
+    -- exclusions -- refuse a NEWTYPE, refuse an EMBEDDED type, because neither
+    -- has a datatype in the logic to rebuild with -- changes no verdict on any
+    -- input found: with it forced to @True@, a @{-@ data @-}@ refinement on an
+    -- @!(IORef Int)@ field (a newtype over @MutVar#@, the recorded case) is
+    -- @SAFE@ either way, and so are all 26 modules under @tests/datacon@.
+    -- An embedded type never reaches here at all, because its sort and its
+    -- component's agree and the branch above takes it. Adding a guard nobody
+    -- can falsify is how ceremony gets copied forward as required.
+    rebuiltOverComponent dc = mapReftField rebuild
+      where
+        rebuild (F.Reft (v, p)) =
+          F.Reft (v, F.subst1 p (v, F.mkEApp (GM.namedLocSymbol dc) [F.EVar v]))
+
     menv = (emptyFamInstEnv, emptyFamInstEnv)
 
 -- Copied from GHC 9.0.2.
