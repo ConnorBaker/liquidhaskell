@@ -1359,6 +1359,7 @@ executable unit-neg
                     , T1657
                     , T1659
                     , T1693B
+                    , T1693D
                     , T1814
                     , T1907
                     , T602
@@ -1657,6 +1658,7 @@ executable unit-pos-2
                     , T1145b
                     , T1693
                     , T1693A
+                    , T1693C
                     , T2756
 
     build-depends:    base

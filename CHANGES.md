@@ -5,6 +5,10 @@
 - Stop crashing constraint generation when a class method is applied to a
   dictionary that is not its own class's, as `mapM` and `foldMap` do
   [#1693](https://github.com/ucsd-progsys/liquidhaskell/issues/1693)
+- Pin a third arming shape of that crash in tests: a dictionary function applied
+  to a value argument before the refined dictionary, as an instance with an
+  `Ord k` context in front of a refined `Semigroup v` produces
+  [#1693](https://github.com/ucsd-progsys/liquidhaskell/issues/1693)
 - Make the positivity checker's variance lookup total, so a type's positivity
   verdict no longer depends on which module is being compiled
 - Restore the `--check-derived` flag, with tests
