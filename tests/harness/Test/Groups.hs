@@ -22,6 +22,7 @@ microTestGroups =
   , "measure-neg"
   , "datacon-pos"
   , "datacon-neg"
+  , "datacon-unsound"
   , "Diff"
   , "names-pos"
   , "names-neg"

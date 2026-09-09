@@ -21,6 +21,12 @@
   constructor, so an unpacked field neither escapes the refusal as
   `Unbound symbol` at a data declaration nor triggers it when nothing projects
   through it
+- Pin six more `-O1` worker/wrapper seam shapes in `tests/datacon`, with
+  green controls, and add a `datacon-unsound` suite whose one module,
+  `tests/datacon/unsound/GadtUnpackMiddleProject.hs`, records a KNOWN
+  UNSOUND shape: a projection through an `{-# UNPACK #-}`ed field in the
+  middle of a GADT constructor verifies a false claim at `-O1` and not at
+  `-O0`
 - Keep a field's written refinement when unpacking changes its sort, by
   rebuilding the field from the components it expanded to, instead of dropping
   it: a `{-@ data @-}` bound on a strict field no longer stops being enforced
