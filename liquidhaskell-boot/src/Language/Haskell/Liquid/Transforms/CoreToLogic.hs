@@ -32,7 +32,6 @@ import qualified Liquid.GHC.API       as Ghc
 import qualified Liquid.GHC.API       as C
 import qualified Data.List                             as L
 import           Data.Maybe                            (listToMaybe)
-import qualified Data.Maybe                            as Mb
 import qualified Data.Text                             as T
 import qualified Data.Char
 import qualified Text.Printf as Printf
@@ -48,7 +47,7 @@ import qualified Language.Haskell.Liquid.GHC.Misc      as GM
 
 import           Language.Haskell.Liquid.Bare.Types
 import           Language.Haskell.Liquid.Bare.DataType
-import           Language.Haskell.Liquid.Measure          (fieldRepTys, unpackInto)
+import           Language.Haskell.Liquid.Types.RepMap
 import           Language.Haskell.Liquid.Bare.Misc     (simpleSymbolVar)
 import           Language.Haskell.Liquid.Types.Errors
 import           Language.Haskell.Liquid.Types.Names
@@ -208,26 +207,33 @@ coreAltToDef locSym z zs y t alts
           -- fields -- which is what the logic knows @d@ to take. The two agree
           -- unless GHC has UNPACKed a strict field, so re-express the body over
           -- source-field binders whenever it has. See 'unpackedFieldSubst'.
-          case unpackedFieldSubst embs dm d xs' x of
-            Nothing ->
-              return
-                . Def x {- (toArgs id args) -} d (Just $ varRType dx) (toArgs Just xs')
-                . ctor
-                $ body `subst1` (F.symbol dx, F.mkEApp (GM.namedLocSymbol d) (F.eVar <$> xs'))
-            Just (srcArgs, rewrite) ->
+          case dataConRepMap embs d of
+            Right rm | Just (srcArgs, rewrite) <- unpackedFieldSubst dm rm xs' x ->
               -- ...unless the composition reaches through a field that has no
               -- selector, exactly as 'altToLg' refuses for the nested-case
-              -- twin. Without this the equation is lifted around an undeclared
-              -- symbol and the failure surfaces as @Unbound symbol@ at the DATA
-              -- DECLARATION, naming neither the measure nor the field.
-              case namesDroppedSelector (droppedSelectors embs dm d) (rewrite body) of
+              -- twin, or the equation KEEPS a source binder that 'toWorkerDef'
+              -- will later have to rebuild through a constructor the logic does
+              -- not know. Without either refusal the equation is lifted around
+              -- an undeclared symbol and the failure surfaces as
+              -- @Unbound symbol@ at the DATA DECLARATION, naming neither the
+              -- measure nor the field. The second case is the one the eta law
+              -- makes reachable: @a2R (A2 r) = r@ over @A2 !(IORef Int)@ has
+              -- the Core body @IORef (STRef mv)@, whose rewrite collapses to
+              -- the source binder @r@ and so names no selector at all.
+              let out = rewrite body
+              in case namesDroppedSelector (undeclaredSelectorsOf (knownDataCon dm) (makeDataConSelector (Just dm)) rm) out
+                        `orElseMb` keepsUnrebuildable (knownDataCon dm) rm srcArgs out of
                 Just (d', i) -> throw (noSelectorMsg d' i)
                 Nothing      ->
                   return
                     . Def x d (Just $ varRType dx) srcArgs
                     . ctor
-                    $ rewrite body
-                        `subst1` (F.symbol dx, F.mkEApp (GM.namedLocSymbol d) (F.eVar . fst <$> srcArgs))
+                    $ out `subst1` (F.symbol dx, F.mkEApp (GM.namedLocSymbol d) (F.eVar . fst <$> srcArgs))
+            _ ->
+              return
+                . Def x {- (toArgs id args) -} d (Just $ varRType dx) (toArgs Just xs')
+                . ctor
+                $ body `subst1` (F.symbol dx, F.mkEApp (GM.namedLocSymbol d) (F.eVar <$> xs'))
     mkAlt _ _ _ _ alt
       = throw $ "Bad alternative" ++ GM.showPpr alt
 
@@ -466,41 +472,35 @@ altToLg de (Alt a@(C.DataAlt d) xs e) = do
     dm <- reader lsDCMap
     embs <- reader lsEmb
     allowTC <- reader (typeclass . lsConfig)
-    let xs'     = filter (not . if allowTC then GM.isEmbeddedDictVar else GM.isEvVar) xs
-        srcTys  = Ghc.irrelevantMult <$> Ghc.dataConOrigArgTys d
-        bangs   = Ghc.dataConImplBangs d
-        -- The expression denoting each SOURCE field of the scrutinee.
-        srcSels = [ EApp (EVar (makeDataConSelector (Just dm) d j)) de
-                  | j <- [1 .. length srcTys] ]
-        projs   = concat (zipWith3 (fieldRepProjs embs dm) srcTys bangs srcSels)
-        ctorSels = concat (zipWith (unpackedCtorSels embs dm) srcTys bangs)
-        unpacked = length srcTys == length bangs
-                && or [ Mb.isJust (unpackInto embs t b) | (t, b) <- zip srcTys bangs ]
+    let xs' = filter (not . if allowTC then GM.isEmbeddedDictVar else GM.isEvVar) xs
+        sel = makeDataConSelector (Just dm)
         bind v pr = [(symbol v, pr), (GM.simplesymbol v, pr)]
-    if unpacked && length projs == length xs'
+    case dataConRepMap embs d of
       -- The alternative binds the constructor's REPRESENTATION arguments,
       -- while 'makeDataConSelector' names its SOURCE fields; the two lists
       -- agree only when GHC unpacked nothing. Where it did, reach each
       -- representation binder by the composition of selectors that gets to
-      -- it, exactly as 'unpackedFieldSubst' does for the top-level case of a
-      -- lifted equation -- of which this is the nested-case twin.
-      then
+      -- it -- 'projectField' over the constructor's 'RepMap', exactly as
+      -- 'unpackedFieldSubst' does for the top-level case of a lifted
+      -- equation, of which this is the nested-case twin.
+      Right rm | rmChanged rm
+               , let projs = concat [ projectField sel fr (EApp (EVar (sel d j)) de)
+                                    | (j, fr) <- zip [1 ..] (rmFields rm) ]
+               , length projs == length xs' ->
         -- ...unless a field this projects through has NO selector, because
         -- unpacking moved its sort. 'makeDataConSelector' still returns a
         -- name for it, but 'makeMeasureSelectors' never declared it, so the
         -- equation would be lifted around an @Unbound symbol@ reported at the
         -- DATA DECLARATION rather than here. Refusing names the measure and
-        -- the field instead. See 'droppedSelectors', which asks
-        -- 'Bare.resortedFields' -- the one authority on which fields those
-        -- are -- at every constructor the descent passes through, not only at
-        -- this one, and 'namesDroppedSelector', which refuses only when the
-        -- equation this actually emits names one of them.
-        let out = etaCollapse ctorSels
+        -- the field instead. 'undeclaredSelectorsOf' walks the whole descent,
+        -- not only this constructor, and 'namesDroppedSelector' refuses only
+        -- when the equation this actually emits names one of them.
+        let out = etaCollapse (ctorLeafProjs sel rm : concatMap (fieldCtorProjs sel) (rmFields rm))
                     (subst (mkSubst (concat (zipWith bind xs' projs))) p)
-        in case namesDroppedSelector (droppedSelectors embs dm d) out of
+        in case namesDroppedSelector (undeclaredSelectorsOf (knownDataCon dm) sel rm) out of
              Just (d', i) -> throw (noSelectorMsg d' i)
              Nothing      -> return (a, out)
-      else do
+      _ -> do
         let su = mkSubst $ concat [ dataConProj dm de d x i | (x, i) <- zip xs' [1..]]
         return (a, subst su p)
 
@@ -532,64 +532,30 @@ altToLg _ (Alt a _ e)
 -- datatype -- reduces back to @a1@.
 --
 -- Returns 'Nothing' -- leaving the pre-existing behaviour untouched -- unless
--- the expansion both accounts for every binder and actually descends through a
--- constructor, so a data type with no unpacked fields is unaffected.
+-- the constructor's 'RepMap' says something changed ('rmChanged') and the
+-- expansion accounts for every binder. 'rmChanged' is the ONE "did anything
+-- change" decision; a second one here, "is some projection more than a
+-- variable", was measured wrong on a strict field of a NULLARY type, which
+-- unpacks to NO worker argument: every surviving projection is a variable,
+-- the equation was left Core-shaped, and the module failed at its measure
+-- with @Requires 2 fields but given 1@. See
+-- @tests/datacon/pos/NullaryUnpack.hs@.
 unpackedFieldSubst
   :: IsReft r
-  => TCEmb TyCon -> DataConMap -> DataCon -> [Var] -> Located LHName
+  => DataConMap -> RepMap -> [Var] -> Located LHName
   -> Maybe ([(Symbol, Maybe (Located (RRType r)))], Expr -> Expr)
-unpackedFieldSubst embs dm d xs x
-  | length projs == length xs, any (not . isEVar) projs
-  = Just (srcArgs, etaCollapse ctorSels . F.subst (F.mkSubst (concat (zipWith bind xs projs))))
+unpackedFieldSubst dm rm xs x
+  | rmChanged rm, length projs == length xs
+  = Just (srcArgs, etaCollapse ctorProjs . F.subst (F.mkSubst (concat (zipWith bind xs projs))))
   | otherwise
   = Nothing
   where
-    srcTys      = Ghc.irrelevantMult <$> Ghc.dataConOrigArgTys d
-    srcArgs     = defArgs x srcTys
-    bangs       = Ghc.dataConImplBangs d
-    projs       = concat (zipWith3 (fieldRepProjs embs dm) srcTys bangs
-                                   (F.eVar . fst <$> srcArgs))
-    ctorSels    = concat (zipWith (unpackedCtorSels embs dm) srcTys bangs)
+    sel         = makeDataConSelector (Just dm)
+    srcArgs     = defArgs x (frSource <$> rmFields rm)
+    projs       = concat (zipWith (projectField sel) (rmFields rm) (F.eVar . fst <$> srcArgs))
+    ctorProjs   = ctorLeafProjs sel rm : concatMap (fieldCtorProjs sel) (rmFields rm)
     bind v p    = [(symbol v, p), (GM.simplesymbol v, p)]
-    isEVar EVar{} = True
-    isEVar _      = False
 
--- | Every selector symbol the projection composition can NAME and
--- 'Bare.makeMeasureSelectors' never DECLARED, each with the field it belongs
--- to, over every constructor the 'unpackInto' descent from @d@ passes through.
---
--- 'Bare.resortedFields' answers that question for ONE constructor. Asking it
--- only about the constructor a caller happens to hold is not enough, because
--- 'fieldRepProjs' descends TRANSITIVELY: a field standing on several worker
--- arguments carries a selector itself -- @moved _ _ = False@ -- while a field of
--- the type it expands INTO may have lost one, and the composition then names a
--- symbol nobody declared.
---
--- A field that has itself lost its selector is recorded AND still descended
--- through. It is tempting not to -- every deeper selector 'altToLg' names is
--- applied TO this one, so this one would be present whenever a deeper one is --
--- but that reasoning holds only for 'altToLg', which starts its composition by
--- applying @d@'s own selector to the SCRUTINEE. 'unpackedFieldSubst' starts
--- from the source ARGUMENT BINDER, so the descent begins INSIDE the field and
--- the outer selector never appears at all. Measured 2026-09-06: with the
--- shortcut, @tests/datacon/neg/UnpackedFieldSubstSort.hs@ still reported
--- @Unbound symbol@ at its data declaration while the three deeper shapes were
--- caught.
---
--- Guarded by @tests/datacon/neg/UnpackedFieldSubstSort.hs@ (the site) and
--- @tests/datacon/neg/NestedCaseProjectionDeep.hs@ (the depth); the precision
--- half is @tests/datacon/pos/UnpackedFieldSubstUnused.hs@.
-droppedSelectors :: TCEmb TyCon -> DataConMap -> DataCon -> [(Symbol, (DataCon, Int))]
-droppedSelectors embs dm = go
-  where
-    go d = concat
-      [ [ (makeDataConSelector (Just dm) d i, (d, i)) | resorts ] ++ deeper t b
-      -- @ftbs@ and 'resortedFields' are both one entry per SOURCE field of the
-      -- same constructor, so 'zip3' truncates nothing here.
-      | (i, (t, b), resorts) <- zip3 [1 :: Int ..] (fieldsOf d) (resortedFields embs d)
-      ]
-    fieldsOf d = zip (Ghc.irrelevantMult <$> Ghc.dataConOrigArgTys d) (Ghc.dataConImplBangs d)
-    deeper t b = maybe [] (go . fst) (unpackInto embs t b)
 
 -- | The first dropped selector an EMITTED expression actually names, if any.
 --
@@ -613,58 +579,56 @@ namesDroppedSelector tbl e
   where
     named = F.syms e
 
+-- | The first source-field binder the equation keeps whose field the logic
+-- cannot rebuild from the worker's arguments ('fieldRebuildable'), if any.
+-- 'toWorkerDef' would have to substitute that rebuild for the binder.
+keepsUnrebuildable :: (DataCon -> Bool) -> RepMap -> [(Symbol, a)] -> Expr -> Maybe (DataCon, Int)
+keepsUnrebuildable known rm srcArgs e
+  = listToMaybe [ (rmDataCon rm, i)
+                | (i, fr, (b, _)) <- zip3 [1 ..] (rmFields rm) srcArgs
+                , not (fieldRebuildable known fr)
+                , b `HS.member` named ]
+  where
+    named = F.syms e
+
+orElseMb :: Maybe a -> Maybe a -> Maybe a
+orElseMb (Just a) _ = Just a
+orElseMb Nothing  b = b
+
 -- | The refusal both projection sites report, so the two cannot drift apart.
 noSelectorMsg :: DataCon -> Int -> String
 noSelectorMsg d i
   =  "field " ++ show i ++ " of " ++ GM.showPpr d
   ++ " has no selector in the logic: unpacking changes its sort"
 
--- | The logic expressions denoting the representation arguments that one source
--- field expands to, given the expression denoting the field itself. Unpacking
--- is transitive, so this recurses.
-fieldRepProjs :: TCEmb TyCon -> DataConMap -> Type -> Ghc.HsImplBang -> Expr -> [Expr]
-fieldRepProjs embs dm t b e = case unpackInto embs t b of
-  Nothing        -> [e]
-  Just (d, ftbs) ->
-    concat [ fieldRepProjs embs dm ft b' (EApp (EVar (makeDataConSelector (Just dm) d i)) e)
-           | (i, (ft, b')) <- zip [1 ..] ftbs
-           ]
 
--- | Every constructor the expansion descends through, with its selectors.
-unpackedCtorSels :: TCEmb TyCon -> DataConMap -> Type -> Ghc.HsImplBang
-                 -> [(Symbol, [Symbol])]
-unpackedCtorSels embs dm t b = case unpackInto embs t b of
-  Nothing        -> []
-  Just (d, ftbs) ->
-    (F.val (GM.namedLocSymbol d), [ makeDataConSelector (Just dm) d i
-                                  | i <- [1 .. length ftbs] ])
-    : concat [ unpackedCtorSels embs dm ft b' | (ft, b') <- ftbs ]
-
--- | @C (sel_1 e) .. (sel_n e) ==> e@: the eta law of a single-constructor
--- datatype.
+-- | @C (proj_1 e) .. (proj_m e) ==> e@: the eta law of a single-constructor
+-- datatype, with @proj_k@ the projection of @e@ to the logic constructor's
+-- @k@-th LEAF -- 'fieldCtorProjs' -- since the logic's @C@ takes its unpacked
+-- fields' components flat.
 --
 -- Lifting a record selector for an UNPACKed field yields exactly that redex,
 -- because GHC's Core rebuilds the field from its components and
 -- 'unpackedFieldSubst' then re-expresses each component as a projection. Left
--- standing it is well sorted but opaque -- the logic only reduces it when the
--- datatype is declared to the SMT solver -- so collapse it here, where the two
--- halves are known to be inverse by construction.
-etaCollapse :: [(Symbol, [Symbol])] -> Expr -> Expr
+-- standing it is well sorted but opaque -- the solver has no equations for a
+-- selector applied to a value it did not see constructed -- so collapse it
+-- here, where the two halves are known to be inverse by construction. The
+-- candidates for @e@ are the first argument and everything under it, since
+-- @proj_1 e@ is a chain of selectors applied to @e@.
+etaCollapse :: [(Symbol, Expr -> [Expr])] -> Expr -> Expr
 etaCollapse dcs
   | null dcs  = id
   | otherwise = mapExprOnExpr step
   where
     step e0 = case splitEApp e0 of
-      (EVar c, args)
-        | Just sels <- L.lookup c dcs
-        , length sels == length args
-        , Just (e : es) <- mapM unSel (zip sels args)
-        , all (e ==) es
+      (EVar c, args@(a1 : _))
+        | Just projs <- L.lookup c dcs
+        , Just e <- L.find (\e -> projs e == args) (under a1)
         -> e
       _ -> e0
-    unSel (sel, a) = case splitEApp a of
-      (EVar s, [e]) | s == sel -> Just e
-      _                        -> Nothing
+    under e = e : case splitEApp e of
+      (_, [e']) -> under e'
+      _         -> []
 
 dataConProj :: DataConMap -> Expr -> DataCon -> Var -> Int -> [(Symbol, Expr)]
 dataConProj dm de d x i = [(symbol x, t), (GM.simplesymbol x, t)]
@@ -786,35 +750,34 @@ toLogicApp e = do
 -- @tests/datacon/pos/UnpackedFieldWorkerReflect.hs@.
 --
 -- Returns 'Nothing' -- leaving the pre-existing behaviour untouched -- unless
--- the application is saturated and the expansion lands on the worker's own
--- value arguments, in COUNT and in SORT. A constructor with a context needs
--- the count check: @'Ghc.dataConRepArgTys'@ leads with one argument per class
--- constraint while @'Ghc.dataConOrigArgTys'@ carries none. The sort check is
--- the one that is not obvious, and counting alone is measurably not enough --
--- @'unpackInto'@ refuses a newtype and an embedded type, so
--- @data T = T !(IORef Int) !Int@ has ONE expansion per field either way while
--- the worker's first argument is a @MutVar#@. Emitting @T r n@ there is
--- ill-sorted and takes down the whole module with
--- @Cannot unify MutVar# with IORef@; see 'fieldRepTys' and
--- @tests/datacon/pos/UnpackedFieldSorts.hs@, which is the arm that caught it.
+-- the application is saturated and the constructor's 'RepMap' aligns its
+-- source fields with the worker's arguments, which is the count AND the sort
+-- check at once: the 'RepMap' reads each leaf's type off the worker, so a
+-- field whose one worker argument is at another sort ('frResorted') is
+-- visible here rather than inferred from a count. Counting alone is measurably
+-- not enough -- @data T = T !(IORef Int) !Int@ has ONE argument per field
+-- either way while the worker's first argument is a @MutVar#@, and emitting
+-- @T r n@ there is ill-sorted and takes down the whole module with
+-- @Cannot unify MutVar# with IORef@; @tests/datacon/pos/UnpackedFieldSorts.hs@
+-- is the arm that caught it. Such a field is projected through its newtype's
+-- selector instead, when the logic has one (see 'fieldProjectable').
 workerApp :: Config -> TCEmb TyCon -> DataConMap -> Var -> [Expr] -> Maybe Expr
 workerApp cfg embs dm v args
   | not (adtFlag cfg)
   , Ghc.DataConWrapId d <- Ghc.idDetails v
-  , let srcTys  = Ghc.irrelevantMult <$> Ghc.dataConOrigArgTys d
-  , let bangs   = Ghc.dataConImplBangs d
-  , length args == length srcTys
-  , length bangs == length srcTys
-  , let repArgs = concat (zipWith3 (fieldRepProjs embs dm) srcTys bangs args)
-  , let repTys  = concat (zipWith  (fieldRepTys   embs)    srcTys bangs)
-  , let valTys  = filter (not . Ghc.isPredTy)
-                         (Ghc.irrelevantMult <$> Ghc.dataConRepArgTys d)
-  , length repArgs == length valTys
-  , length repTys  == length valTys
-  , and (zipWith (\s r -> typeSort embs s == typeSort embs r) repTys valTys)
-  = Just (F.mkEApp (GM.namedLocSymbol d) repArgs)
+  , Right rm <- dataConRepMap embs d
+  , length args == length (rmFields rm)
+  , all (fieldProjectable (knownDataCon dm)) (rmFields rm)
+  = Just (F.mkEApp (GM.namedLocSymbol d)
+                   (concat (zipWith (projectField (makeDataConSelector (Just dm))) (rmFields rm) args)))
   | otherwise
   = Nothing
+    -- The projection composes the selectors of every constructor a field is
+    -- unpacked through, and those exist only for constructors the logic knows
+    -- ('Bare.knownDataCon'): @!(IORef Int)@ becomes a @MutVar#@ through
+    -- @IORef@ and @STRef@, neither of which has a datatype in the logic. There
+    -- the rewrite declines and the construction stays on the wrapper --
+    -- disconnected but well sorted, the pre-existing behaviour.
 
 makeApp :: Expr -> LogicMap -> Located Symbol-> [Expr] -> Expr
 makeApp _ _ f [e]

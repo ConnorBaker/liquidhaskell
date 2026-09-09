@@ -8,7 +8,8 @@ module Language.Haskell.Liquid.Bare.DataType
   -- * Names for accessing Data Constuctors
   , makeDataConChecker
   , makeDataConSelector
-  , resortedFields
+  , droppedSelectorFields
+  , knownDataCon
   , addClassEmbeds
 
   -- * Constructors
@@ -39,6 +40,7 @@ import           Language.Haskell.Liquid.Types.Names
 import           Language.Haskell.Liquid.Types.PredType (dataConPSpecType)
 import qualified Language.Haskell.Liquid.Types.RefType  as RT
 import           Language.Haskell.Liquid.Types.RType
+import           Language.Haskell.Liquid.Types.RepMap (RepMap (rmFields), fieldSelectorDropped, repMapErrorDoc)
 import           Language.Haskell.Liquid.Types.RTypeOp
 import           Language.Haskell.Liquid.Types.Types
 import           Language.Haskell.Liquid.Types.Meet
@@ -59,13 +61,18 @@ import Text.PrettyPrint ((<+>))
 --------------------------------------------------------------------------------
 -- | 'DataConMap' stores the names of those ctor-fields that have been declared
 --   as SMT ADTs so we don't make up new names for them.
+--
+--   Index @0@ is the constructor ITSELF, present for every declared
+--   constructor including a nullary one, so that 'knownDataCon' can ask
+--   whether the logic has the constructor at all. Nothing enumerates the map;
+--   every reader looks a @(constructor, index)@ up.
 --------------------------------------------------------------------------------
 dataConMap :: [F.DataDecl] -> Bare.DataConMap
 dataConMap ds = M.fromList $ do
   d     <- ds
   c     <- F.ddCtors d
   let fs = F.symbol <$> F.dcFields c
-  zip ((F.symbol c,) <$> [1..]) fs
+  ((F.symbol c, 0), F.symbol c) : zip ((F.symbol c,) <$> [1..]) fs
 
 
 --------------------------------------------------------------------------------
@@ -82,78 +89,41 @@ makeDataConChecker = F.testSymbol . F.symbol
 --   e.g. `select$Cons$1` and `select$Cons$2` are respectively
 --   equivalent to `head` and `tail`.
 --------------------------------------------------------------------------------
--- | One entry per SOURCE field of @d@: does GHC's worker/wrapper unpacking
--- change that field's SORT?
---
--- A field selector is declared at the field's SOURCE type -- 'bkDataCon' reads
--- 'Ghc.dataConFullSig' -- while the constructor's own spec is bound at the
--- WORKER's argument types. The result refinement states @sel_i VV == b_i@
--- across the two, so a field whose sort MOVES can carry no selector in the
--- logic and 'makeMeasureSelectors' drops it.
---
--- This is the single authority on that question. 'CoreToLogic' needs the same
--- answer -- an equation it lifts from Core may want to project through a field
--- whose selector was dropped -- and deciding it twice is how the two would
--- drift apart.
---
--- @dataConRepArgTys@ leads with one argument per class constraint, which
--- 'Ghc.isPredTy' drops; what is left corresponds to the source fields
--- one-to-one, and comparing them positionally is the whole answer -- WHILE
--- they correspond. An @{-# UNPACK #-}@ed multi-field product contributes
--- SEVERAL, and this used to answer 'False' throughout as soon as that made the
--- counts disagree.
---
--- That read as the conservative choice and was not one. 'False' KEEPS a
--- selector, so a constructor carrying both a resorted field and an expanding
--- one had this guard silently disarmed, and was rejected at its own
--- declaration with @Illegal type specification@ -- the very error dropping the
--- selector exists to prevent. Loud rather than unsound, but reached by exactly
--- the shape the old comment named as out of scope.
---
--- So the correspondence is REBUILT rather than abandoned: the worker's value
--- arguments are regrouped along each field's own expansion, 'Ms.fieldRepTys',
--- the same descent 'CoreToLogic' projects along, so the two agree by
--- construction. What is NOT the answer is comparing a field against its own
--- expansion -- those match by construction too, and asking that question here
--- silently disarms the refusal for @data C = C !W@, which is 'workerApp'\'s
--- question ("is the rewrite well typed") rather than this one ("can this field
--- carry a selector").
-resortedFields :: F.TCEmb Ghc.TyCon -> Ghc.DataCon -> [Bool]
-resortedFields embs d
-  | sameValueArity                            = zipWith differs origTys valTys
-  | Just grouped <- regroup expansions valTys = zipWith moved origTys grouped
-  | otherwise                                 = replicate (length origTys) False
-  where
-    differs s r    = RT.typeSort embs s /= RT.typeSort embs r
-    sameValueArity = length valTys == length origTys
+-- | Does the logic have a datatype for this constructor -- a declaration with
+-- selectors -- so that an equation may apply it or project through it? This is
+-- membership in the 'Bare.DataConMap', which 'dataConMap' builds from the
+-- 'F.DataDecl's the module and its LiquidHaskell-compiled imports declare.
+-- @IORef@ from @base@ is not in it; a module-local @data W = W !Int@ is, and
+-- so is a nullary @data U = U@ -- the key is the constructor's own entry,
+-- index @0@, not its first field, which a nullary constructor has not got.
+knownDataCon :: Bare.DataConMap -> Ghc.DataCon -> Bool
+knownDataCon dm d = M.member (F.symbol d, 0) dm
 
-    -- A field represented by SEVERAL worker arguments still has a selector:
-    -- the result refinement rebuilds it, @sel_i VV == C b_j b_k@, which is
-    -- well sorted because the reconstruction is at the field's own type. Only
-    -- a field standing on ONE worker argument of a DIFFERENT sort has none.
-    moved t [r] = differs t r
-    moved _ _   = False
-
-    expansions
-      | length bangs == length origTys = zipWith (Ms.fieldRepTys embs) origTys bangs
-      | otherwise                      = [ [t] | t <- origTys ]
-    bangs   = Ghc.dataConImplBangs d
-    origTys = Ghc.irrelevantMult <$> Ghc.dataConOrigArgTys d
-    valTys  = filter (not . Ghc.isPredTy)
-                     (Ghc.irrelevantMult <$> Ghc.dataConRepArgTys d)
-
--- | Cut @rs@ into one group per expansion, or 'Nothing' if it does not divide
--- exactly -- in which case the expansion does not explain the worker's shape
--- and no field can be judged.
-regroup :: [[a]] -> [b] -> Maybe [[b]]
-regroup []       [] = Just []
-regroup []       _  = Nothing
-regroup (g : gs) rs
-  | length rs >= n = (here :) <$> regroup gs there
-  | otherwise      = Nothing
-  where
-    n             = length g
-    (here, there) = splitAt n rs
+-- | One entry per SOURCE field of @d@: has GHC's worker/wrapper unpacking left
+-- that field with no selector in the logic?
+--
+-- A field selector is a logic function at the field's SOURCE type --
+-- 'bkDataCon' reads 'Ghc.dataConFullSig' -- whose equation is stated over the
+-- WORKER's arguments, @sel_i (D ys) = rebuild_i@. That is well sorted whenever
+-- the rebuild can be written, so the selector is dropped only for a field
+-- whose sort moved AND whose rebuild applies a constructor the logic does not
+-- know: 'fieldSelectorDropped' over the constructor's 'RepMap' with
+-- 'knownDataCon' as the oracle. 'makeMeasureSelectors' consults this before
+-- declaring, and 'CoreToLogic' consults the same predicate through
+-- 'undeclaredSelectorsOf' before lifting an equation that would project
+-- through one, so the two agree by construction.
+--
+-- This used to rebuild the correspondence on its own, drop EVERY field whose
+-- sort moved, and answer @replicate n False@ whenever it could not align the
+-- lists: 'False' KEEPS a selector, so every shape it did not recognise
+-- silently disarmed the guard and was rejected downstream, at its own
+-- declaration, with the error the guard exists to prevent. A shape the
+-- authority cannot align is now reported HERE, naming the constructor and the
+-- counts.
+droppedSelectorFields :: F.TCEmb Ghc.TyCon -> Bare.DataConMap -> Ghc.DataCon -> [Bool]
+droppedSelectorFields embs dm d = case RT.dataConRepMap embs d of
+  Right rm -> fieldSelectorDropped (knownDataCon dm) <$> rmFields rm
+  Left err -> Ex.throw (ErrDataCon (Ghc.getSrcSpan d) (pprint d) (repMapErrorDoc err) :: Error)
 
 makeDataConSelector :: Maybe Bare.DataConMap -> Ghc.DataCon -> Int -> F.Symbol
 makeDataConSelector dmMb d i = M.lookupDefault def (F.symbol d, i) dm
@@ -442,12 +412,12 @@ muSort c n  = V.mapSort tx
 -}
 
 --------------------------------------------------------------------------------
-meetDataConSpec :: Bool -> F.TCEmb Ghc.TyCon -> [(Ghc.Var, SpecType)] -> [DataConP]
+meetDataConSpec :: Bool -> (Ghc.DataCon -> Bool) -> F.TCEmb Ghc.TyCon -> [(Ghc.Var, SpecType)] -> [DataConP]
                 -> [(Ghc.Var, SpecType)]
 --------------------------------------------------------------------------------
-meetDataConSpec allowTC emb xts dcs  = M.toList $ snd <$> L.foldl' upd dcm0 xts
+meetDataConSpec allowTC known emb xts dcs  = M.toList $ snd <$> L.foldl' upd dcm0 xts
   where
-    dcm0                     = M.fromListWith meetM (dataConSpec' allowTC emb dcs)
+    dcm0                     = M.fromListWith meetM (dataConSpec' allowTC known emb dcs)
     upd dcm (x, t)           = M.insert x (Ghc.getSrcSpan x, tx') dcm
                                 where
                                   tx' = maybe t (meetX x t) (M.lookup x dcm)
@@ -455,11 +425,11 @@ meetDataConSpec allowTC emb xts dcs  = M.toList $ snd <$> L.foldl' upd dcm0 xts
     meetX x t (sp', t')      = F.notracepp (_msg x t t') $ meetVarTypes emb (pprint x) (Ghc.getSrcSpan x, t) (sp', t')
     _msg x t t'              = "MEET-VAR-TYPES: " ++ showpp (x, t, t')
 
-dataConSpec' :: Bool -> F.TCEmb Ghc.TyCon -> [DataConP] -> [(Ghc.Var, (Ghc.SrcSpan, SpecType))]
-dataConSpec' allowTC emb = concatMap tx
+dataConSpec' :: Bool -> (Ghc.DataCon -> Bool) -> F.TCEmb Ghc.TyCon -> [DataConP] -> [(Ghc.Var, (Ghc.SrcSpan, SpecType))]
+dataConSpec' allowTC known emb = concatMap tx
   where
     tx dcp   =  [ (x, res) | (x, t0) <- dataConPSpecType allowTC dcp
-                          , let t    = RT.expandProductType emb x t0
+                          , let t    = RT.expandProductType known emb x t0
                           , let res  = (GM.fSrcSpan dcp, t)
                 ]
 --------------------------------------------------------------------------------

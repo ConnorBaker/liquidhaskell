@@ -1086,6 +1086,16 @@ executable datacon-pos
                     , UnpackedFieldInvariant
                     , WrapperSingletonNoReflect
                     , SaturatedWrapperReflect
+                    , UnpackedNewtypeProduct
+                    , NullaryUnpack
+                    , UnpackedFieldReftUnknown
+                    , UnpackedFieldReftUnknownDep
+                    , CrossFieldReft
+                    , CrossFieldReftMulti
+                    , NestedCaseProjectionSort
+                    , NestedCaseProjectionDeep
+                    , UnpackedFieldSubstSort
+                    , NewtypeFieldReftPle
 
     build-depends:    base
                     , liquid-prelude
@@ -1130,11 +1140,15 @@ executable datacon-neg
                     , UnpackedFieldSubstSort
                     , NestedCaseProjectionDeep
                     , UnpackedNewtypeProduct
+                    , UnpackedFieldReftUnknownProduct
+                    , NullaryUnpack
                     , GadtUnpackMiddle
                     , ReflectionCaseEmbedded
                     , NewtypeFieldReft
                     , CrossFieldReft
                     , CrossFieldReftMulti
+                    , NestedCaseProjectionUnknown
+                    , UnpackedFieldSubstUnknown
 
     build-depends:    base
                     , liquid-prelude

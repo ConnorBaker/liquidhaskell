@@ -22,9 +22,6 @@ module Language.Haskell.Liquid.Measure (
   , defRefType
   , bodyPred
 
-  -- * UNPACKed fields
-  , unpackInto
-  , fieldRepTys
   ) where
 
 import           GHC                                    hiding (Located)
@@ -47,6 +44,7 @@ import           Language.Haskell.Liquid.Types.RType
 import           Language.Haskell.Liquid.Types.RTypeOp
 import           Language.Haskell.Liquid.Types.Types
 import           Language.Haskell.Liquid.Types.RefType
+import           Language.Haskell.Liquid.Types.RepMap
 -- import           Language.Haskell.Liquid.Types.Variance
 -- import           Language.Haskell.Liquid.Types.Bounds
 import           Language.Haskell.Liquid.Types.Specs
@@ -139,7 +137,7 @@ makeDataConType allowTC embs ds
     -- fields. That is also the WORKER's argument list -- unless GHC UNPACKed a
     -- strict field, from @-O1@ up, in which case the worker takes the
     -- components the field expanded to and the equation has to be rebuilt over
-    -- them. See 'unpackedFieldRecon'.
+    -- them; 'toWorkerDef' does it over the constructor's 'RepMap'.
     --
     -- BOTH kinds need that rebuild, for the mirror image of the reason the
     -- wrapper needs both. A selector equation is written over the SOURCE
@@ -158,126 +156,36 @@ makeDataConType allowTC embs ds
     wrRType  = combineDCTypes "cdc1" wrt wrts
     woRType  = combineDCTypes "cdc2" wot wots
 
--- | The inverse of 'unpackedFieldSubst', for the other direction of the same
--- mismatch.
---
--- 'Language.Haskell.Liquid.Measure.makeDataConType' gives a lifted measure
--- equation to BOTH the wrapper and the worker of a data constructor, on the
--- assumption that the two take the same arguments. UNPACKing breaks that
--- assumption, so re-express the equation -- which after 'unpackedFieldSubst' is
--- written over the SOURCE fields -- over the worker's representation arguments
--- @xs@, by rebuilding each unpacked field from the components it expanded to.
---
--- Returns one expression per source field, or 'Nothing' when the constructor
--- has no unpacked field or @xs@ does not account for the expansion exactly --
--- in which case the caller must leave the equation alone.
-unpackedFieldRecon :: F.TCEmb TyCon -> DataCon -> [Symbol] -> Maybe [Expr]
-unpackedFieldRecon embs d xs
-  | length srcTys == length bangs
-  , Just (es, []) <- go (zip srcTys bangs) xs
-  , any (not . isEVar) es
-  = Just es
-  | otherwise
-  = Nothing
-  where
-    srcTys        = Ghc.irrelevantMult <$> Ghc.dataConOrigArgTys d
-    bangs         = Ghc.dataConImplBangs d
-    isEVar EVar{} = True
-    isEVar _      = False
-
-    go [] ys              = Just ([], ys)
-    go ((t, b) : tbs) ys  = do
-      (e , ys' ) <- one t b ys
-      (es, ys'') <- go tbs ys'
-      return (e : es, ys'')
-
-    -- One source field. Note the application is FLAT: @d'@ is applied to every
-    -- leaf the field expanded to, with no intermediate constructor, however
-    -- many levels down those leaves were found.
-    --
-    -- That is not a shortcut, it is what the logic's @d'@ takes.
-    -- 'expandProductType' rewrites EVERY constructor's spec, @d'@ included, so
-    -- if GHC unpacked a field of @d'@ then the logic's @d'@ already takes that
-    -- field's components rather than the field. Rebuilding the intermediate
-    -- constructor here hands it a value of the SOURCE field's sort where it
-    -- expects the component's, and the declaration is rejected with
-    -- @Cannot unify (Array_t int bool) with Keys@. The two descents agree by
-    -- construction because both are driven by 'dataConImplBangs', which
-    -- reports the decision GHC actually made.
-    one t b ys
-      | Just (d', ftbs) <- unpackInto embs t b
-      = do (ls, ys') <- leaves ftbs ys
-           return (F.mkEApp (namedLocSymbol d') (EVar <$> ls), ys')
-    one _ _ (y : ys) = Just (EVar y, ys)
-    one _ _ []       = Nothing
-
-    -- The leaves one field expands to, in worker-argument order.
-    leaves [] ys             = Just ([], ys)
-    leaves ((t, b) : tbs) ys = do
-      (l , ys' ) <- leaf t b ys
-      (ls, ys'') <- leaves tbs ys'
-      return (l ++ ls, ys'')
-
-    leaf t b ys
-      | Just (_, ftbs) <- unpackInto embs t b = leaves ftbs ys
-    leaf _ _ (y : ys) = Just ([y], ys)
-    leaf _ _ []       = Nothing
-
--- | Does GHC's UNPACKing of this field expand it into the fields of a single
--- constructor, and if so which?
---
--- An EMBEDDED type -- @Int@ as @int@, @Text@ as @Str@ -- has no datatype in the
--- logic, hence no constructor to rebuild it with and no selectors to take it
--- apart, so the expansion stops there and the component stands for the field.
--- Its sort is the embedded one either way, which is what makes that sound.
-unpackInto :: F.TCEmb TyCon -> Type -> Ghc.HsImplBang
-           -> Maybe (DataCon, [(Type, Ghc.HsImplBang)])
-unpackInto embs t Ghc.HsUnpack{}
-  | Just (tc, _) <- Ghc.splitTyConApp_maybe t
-  , not (Ghc.isNewTyCon tc)
-  , not (F.tceMember tc embs)
-  , Just d <- Ghc.tyConSingleDataCon_maybe tc
-  , let fts = Ghc.irrelevantMult <$> Ghc.dataConOrigArgTys d
-  , let bs  = Ghc.dataConImplBangs d
-  , not (null fts)
-  , length fts == length bs
-  = Just (d, zip fts bs)
-unpackInto _ _ _ = Nothing
-
--- | The TYPES of the representation arguments one source field expands to: the
--- twin of 'fieldRepProjs', driven by the same 'unpackInto' so the two descents
--- agree by construction.
---
--- 'workerApp' needs it because matching the expansion's LENGTH against the
--- worker's value arguments is not enough. 'unpackInto' REFUSES a newtype and an
--- embedded type, so a field GHC unpacked through one of those passes through at
--- its SOURCE type while the worker takes the component -- @IORef Int@ against
--- @MutVar# RealWorld Int@, one argument either way. That is the same
--- source/worker sort split 'Bare.resortedFields' answers for selectors; here
--- the answer has to be per EXPANSION rather than per field, because a field
--- that does expand contributes several.
-fieldRepTys :: F.TCEmb TyCon -> Type -> Ghc.HsImplBang -> [Type]
-fieldRepTys embs t b = case unpackInto embs t b of
-  Nothing        -> [t]
-  Just (_, ftbs) -> concat [ fieldRepTys embs ft b' | (ft, b') <- ftbs ]
-
 -- | Rewrite a measure equation from the constructor's source fields to the
 -- WORKER's representation arguments. The identity unless GHC unpacked a strict
--- field; see 'unpackedFieldRecon', which decides that and supplies the
--- reconstruction.
+-- field, in which case each source binder is replaced by the reconstruction
+-- of its field from the worker arguments it stands on: 'rebuildField' over
+-- the constructor's 'RepMap', which is the one place that descent is decided.
+--
+-- The reconstruction is FLAT: a field expanded into a constructor @d'@ is
+-- rebuilt as @d'@ applied to every leaf, with no intermediate constructor,
+-- however deep the leaves were found. That is what the logic's @d'@ takes --
+-- 'expandProductType' rewrites @d'@'s own spec the same way, so if GHC
+-- unpacked a field of @d'@ the logic's @d'@ already takes that field's
+-- components, and rebuilding the intermediate constructor would hand it a
+-- value at the SOURCE field's sort (@Cannot unify (Array_t int bool) with
+-- Keys@). The newtypes GHC unpacked THROUGH are the exception, because a
+-- newtype has no worker and its logic symbol takes its one source field;
+-- 'RepMap' records them and 'rebuildField' wraps them back on.
 toWorkerDef :: F.TCEmb TyCon -> DataCon -> Def (RRType Reft) DataCon -> Def (RRType Reft) DataCon
 toWorkerDef embs dc def@(Def f d mt xs body)
-  | Just es <- unpackedFieldRecon embs dc repXs
+  | Right rm <- dataConRepMap embs dc
+  , rmChanged rm
+  , let repXs = [ F.tempSymbol (lhNameToResolvedSymbol (F.val f)) i
+                | i <- [0 .. toInteger (sum (fieldLeafCount <$> rmFields rm)) - 1] ]
+  , Just groups <- splitLeaves (rmFields rm) repXs
+  , let es = zipWith rebuildField (rmFields rm) (map (map EVar) groups)
   , length es == length xs
   -- 'subst' is simultaneous, so it is safe for 'repXs' to reuse the names in
   -- 'xs': a binder introduced by the reconstruction is never itself rewritten.
   = Def f d mt [(x, Nothing) | x <- repXs] (subst (mkSubst (zip (fst <$> xs) es)) body)
   | otherwise
   = def
-  where
-    repVTys = filter (not . Ghc.isPredTy) (irrelevantMult <$> dataConRepArgTys dc)
-    repXs   = [ F.tempSymbol (lhNameToResolvedSymbol (F.val f)) i
-              | i <- [0 .. toInteger (length repVTys) - 1] ]
 
 -- | If there are any dummy symbols in the type, replace them with fresh
 -- variables.

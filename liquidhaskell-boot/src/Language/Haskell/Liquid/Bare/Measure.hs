@@ -282,13 +282,11 @@ makeMeasureSelectors cfg embs dm (Loc l l' c)
       | otherwise
       = Just $ makeMeasureSelector (Loc l l' (makeGeneratedLogicLHName $ Bare.makeDataConSelector (Just dm) dc i)) (projT i) dc n i
 
-    -- | Does GHC's worker/wrapper unpacking change the SORT of field @i@,
-    -- so that it can carry no selector in the logic?
-    --
-    -- The decision itself is 'Bare.resortedFields', which is also what
-    -- 'CoreToLogic' consults before lifting an equation that would project
-    -- through such a field. The extra guard here is local: it checks that
-    -- LiquidHaskell's own view of the constructor's fields (@xts@, from
+    -- | Has GHC's worker/wrapper unpacking left field @i@ with no selector
+    -- in the logic? The decision is 'Bare.droppedSelectorFields', which is
+    -- also what 'CoreToLogic' consults before lifting an equation that would
+    -- project through such a field. The extra guard here is local: it checks
+    -- that LiquidHaskell's own view of the constructor's fields (@xts@, from
     -- @dcpTyArgs@) agrees with GHC's before indexing into the answer.
     --
     -- Dropping the selector is the sound direction: the field simply has no
@@ -297,7 +295,7 @@ makeMeasureSelectors cfg embs dm (Loc l l' c)
     resortedByUnpacking i
       | length origTys /= length xts = False
       | otherwise = Mb.fromMaybe False (Misc.getNth (i - 1) resorted)
-    resorted = Bare.resortedFields embs dc
+    resorted = Bare.droppedSelectorFields embs dm dc
     origTys = Ghc.irrelevantMult <$> Ghc.dataConOrigArgTys dc
 
     fields   = zip (reverse xts) [1..]
