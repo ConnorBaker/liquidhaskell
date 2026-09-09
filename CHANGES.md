@@ -47,6 +47,9 @@
   whose constructor is unknown to the logic is refused at the constructor
   rather than as `Unbound symbol`, and a strict field of a nullary type,
   which unpacks to no worker argument, is handled
+- Route the PLE rewrite guards for a data constructor -- whether its wrapper
+  takes different arguments from its worker, and how many evidence binders
+  its worker leads with -- through the same `RepMap`
 - Keep a field's written refinement when unpacking changes its sort, by
   rebuilding the field from the components it expanded to, instead of dropping
   it: a `{-@ data @-}` bound on a strict field no longer stops being enforced

@@ -77,6 +77,7 @@ module Language.Haskell.Liquid.Types.RepMap
   , RepMapError (..)
   , repMap
   , repMapErrorDoc
+  , dictArity
     -- * Reading a 'FieldRep'
   , fieldLeaves
   , fieldLeafCount
@@ -194,7 +195,7 @@ repMap embs sortOf dc
   where
     srcTys = irrelevantMult <$> dataConOrigArgTys dc
     bangs  = dataConImplBangs dc
-    nDict  = length (dataConTheta dc)
+    nDict  = dictArity dc
     valTys = drop nDict (irrelevantMult <$> dataConRepArgTys dc)
 
     -- Hand each leaf, in worker order, the worker's type for it.
@@ -221,6 +222,12 @@ repMap embs sortOf dc
           Just rep -> sortOf src /= sortOf rep
           Nothing  -> False
       }
+
+-- | How many arguments the worker takes BEFORE its value arguments: one per
+-- entry of 'dataConTheta', equality evidence first, then class
+-- dictionaries. The one place that count is decided; 'rmDictArity' is it.
+dictArity :: DataCon -> Int
+dictArity = length . dataConTheta
 
 -- | Structure only: what does GHC's bang say this field expands to?
 data Field0 = Field0 Type [DataCon] Shape0
