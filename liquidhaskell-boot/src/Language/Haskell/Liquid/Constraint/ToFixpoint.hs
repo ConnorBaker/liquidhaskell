@@ -17,6 +17,7 @@ import qualified Language.Fixpoint.Types        as F
 import           Language.Fixpoint.Solver.Rewrite (unify)
 import           Language.Haskell.Liquid.Constraint.Types
 import qualified Language.Haskell.Liquid.Types.RefType as RT
+import           Language.Haskell.Liquid.Types.RepMap (RepMap (rmChanged), dictArity)
 import           Language.Haskell.Liquid.Constraint.Qualifier
 import           Control.Monad (guard)
 import qualified Data.Maybe as Mb
@@ -95,13 +96,14 @@ targetFInfo info cgi = mappend (mempty { F.ae = ax, F.lrws = localRewrites cgi }
 makeAxiomEnvironment :: TargetInfo -> [(Var, SpecType)] -> M.HashMap F.SubcId (F.SubC Cinfo) -> F.AxiomEnv
 makeAxiomEnvironment info xts fcs
   = F.AEnv eqs
-           (concatMap makeSimplify xts)
+           (concatMap (makeSimplify tce) xts)
            (doExpand sp cfg <$> fcs)
            (makeRewrites info <$> fcs)
   where
     eqs      = axioms
     cfg      = getConfig  info
     sp       = giSpec     info
+    tce      = gsTcEmbeds (gsName sp)
     axioms   = gsMyAxioms refl ++ gsImpAxioms refl
     refl     = gsRefl sp
 
@@ -258,15 +260,14 @@ doExpand sp cfg sub = allowGlobalPLE cfg
 -- This drops a duplicate, not a rewrite. The wrapper's refinement TYPE is
 -- untouched, which is what a record update needs -- see
 -- @tests/datacon/pos/UnpackedFieldUpdate.hs@.
-wrapperArgsDiffer :: Var -> Bool
-wrapperArgsDiffer var = case Ghc.idDetails var of
-  Ghc.DataConWrapId dc ->
-    let origTys = Ghc.irrelevantMult <$> Ghc.dataConOrigArgTys dc
-        repTys  = Ghc.irrelevantMult <$> Ghc.dataConRepArgTys  dc
-        valTys  = drop (length repTys - length origTys) repTys
-    in length repTys - length (filter Ghc.isPredTy repTys) /= length origTys
-       || not (and (zipWith Ghc.eqType origTys valTys))
-  _ -> False
+--
+-- The question is the constructor's 'RepMap''s 'rmChanged'; a shape the
+-- authority cannot align counts as differing, which drops the duplicate and
+-- loses nothing.
+wrapperArgsDiffer :: F.TCEmb TyCon -> Var -> Bool
+wrapperArgsDiffer tce var = case Ghc.idDetails var of
+  Ghc.DataConWrapId dc -> either (const True) rmChanged (RT.dataConRepMap tce dc)
+  _                    -> False
 
 -- | Given @(dc, t)@ where @dc@ is a data constructor and @t@ is its spec type,
 -- generate PLE rewrite rules for measures keyed on the worker DataCon symbol.
@@ -283,11 +284,11 @@ wrapperArgsDiffer var = case Ghc.idDetails var of
 -- > f (dc x1 ... xn)
 -- > not (f (dc x1 ... xn))
 --
-makeSimplify :: (Var, SpecType) -> [F.Rewrite]
-makeSimplify (var, t)
+makeSimplify :: F.TCEmb TyCon -> (Var, SpecType) -> [F.Rewrite]
+makeSimplify tce (var, t)
   | not (GM.isDataConId var)
   = []
-  | wrapperArgsDiffer var
+  | wrapperArgsDiffer tce var
   = []
   | otherwise
   = go $ specTypeToResultRef eVal t
@@ -300,17 +301,15 @@ makeSimplify (var, t)
       _                    -> F.symbol var
     -- Value-only binders: for GADT workers, drop the leading coercion binders
     -- that are present in the spec type but absent in the SMT encoding.
-    -- See note [GADT workers and coercion binders].
+    -- See note [GADT workers and coercion binders]. Their count is
+    -- 'RepMap.dictArity', the one place it is decided.
     valBs = case Ghc.idDetails var of
-      Ghc.DataConWorkId dc ->
-        let nCoerce = length $ filter (Ghc.isSimplePredTy . Ghc.irrelevantMult)
-                              $ Ghc.dataConRepArgTys dc
+      Ghc.DataConWorkId dc
         -- Class dictionary constructors can take superclass dictionaries as
         -- arguments. Keep their binders so the dictionary arguments are retained.
-        in if Ghc.isClassTyCon (Ghc.dataConTyCon dc)
-            then ty_binds trep
-            else drop nCoerce (ty_binds trep)
-      _                    -> ty_binds trep
+        | Ghc.isClassTyCon (Ghc.dataConTyCon dc) -> ty_binds trep
+        | otherwise                              -> drop (dictArity dc) (ty_binds trep)
+      _ -> ty_binds trep
     eVal  = F.eApps (F.EVar dcSym) (F.EVar <$> valBs)
 
     go (F.PAnd es) = concatMap go es
