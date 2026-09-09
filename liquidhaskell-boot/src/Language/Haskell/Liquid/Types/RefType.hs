@@ -81,6 +81,7 @@ module Language.Haskell.Liquid.Types.RefType (
   -- * TODO: classify these
   -- , mkDataConIdsTy
   , expandProductType
+  , dataConRepMap
   , mkTyConInfo
   , strengthenRefTypeGen
   , strengthenDataConType
@@ -116,7 +117,7 @@ import           Language.Haskell.Liquid.Types.RType
 import           Language.Haskell.Liquid.Types.RTypeOp
 import           Language.Haskell.Liquid.Types.Types
 import           Language.Haskell.Liquid.Types.Variance
-import           Language.Haskell.Liquid.Misc
+import           Language.Haskell.Liquid.Types.RepMap
 import           Language.Haskell.Liquid.Types.Names
 import qualified Language.Haskell.Liquid.GHC.Misc as GM
 import           Language.Haskell.Liquid.GHC.Play (mapType, stringClassArg)
@@ -1645,227 +1646,180 @@ grabArgs τs τ
   = reverse (τ:τs)
 
 
-expandProductType :: (PPrint r, IsReft r, SubsTy RTyVar (RType RTyCon RTyVar NoReft) r,
+-- | 'RepMap.repMap' with this module's 'typeSort' deciding which fields
+-- resort: the one-liner every consumer of the source-to-worker correspondence
+-- calls. It lives here rather than in "Language.Haskell.Liquid.Types.RepMap"
+-- because that module sits below this one, so that 'expandProductType' can be
+-- a consumer of it.
+dataConRepMap :: F.TCEmb TyCon -> DataCon -> Either RepMapError RepMap
+dataConRepMap embs = repMap embs (typeSort embs)
+
+-- | Rewrite a data constructor's spec type from its SOURCE fields to its
+-- WORKER's arguments, so that it refines the type the worker actually has.
+--
+-- The identity while the two agree -- the @-O0@ shape, and the wrapper's
+-- entry at every level -- which @isTrivial'@ decides by comparing the binder's
+-- own type with the spec's. Otherwise the rewrite is driven by the
+-- constructor's 'RepMap', the one place the correspondence is decided, and
+-- nothing here asks GHC what a field expands to. See 'expandOver'.
+--
+-- @known@ is 'Language.Haskell.Liquid.Bare.DataType.knownDataCon': the rewrite
+-- REBUILDS a field from its components to carry its refinement across, and
+-- that rebuild applies constructors. A field standing on ONE worker argument
+-- whose rebuild the logic cannot express -- @!(IORef Int)@, a newtype chain
+-- over @MutVar#@ with no datatype for @IORef@ or @STRef@ -- keeps its
+-- refinement VERBATIM on the leaf, the one reading the logic can give a type
+-- it has no datatype for: @{v:IORef Int | v == v}@ is accepted and
+-- @{v:IORef Int | false}@ is enforced, while a field-sorted term against @v@
+-- (@ioTag v == 0@ with @ioTag :: IORef Int -> Int@) is ill-sorted and loud,
+-- @Cannot unify IORef with MutVar#@. For the field's OWN refinement that is
+-- what the series base (41c6c09b4) did. For a SIBLING reference between two
+-- such fields, @b2 :: {v:IORef Int | v == b1}@, the binder is kept rather than
+-- substituted (see 'expandOver'), and that is strictly MORE permissive than
+-- the base, soundly: both binders sit at the same leaf sort and the newtype
+-- chain is injective, so @v == b1@ over the leaves says exactly what it said
+-- over the fields; the base rebuilt through the chain and reported
+-- @Unbound symbol GHC.Internal.STRef.STRef@. A field
+-- standing on SEVERAL arguments has no such reading -- the refinement relates
+-- the components and can only be stated over the rebuilt product -- so where
+-- that rebuild would name a constructor the logic has no datatype for the spec
+-- is refused HERE, naming the field and the constructor, rather than at the
+-- declaration as @Unbound symbol@. Decided on the type actually emitted: a
+-- trivial refinement rebuilds nothing and is not refused.
+expandProductType :: (PPrint r, IsReft r, F.Subable r, SubsTy RTyVar (RType RTyCon RTyVar NoReft) r,
                       ReftBind r ~ Symbol, ReftVar r ~ Symbol, Variable r ~ Symbol)
-                  => F.TCEmb TyCon -> Var -> RType RTyCon RTyVar r -> RType RTyCon RTyVar r
-expandProductType embs x t
-  | isTrivial'      = t
-  | otherwise       = fromRTypeRep $ trep {ty_binds = xs', ty_info=is', ty_args = ts', ty_refts = rs'}
-     where
-      isTrivial'    = ofType (varType x) == toRSort t
-      τs            = map irrelevantMult $ fst $ splitFunTys $ snd $ splitForAllTyCoVars $ toType False t
-      trep          = toRTypeRep t
-      (xs',is',ts',rs') = unzip4 $ concat
-                        $ zipWith expandOne (unpackedFields x τs)
-                        $ zip5 τs (ty_binds trep) (ty_info trep) (ty_args trep) (ty_refts trep)
-      expandOne unpacked q@(_, x0, i0, t0, r0)
-        | unpacked  = mkProductTy embs q
-        | otherwise = [(x0, i0, t0, r0)]
-
--- | GHC's OWN per-field unpacking decision, one 'Bool' per argument of @x@'s
--- spec type.
---
--- 'mkProductTy' expands anything 'deepSplitProductType' can take apart, which
--- is every single-constructor type application -- and that is strictly more
--- than @-funbox-small-strict-fields@ actually unpacks. @Data.Text.Text@ is the
--- case that shows it: three fields, so GHC leaves it alone, but it splits
--- perfectly well, and expanding it puts THREE arguments in the spec where the
--- worker has one. The whole constructor is then rejected with
--- @Illegal type specification@ -- or, worse, accepted with the remaining
--- fields' refinements sitting one position out.
---
--- Nothing below @-O1@ reaches this, because 'expandProductType' short-circuits
--- while the worker's type still equals the spec's; a record mixing an unpacked
--- @!Int@ with an untouched @!Text@ is what makes the two disagree, and the two
--- decisions are then independent per field.
---
--- Conservative when it cannot ask: a 'Var' that is not a data constructor, or
--- an argument count that does not match the source fields (a constructor with
--- a class context carries its dictionaries here and @dataConImplBangs@ does
--- not), keeps the previous behaviour rather than guessing.
-unpackedFields :: Var -> [Type] -> [Bool]
-unpackedFields x τs = case Ghc.isDataConId_maybe x of
-  Just dc | length bangs == length τs -> map isUnpack bangs
-    where bangs = Ghc.dataConImplBangs dc
-  _ -> replicate (length τs) True
+                  => (DataCon -> Bool) -> F.TCEmb TyCon -> Var -> RType RTyCon RTyVar r -> RType RTyCon RTyVar r
+expandProductType known embs x t
+  | isTrivial'                      = t
+  | Just dc <- Ghc.isDataConId_maybe x
+  , Right rm <- dataConRepMap embs dc
+  , rmChanged rm                    = refuseUnknownRebuild known x rm (expandOver known x rm t)
+  | otherwise                       = t
   where
-    isUnpack Ghc.HsUnpack{} = True
-    isUnpack _              = False
+    isTrivial' = ofType (varType x) == toRSort t
 
--- splitFunTys :: Type -> ([Type], Type)
+-- | The refusal 'expandProductType' documents: the first constructor a
+-- rebuilt refinement names that @known@ does not know, if any.
+refuseUnknownRebuild :: (PPrint r, IsReft r, F.Subable r, ReftBind r ~ Symbol, ReftVar r ~ Symbol, Variable r ~ Symbol)
+                     => (DataCon -> Bool) -> Var -> RepMap -> RType RTyCon RTyVar r -> RType RTyCon RTyVar r
+refuseUnknownRebuild known x rm t'
+  | ((i, d) : _) <- offenders
+  = uError (ErrDataCon (Ghc.getSrcSpan x) (pprint (rmDataCon rm))
+             (text "cannot carry the refinement written on field" <+> text (show i)
+              <+> text "across GHC's unpacking of it: its rebuild applies constructor"
+              <+> text ("`" ++ GM.showPpr d ++ "'") <+> text "which has no datatype in the logic"))
+  | otherwise
+  = t'
+  where
+    used      = F.syms t'
+    offenders = [ (i, d) | (i, fr) <- zip [1 :: Int ..] (rmFields rm)
+                         , not (fieldRebuildable known fr)
+                         , d <- frVia fr ++ [ p | Product p _ <- [frShape fr] ]
+                         , not (known d)
+                         , F.val (GM.namedLocSymbol d) `elem` used ]
 
-data DataConAppContext
-  = DataConAppContext
-  { dcac_dc      :: !DataCon
-  , dcac_tys     :: ![Type]
-  , dcac_arg_tys :: ![(Type, StrictnessMark)]
-  , dcac_co      :: !Coercion
-  }
+-- | The rewrite itself, one field at a time.
+--
+-- A field that GHC left alone keeps its binder, type and refinement. A field
+-- standing on ONE worker argument keeps its binder -- the result refinement
+-- names it, @select_i VV == b_i@, and a fresh name there would disconnect the
+-- field from its own selector -- at the worker's type, with the refinement
+-- copied verbatim when the sorts agree (@!Int@ to @Int#@, both @int@) and
+-- REBUILT over the component when they do not: @{v : W | wOf v <= 10}@ on a
+-- field that unpacks to its @Int@ becomes @{v : int | wOf (W v) <= 10}@, so the
+-- fact stated is the fact that was written. A field standing on SEVERAL
+-- arguments cannot keep one name for several values, so each component is
+-- suffixed and the refinement, which relates all of them, goes on the LAST --
+-- the only position where every earlier binder is in scope, a constructor's
+-- spec being a dependent function type.
+--
+-- THE SUBSTITUTION IS THREADED THROUGH THE SIBLINGS, which is what a dependent
+-- spec needs. A later field's refinement may NAME an earlier one --
+-- @b :: {v:Int | v == wOf a}@ -- and after the rewrite @a@ is either at another
+-- sort or gone, renamed to its components. So every field is expanded under
+-- the substitution the fields before it contributed, mapping each rebuilt
+-- binder to its reconstruction, and the result refinement gets the same.
+-- Measured without it: @Illegal type specification@ with
+-- @Cannot unify W with int in expression: wOf a@ for the single-component
+-- shape, and @Unbound symbol a --- perhaps you meant: a##expand##1@ for the
+-- multi-component one, at @-O1@ only.
+expandOver :: (PPrint r, IsReft r, F.Subable r, SubsTy RTyVar (RType RTyCon RTyVar NoReft) r,
+               ReftBind r ~ Symbol, ReftVar r ~ Symbol, Variable r ~ Symbol)
+           => (DataCon -> Bool) -> Var -> RepMap -> RType RTyCon RTyVar r -> RType RTyCon RTyVar r
+expandOver known x rm t
+  | nPad < 0 || nPad > rmDictArity rm
+  = panic (Just (Ghc.getSrcSpan x)) $ unwords
+      [ "expandOver: the spec of", GM.showPpr x, "leads with", show nPad
+      , "binders before its", show (length (rmFields rm)), "fields, but its worker takes"
+      , show (rmDictArity rm), "evidence arguments" ]
+  | otherwise = fromRTypeRep trep { ty_binds = bs, ty_info = is, ty_args = ts, ty_refts = rs
+                                  , ty_res = F.subst (F.mkSubst su) (ty_res trep) }
+  where
+    trep             = toRTypeRep t
+    args             = L.zip4 (ty_binds trep) (ty_info trep) (ty_args trep) (ty_refts trep)
+    -- The spec leads with one binder per constraint it KEEPS and the fields do
+    -- not. 'Bare.DataType.makeDataConP' keeps the SUBSET of 'dataConTheta'
+    -- that 'keepPredType' admits -- an equality on a type variable the fields
+    -- never mention is dropped -- so the count is positional, from the spec,
+    -- and 'rmDictArity', the worker's count, BOUNDS it. Outside the bound the
+    -- two authorities disagree and this says so rather than padding.
+    nPad             = length args - length (rmFields rm)
+    (lead, flds)     = splitAt nPad args
+    (expanded, su)   = L.foldl' step ([], []) (zip (rmFields rm) flds)
+    (bs, is, ts, rs) = L.unzip4 (lead ++ expanded)
+    step (acc, su0) (fr, (x0, i0, t0, r0)) =
+      let comps = expandField known fr (x0, i0, F.subst (F.mkSubst su0) t0, r0)
+          -- A single leaf the logic cannot rebuild STANDS FOR its field, so a
+          -- sibling naming the field keeps naming the binder, as its own
+          -- refinement does ('expandField', 'leafStandsIn'). Pinned by
+          -- @tests/datacon/pos/UnpackedFieldReftUnknownDep.hs@.
+          su1 | fieldChanged fr, fieldLeafCount fr /= 1 || frResorted fr, not (leafStandsIn known fr)
+              = su0 ++ [(x0, rebuildField fr [ F.EVar b | (b, _, _, _) <- comps ])]
+              | otherwise
+              = su0
+      in (acc ++ comps, su1)
 
-mkProductTy :: forall t r. (IsReft t, IsReft r, ReftBind r ~ Symbol, ReftVar r ~ Symbol)
-            => F.TCEmb TyCon
-            -> (Type, Symbol, RFInfo, RType RTyCon RTyVar r, t)
+-- | Does the field's ONE worker argument stand in for the field itself, its
+-- refinement copied verbatim rather than rebuilt? Yes exactly when the rebuild
+-- would apply a constructor the logic has no datatype for -- see
+-- 'expandProductType' for why that reading is sound and where it is more
+-- permissive than the series base.
+leafStandsIn :: (DataCon -> Bool) -> FieldRep -> Bool
+leafStandsIn known fr = fieldLeafCount fr == 1 && not (fieldRebuildable known fr)
+
+-- | One field of 'expandOver'.
+expandField :: (IsReft t, IsReft r, ReftBind r ~ Symbol, ReftVar r ~ Symbol)
+            => (DataCon -> Bool) -> FieldRep
+            -> (Symbol, RFInfo, RType RTyCon RTyVar r, t)
             -> [(Symbol, RFInfo, RType RTyCon RTyVar r, t)]
-mkProductTy embs (τ, x, i, t, r) = maybe [(x, i, t, r)] f (deepSplitProductType menv τ)
+expandField known fr q@(x0, _, t0, _)
+  | not (fieldChanged fr)   = [q]
+  | [rep] <- fieldLeaves fr = [(x0, defRFInfo, singleLeaf rep, trueReft)]
+  | otherwise               = reftOnLast comps
   where
-    f    :: DataConAppContext -> [(Symbol, RFInfo, RType RTyCon RTyVar r, t)]
-    -- KEEP THE BINDER. Naming every expanded component `dummySymbol` discards
-    -- the caller's binder AND makes the components indistinguishable from one
-    -- another, because `dummySymbol` is ONE FIXED NAME rather than a fresh one.
-    --
-    -- That matters because the binders of a data constructor's type are
-    -- REFERENCED BY NAME from its result refinement, which says
-    -- `select_i VV == b_i` for each field. Give two fields the same `b_i` and
-    -- the refinement equates them. Where their sorts differ and cannot unify,
-    -- LiquidHaskell rejects the data declaration outright with
-    -- `Illegal type specification`; where the sorts happen to agree it is
-    -- ACCEPTED, and silently asserts a field equality nobody wrote.
-    --
-    -- Only reachable from `-O1` upward, because `expandProductType` is a no-op
-    -- while the worker's type still equals the spec's (its `isTrivial` guard).
-    -- At `-O1` GHC unpacks a small strict field -- `!Int` becomes `Int#` --
-    -- the two stop being equal, and every binder of the constructor is
-    -- rewritten through here. `data R = R { f1 :: !Int, f2 :: Text }` is
-    -- enough: at `-O0` the fields bind to distinct `lq_tmp$x##455` and
-    -- `lq_tmp$x##456`, and at `-O1` both bound to `LIQUID$dummy` and the
-    -- module failed with `Cannot unify Text with int`.
-    --
-    -- A SINGLE-component expansion keeps `x` itself, so the result refinement
-    -- still names the field it always named; that is the `!Int -> Int#` case,
-    -- and it is the common one. A genuine MULTI-component expansion cannot
-    -- preserve one name for several values, so each component is suffixed and
-    -- the names stay pairwise distinct.
-    f    DataConAppContext{..} = case dcac_arg_tys of
-      [t1] -> [(x, defRFInfo, keepReft dcac_dc (fst t1), trueReft)]
-      tys  -> reftOnLast dcac_dc
-                [ (intSymbol (suffixSymbol x "expand") j, defRFInfo, ofType (fst ty), trueReft)
-                | (j, ty) <- zip [1 :: Int ..] tys
-                ]
-    -- KEEP THE FIELD'S OWN REFINEMENT. `ofType` alone returns the component's
-    -- type with a TRIVIAL refinement, so a user-written
-    -- `{-@ data F = F [Int] {v : Int | v <= lim} @-}` silently loses its
-    -- `v <= lim` the moment `-funbox-small-strict-fields` makes the field
-    -- unpackable -- and, unlike the binder defect above, it is quiet in both
-    -- directions: the declaration is accepted and every obligation that the
-    -- field's bound would have discharged simply becomes unprovable at the
-    -- CONSUMER.
-    --
-    -- Guarded on the SORT, which is the same criterion `makeMeasureSelectors`
-    -- uses to decide whether the field keeps a name in the logic at all. A
-    -- `!Int -> Int#` expansion embeds to `int` on both sides, so the
-    -- refinement transfers verbatim; an `IORef a -> MutVar# ...` one does not,
-    -- and carrying the refinement across would reintroduce exactly the
-    -- `Illegal type specification` that dropping the selector removed.
-    keepReft dc t1
-      | Just r0 <- stripRTypeBase t
-      , typeSort embs τ == typeSort embs t1
-      = strengthenWith (\_ new -> new) (ofType t1) r0
-      -- ...and where the sorts DIFFER, relate them instead of dropping the
-      -- refinement. See 'rebuiltOverComponent'.
-      | Just r0 <- stripRTypeBase t
-      = strengthenWith (\_ new -> new) (ofType t1) (rebuiltOverComponent dc r0)
+    comps = [ (intSymbol (suffixSymbol x0 "expand") j, defRFInfo, ofType rep, trueReft)
+            | (j, rep) <- zip [1 :: Int ..] (fieldLeaves fr) ]
+    r0Mb  = stripRTypeBase t0
+    singleLeaf rep = case r0Mb of
+      Just r0 | not (frResorted fr) || leafStandsIn known fr
+              -> strengthenWith (\_ new -> new) (ofType rep) r0
+      Just r0 -> strengthenWith (\_ new -> new) (ofType rep)
+                   (overComponents (\v -> rebuildField fr [v]) r0)
+      Nothing -> ofType rep
+    reftOnLast cs
+      | Just r0 <- r0Mb
+      , (pre, [(xn, iN, tn, rn)]) <- splitAt (length cs - 1) cs
+      = pre ++ [ (xn, iN, strengthenWith (\_ new -> new) tn
+                            (overComponents (\v -> rebuildField fr ([ F.EVar n | (n, _, _, _) <- pre ] ++ [v])) r0)
+                 , rn) ]
       | otherwise
-      = ofType t1
-
-    -- | The multi-component twin of 'rebuiltOverComponent'.
-    --
-    -- A field expanded into SEVERAL components has the same problem and had no
-    -- comment admitting it: every component got 'ofType', so the field's
-    -- refinement was dropped outright. Measured 2026-09-06 on
-    -- @data H = H [Int] {-# UNPACK #-} !P2@ with @P2 !Int !Int@ -- @SAFE (1)@
-    -- at @-O0@, @UNSAFE (1)@ at @-O1@ and @-O2@, identical count -- so it is
-    -- the same optimisation-dependent loss, in the shape an explicit
-    -- @{-# UNPACK #-}@ produces, which is the common one.
-    --
-    -- The refinement relates ALL the components at once, so it cannot sit on
-    -- any one of them in isolation. It goes on the LAST, which is the only
-    -- position where every earlier binder is in scope: a constructor's spec is
-    -- a dependent function type and an argument's refinement may name the
-    -- arguments before it. @{v : P2 | p2Fst v <= 10}@ on a field expanding to
-    -- @a, b@ becomes @{v : int | p2Fst (P2 a v) <= 10}@ on @b@.
-    reftOnLast dc comps
-      | Just r0 <- stripRTypeBase t
-      , (pre, [(xn, iN, tn, rn)]) <- splitAt (length comps - 1) comps
-      = pre ++ [(xn, iN, strengthenWith (\_ new -> new) tn (rebuild pre r0), rn)]
-      | otherwise
-      = comps
-      where
-        -- the earlier binders come from @pre@, which the pattern above has
-        -- already split off, rather than from @init comps@: the guard proves
-        -- @comps@ non-empty, but a total expression needs no such proof and
-        -- this is the only partial call this module would otherwise contain.
-        rebuild before = mapReftField (\(F.Reft (v, p)) -> F.Reft (v, F.subst1 p (v, app before v)))
-        app before v   = F.mkEApp (GM.namedLocSymbol dc)
-                                  ([ F.EVar n | (n, _, _, _) <- before ] ++ [F.EVar v])
-
-    -- | Re-express the field's own refinement over the COMPONENT it expanded
-    -- to, by rebuilding the field from it: @{v : W | wOf v <= 10}@ on a field
-    -- that unpacks to its @Int@ becomes @{v : int | wOf (W v) <= 10}@.
-    --
-    -- Dropping it instead is sound and was what this did until 2026-09-06, but
-    -- it is a real optimisation-dependent difference rather than a repair: the
-    -- same module is @SAFE (1)@ at @-O0@ and @UNSAFE (1)@ at @-O1@ and @-O2@,
-    -- at an IDENTICAL constraint count, so the obligation is raised either way
-    -- and only its discharge moves. A user-written bound that stops being
-    -- enforced because GHC unpacked a field is exactly the class of
-    -- @-funbox-small-strict-fields@ damage the rest of this series exists to
-    -- remove.
-    --
+      = cs
     -- The substitution goes UNDER the refinement's own binder, which is why it
     -- is 'mapReftField' plus an explicit 'F.Reft' match rather than 'F.subst1'
-    -- on @r0@ -- a 'Subable' substitution respects that binder and would be a
-    -- no-op.
-    --
-    -- The application is single-argument because @dc@ has exactly one field in
-    -- this branch, so @dc v@ IS the field and the fact transferred is the fact
-    -- that was written. The multi-component case is the SAME defect and is
-    -- handled one branch up, in 'reftOnLast' -- see the note there for why the
-    -- refinement goes on the LAST component. It was measured separately rather
-    -- than assumed: before that half, @tests/datacon/pos/UnpackedFieldReftMulti.hs@
-    -- read @SAFE (1) / UNSAFE (1) / UNSAFE (1)@ across @-O0@\/@-O1@\/@-O2@,
-    -- the identical signature this branch had.
-    --
-    -- THERE IS DELIBERATELY NO GUARD ON @dc@ HERE, and the guard that looked
-    -- obviously required is measured INERT. Copying 'Measure.unpackInto''s two
-    -- exclusions -- refuse a NEWTYPE, refuse an EMBEDDED type, because neither
-    -- has a datatype in the logic to rebuild with -- changes no verdict on any
-    -- input found: with it forced to @True@, a @{-@ data @-}@ refinement on an
-    -- @!(IORef Int)@ field (a newtype over @MutVar#@, the recorded case) is
-    -- @SAFE@ either way, and so are all 26 modules under @tests/datacon@.
-    -- An embedded type never reaches here at all, because its sort and its
-    -- component's agree and the branch above takes it. Adding a guard nobody
-    -- can falsify is how ceremony gets copied forward as required.
-    rebuiltOverComponent dc = mapReftField rebuild
-      where
-        rebuild (F.Reft (v, p)) =
-          F.Reft (v, F.subst1 p (v, F.mkEApp (GM.namedLocSymbol dc) [F.EVar v]))
-
-    menv = (emptyFamInstEnv, emptyFamInstEnv)
-
--- Copied from GHC 9.0.2.
-orElse :: Maybe a -> a -> a
-orElse = flip fromMaybe
-
--- Copied from GHC 9.0.2.
-deepSplitProductType :: FamInstEnvs -> Type -> Maybe DataConAppContext
--- If    deepSplitProductType_maybe ty = Just (dc, tys, arg_tys, co)
--- then  dc @ tys (args::arg_tys) :: rep_ty
---       co :: ty ~ rep_ty
--- Why do we return the strictness of the data-con arguments?
--- Answer: see Note [Record evaluated-ness in worker/wrapper]
-deepSplitProductType fam_envs ty
-  | let Reduction co ty1 = topNormaliseType_maybe fam_envs ty
-                    `orElse` Reduction (mkRepReflCo ty) ty
-  , Just (tc, tc_args) <- splitTyConApp_maybe ty1
-  , Just con <- tyConSingleDataCon_maybe tc
-  , let arg_tys = dataConInstArgTys con tc_args
-        strict_marks = dataConRepStrictness con
-  = Just DataConAppContext { dcac_dc = con
-                           , dcac_tys = tc_args
-                           , dcac_arg_tys = zip (map irrelevantMult arg_tys) strict_marks
-                           , dcac_co = co }
-
-deepSplitProductType _ _ = Nothing
+    -- on the refinement -- a 'Subable' substitution respects that binder and
+    -- would be a no-op.
+    overComponents rebuild =
+      mapReftField (\(F.Reft (v, p)) -> F.Reft (v, F.subst1 p (v, rebuild (F.EVar v))))
 
 
 -----------------------------------------------------------------------------------------

@@ -38,6 +38,15 @@
   UNSOUND shape: a projection through an `{-# UNPACK #-}`ed field in the
   middle of a GADT constructor verifies a false claim at `-O1` and not at
   `-O0`
+- Decide the source-to-worker field correspondence of a data constructor ONCE,
+  in a `RepMap` built from `dataConImplBangs`, and make every site that
+  expands a spec, rebuilds a measure equation, drops a selector, lifts a
+  construction or projects through an unpacked field a consumer of it;
+  a shape it cannot align is an error at the constructor rather than a
+  kept selector, a refinement written on an unpacked multi-argument product
+  whose constructor is unknown to the logic is refused at the constructor
+  rather than as `Unbound symbol`, and a strict field of a nullary type,
+  which unpacks to no worker argument, is handled
 - Keep a field's written refinement when unpacking changes its sort, by
   rebuilding the field from the components it expanded to, instead of dropping
   it: a `{-@ data @-}` bound on a strict field no longer stops being enforced

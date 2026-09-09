@@ -297,6 +297,7 @@ import GHC.Core.DataCon               as Ghc
     , dataConImplBangs
     , dataConImplicitTyThings
     , dataConInstArgTys
+    , dataConInstOrigArgTys
     , dataConName
     , dataConOrigArgTys
     , dataConRepArgTys
