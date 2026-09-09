@@ -36,6 +36,9 @@
   rebuilding the field from the components it expanded to, instead of dropping
   it: a `{-@ data @-}` bound on a strict field no longer stops being enforced
   because GHC unboxed it
+- Add `define`s for `isJust`, `isNothing` and `fromJust` to
+  `Data.Maybe_LHAssumptions`, so a reflected body that applies them lifts to
+  the measure instead of an uninterpreted Haskell symbol
 - Drop the `is$Con`/`$select` conjuncts from the inferred types written as
   annotations (`.liquid/*.json`, `.html`, `.vim.annot`) again, without
   bringing them back into error messages: with the filter gone from both, a

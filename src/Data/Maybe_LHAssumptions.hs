@@ -18,4 +18,9 @@ measure isJust :: Maybe a -> Bool
 assume fromJust :: {v:(Maybe a) | isJust v} -> a
 measure fromJust :: Maybe a -> a
   fromJust (Just x) = x
+
+define isJust x    = (isJust x)
+define isNothing x = (not (isJust x))
+define fromJust x  = (fromJust x)
+
 @-}
