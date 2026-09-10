@@ -1078,9 +1078,17 @@ castTy γ t e _
 castTyNewtypeWrap :: CGEnv -> Type -> CoreExpr -> Ghc.DataCon -> CG SpecType
 castTyNewtypeWrap γ τ e dc
   | Just (_, tyArgs) <- Ghc.splitTyConApp_maybe τ
-  = consE γ (foldl App (Var (Ghc.dataConWorkId dc)) (map Type tyArgs ++ [e]))
+  = do t <- consE γ (foldl App (Var (Ghc.dataConWorkId dc)) (map Type tyArgs ++ [e]))
+       -- An embedding may identify the newtype's logical carrier with its
+       -- representation. Preserve the coercion's identity in that case, as
+       -- castTy' already does when unwrapping, alongside constructor facts.
+       if logicalSort τ == logicalSort (exprType e)
+         then meet t <$> castTy' γ τ e
+         else return t
   | otherwise
   = castTy' γ τ e
+  where
+    logicalSort = typeSort (emb γ) . Ghc.expandTypeSynonyms
 
 
 castTy' γ τ (Var x)
