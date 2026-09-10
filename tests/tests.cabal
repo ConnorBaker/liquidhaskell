@@ -1096,6 +1096,11 @@ executable datacon-pos
                     , NestedCaseProjectionDeep
                     , UnpackedFieldSubstSort
                     , NewtypeFieldReftPle
+                    , UnpackedFieldSubWord
+                    , UnpackedFieldSubWordNewtype
+                    , UnpackedFieldEmbeddedProduct
+                    , UnpackedFieldSum
+                    , UnpackedFieldSubWordPair
 
     build-depends:    base
                     , liquid-prelude
@@ -1149,6 +1154,9 @@ executable datacon-neg
                     , CrossFieldReftMulti
                     , NestedCaseProjectionUnknown
                     , UnpackedFieldSubstUnknown
+                    , UnpackedFieldSubWord
+                    , UnpackedFieldSum
+                    , UnpackedFieldSubWordPair
 
     build-depends:    base
                     , liquid-prelude

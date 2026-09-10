@@ -30,7 +30,13 @@
 --   * EMBEDDED TYPES stop the descent. @Int@ as @int@, @Set a@ as @Set_Set a@:
 --     there is no datatype in the logic, hence no constructor to rebuild with
 --     and no selector to project through, so the component stands for the
---     field at the embedded sort.
+--     field at the embedded sort -- WHEN it has that sort. GHC unboxes an
+--     embedded type like any other single-constructor product, and the
+--     component it leaves may embed elsewhere or not at all: @!Int@ becomes
+--     an @Int#@, which embeds to @int@ as @Int@ does, while @!Word8@ becomes
+--     a @Word8#@, which embeds to nothing although @Word8@ embeds to @int@.
+--     That is 'frLeafResorted', and such a component cannot stand for its
+--     field: @sel (D y) = y@ would put a @Word8#@ where an @int@ is declared.
 --
 --   * CLASS AND EQUALITY EVIDENCE. The worker leads with one argument per
 --     entry of 'Ghc.dataConTheta'; that count is 'rmDictArity' and nothing
@@ -50,15 +56,24 @@
 --     type whose one equation is @sel_i (D ys) = rebuild_i@, the field rebuilt
 --     from the worker arguments it stands on. That equation is well sorted
 --     exactly when the rebuild is expressible, so the selector is DROPPED only
---     for a field whose sort moved AND whose rebuild names a constructor the
---     logic does not have ('fieldSelectorDropped'): @!(IORef Int)@ becomes a
+--     for a field whose sort moved AND whose rebuild the logic cannot state
+--     ('fieldSelectorDropped'), for one of two reasons. Either it names a
+--     constructor the logic does not have: @!(IORef Int)@ becomes a
 --     @MutVar#@ and neither @IORef@ nor @STRef@ has a datatype in the logic,
---     while @!W@ over a module-local @W@ keeps @sel (D y) = W y@. Which
+--     while @!W@ over a module-local @W@ keeps @sel (D y) = W y@. Or its one
+--     worker argument is at a sort other than the one the type it stands for
+--     embeds to ('frLeafResorted'): @!Word8@ becomes a @Word8#@ and the
+--     rebuild is the argument itself, so @sel (D y) = y@ relates an @int@ to
+--     a @Word8#@; likewise @newtype P8 = P8 Word8@ over that @Word8#@, whose
+--     @sel (D y) = P8 y@ hands @P8 : func([int; P8])@ a @Word8#@. Which
 --     constructors the logic has is a predicate passed in -- membership in the
 --     'Bare.DataConMap' -- because this module sits below the place that is
 --     decided. Before this module, EVERY field whose sort moved lost its
 --     selector, and a @{-@ data @-}@ record with such a field was rejected at
---     its own selector's signature with @Unbound symbol@.
+--     its own selector's signature with @Unbound symbol@. The first cut of
+--     this module dropped only for an unknown constructor, and KEPT the
+--     @Word8@ selector: a constructor with a @!Word8@ field and no spec at
+--     all was rejected at its own declaration from @-O1@ up.
 --
 --   * THE WORKER IS THE TRUTH FOR SORTS. The descent decides STRUCTURE -- which
 --     field expands into which constructor and how many leaves -- and the leaf
@@ -137,6 +152,16 @@ data FieldRep = FieldRep
     -- rebuild is expressible ('fieldSelectorDropped'). A field standing on
     -- several arguments is never resorted: its reconstruction @C b_j b_k@ is
     -- at the field's own type.
+  , frLeafResorted :: Bool
+    -- ^ Does this field stand on exactly ONE worker argument whose SORT differs
+    -- from that of the type the argument STANDS FOR -- the field's own type
+    -- when GHC unpacked nothing but the box ('frVia' empty, 'Atom'), or the
+    -- type the newtype chain landed on? Then no rebuild is expressible: the
+    -- argument would be handed to a selector equation, or to the innermost
+    -- newtype constructor, at the wrong sort. @!Word8@ over its @Word8#@ is
+    -- the case: @Word8@ embeds to @int@ and @Word8#@ to nothing. Always
+    -- 'False' for a 'Product', whose constructor takes its leaves at the
+    -- worker's sorts by construction, and for an unresorted 'Atom'.
   }
 
 data Shape
@@ -206,21 +231,22 @@ repMap embs sortOf dc
       in (f : fs, ys'')
 
     fill (Field0 src via sh) ys = case sh of
-      Atom0 -> case ys of
-        (y : ys') -> (mk src via (Atom y) (Just y), ys')
-        []        -> (mk src via (Atom src) Nothing, [])  -- unreachable: counts were checked
+      Atom0 standsFor -> case ys of
+        (y : ys') -> (mk src via (Atom y) (Just y) (sortOf standsFor /= sortOf y), ys')
+        []        -> (mk src via (Atom src) Nothing False, [])  -- unreachable: counts were checked
       Product0 d parts ->
         let (fs, ys') = fillAll parts ys
             leaves    = concatMap fieldLeaves fs
-        in (mk src via (Product d fs) (case leaves of [l] -> Just l; _ -> Nothing), ys')
+        in (mk src via (Product d fs) (case leaves of [l] -> Just l; _ -> Nothing) False, ys')
 
-    mk src via sh single = FieldRep
-      { frSource   = src
-      , frVia      = via
-      , frShape    = sh
-      , frResorted = case single of
+    mk src via sh single leafResorted = FieldRep
+      { frSource       = src
+      , frVia          = via
+      , frShape        = sh
+      , frResorted     = case single of
           Just rep -> sortOf src /= sortOf rep
           Nothing  -> False
+      , frLeafResorted = leafResorted
       }
 
 -- | How many arguments the worker takes BEFORE its value arguments: one per
@@ -231,10 +257,13 @@ dictArity = length . dataConTheta
 
 -- | Structure only: what does GHC's bang say this field expands to?
 data Field0 = Field0 Type [DataCon] Shape0
-data Shape0 = Atom0 | Product0 DataCon [Field0]
+data Shape0 = Atom0 Type | Product0 DataCon [Field0]
+  -- ^ 'Atom0' carries the type the one worker argument STANDS FOR: the field's
+  -- own type, or the type the newtype chain landed on. 'fill' compares its
+  -- sort with the argument's for 'frLeafResorted'.
 
 leafCount0 :: Field0 -> Int
-leafCount0 (Field0 _ _ Atom0)             = 1
+leafCount0 (Field0 _ _ (Atom0 _))         = 1
 leafCount0 (Field0 _ _ (Product0 _ parts)) = sum (map leafCount0 parts)
 
 descend :: F.TCEmb TyCon -> DataCon -> Type -> HsImplBang -> Either RepMapError Field0
@@ -247,8 +276,8 @@ descend embs dc t b = case b of
       Just (d, argTys) -> do
         parts <- mapM (uncurry (descend embs dc)) (zip argTys (dataConImplBangs d))
         Right (Field0 t via (Product0 d parts))
-      Nothing -> Right (Field0 t via Atom0)
-  _ -> Right (Field0 t [] Atom0)
+      Nothing -> Right (Field0 t via (Atom0 t'))
+  _ -> Right (Field0 t [] (Atom0 t))
 
 -- | The single-constructor, non-embedded, non-newtype product a type is, with
 -- that constructor's SOURCE argument types instantiated at the type's
@@ -391,18 +420,28 @@ splitLeaves (fr : frs) xs
 -- constructor its fields expand into, transitively -- with the field it
 -- belongs to, in descent order.
 -- | Can the logic REBUILD this field from its worker arguments -- is every
--- constructor 'rebuildField' applies one the logic knows?
+-- constructor 'rebuildField' applies one the logic knows, and is the one
+-- argument an 'Atom' stands on at the sort it is handed on as
+-- ('frLeafResorted')? The second half is what makes an identity rebuild
+-- expressible only where nothing moved: @!Word8@ over a @Word8#@ has no
+-- constructor to apply and no well-sorted equation either.
 fieldRebuildable :: (DataCon -> Bool) -> FieldRep -> Bool
-fieldRebuildable known fr = all known (frVia fr) && case frShape fr of
+fieldRebuildable known fr = all known (frVia fr) && not (frLeafResorted fr) && case frShape fr of
   Product d _ -> known d
   Atom _      -> True
 
 -- | Can the logic PROJECT this field's worker arguments out of the field -- is
--- every selector 'projectField' composes one the logic declares? Deeper than
+-- every selector 'projectField' composes one the logic declares, and does the
+-- projection LAND at the sort the worker takes ('frLeafResorted')? Deeper than
 -- 'fieldRebuildable', because a rebuild applies the outermost constructor to
--- the leaves FLAT while a projection walks every level.
+-- the leaves FLAT while a projection walks every level. The sort half is the
+-- same bit 'fieldRebuildable' reads, seen from the other direction: a
+-- projection out of a @!Word8@ field is the field itself, at @int@, and the
+-- worker takes a @Word8#@ there. Measured without it, 'workerApp' lifted
+-- @mk a n = D a n@ onto the worker as @D a n@ with @a : int@ and the module
+-- failed with @Cannot unify Word8# with int in expression: D a@.
 fieldProjectable :: (DataCon -> Bool) -> FieldRep -> Bool
-fieldProjectable known fr = all known (frVia fr) && case frShape fr of
+fieldProjectable known fr = all known (frVia fr) && not (frLeafResorted fr) && case frShape fr of
   Product d parts -> known d && all (fieldProjectable known) parts
   Atom _          -> True
 
