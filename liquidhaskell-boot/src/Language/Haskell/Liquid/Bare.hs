@@ -330,7 +330,7 @@ makeGhcSpec0 stratNames cfg ghcTyLookupEnv tcg instEnvs lenv localVars src lmap 
       case CoreToLogic.runToLogic
              embs
              lmap
-             dm
+             (Just dm)
              cfg
              (\x -> todo Nothing ("coreToLogic not working " ++ x))
              (CoreToLogic.coreToLogic ce) of

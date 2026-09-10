@@ -117,7 +117,7 @@ makeUnSorted allowTC ty defs
 coreToDef' :: Config -> Bare.TycEnv -> LogicMap -> Located LHName -> Ghc.Var -> Ghc.CoreExpr
            -> [Def LocSpecType Ghc.DataCon]
 coreToDef' cfg tycEnv lmap vx v defn =
-  case runToLogic embs lmap dm cfg (errHMeas vx) (coreToDef vx v defn) of
+  case runToLogic embs lmap (Just dm) cfg (errHMeas vx) (coreToDef vx v defn) of
     Right l -> l
     Left e  -> Ex.throw e
   where
@@ -148,19 +148,25 @@ makeMeasureInline cfg embs lmap cbs x =
                        vx         = F.atLoc x (F.symbol v)
                        ok (xs, e) = LMap vx (F.symbol <$> xs) (either id id e)
 
--- | @coreToFun'@ takes a @Maybe DataConMap@: we need a proper map when lifting
---   measures and reflects (which have case-of, and hence, need the projection symbols),
---   but NOT when lifting inlines (which do not have case-of).
---   For details, see [NOTE:Lifting-Stages]
+-- | @coreToFun'@ takes a @Maybe DataConMap@. Measures and reflects carry the
+--   map: they have case-of, and hence need the projection symbols, and
+--   'CoreToLogic.firstOrderOnly' reads it to tell a data constructor at the
+--   head of an eta-reduced lambda. Inlines are lifted at stage 0
+--   ([NOTE:Lifting-Stages]), BEFORE @makeTycEnv0@ builds that map -- and the
+--   map depends on the inlines, through the alias expansion of the data
+--   declarations -- so no map exists to pass here and 'Nothing' is not a
+--   shortcut but the only value in scope. 'firstOrderOnly' takes 'Nothing' as
+--   "no oracle" and, under @--adt@, withholds eta from every lambda in an
+--   inline body rather than risk handing z3 a bare datatype constructor.
+--   Inlines have no case-of, so no projection symbol is ever looked up.
 
 coreToFun' :: Config -> F.TCEmb Ghc.TyCon -> Maybe Bare.DataConMap -> LogicMap -> LocSymbol -> Ghc.Var -> Ghc.CoreExpr
            -> (([Ghc.Var], Either F.Expr F.Expr) -> a) -> a
 coreToFun' cfg embs dmMb lmap x v defn ok = either Ex.throw ok act
   where
-    act  = runToLogic embs lmap dm cfg err xFun
+    act  = runToLogic embs lmap dmMb cfg err xFun
     xFun = coreToFun x v defn
     err  str = ErrHMeas (GM.sourcePosSrcSpan $ loc x) (pprint $ val x) (text str)
-    dm   = Mb.fromMaybe mempty dmMb
 
 
 -------------------------------------------------------------------------------

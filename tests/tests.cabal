@@ -885,7 +885,15 @@ executable reflect-pos
       buildable:      False
 
     other-modules:
-                      DoubleLit
+                      ConstructorAsValue
+                    , ConstructorAsValueHigherOrder
+                    , ConstructorAsValueLambda
+                    , ConstructorAsValueLazy
+                    , DoubleLit
+                    , InlineConstructorAsValue
+                    , LambdaBetaReduced
+                    , LambdaKeptUnderAdt
+                    , LambdaWithHigherOrder
                     , QuotRemInt
                     , ReflString0
                     , ReflString1
@@ -956,7 +964,13 @@ executable reflect-neg
       buildable:      False
 
     other-modules:
-                      DoubleLit
+                      ConstructorAsValueAdt
+                    , ConstructorAsValueFalse
+                    , ConstructorAsValueLambdaFalse
+                    , ConstructorAsValueLazyFalse
+                    , DoubleLit
+                    , InlineConstructorAsValueAdt
+                    , LambdaWithoutHigherOrder
                     , ReflString0
                     , ReflString1
 
@@ -1028,6 +1042,8 @@ executable measure-neg
                     , Fst01
                     , Fst02
                     , GList00Lib
+                    , LambdaInInlineWithoutHigherOrder
+                    , LambdaInMeasureWithoutHigherOrder
                     , Len00
                     , Len01
                     , List00

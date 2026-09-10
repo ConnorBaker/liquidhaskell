@@ -12,6 +12,7 @@ module Language.Haskell.Liquid.Transforms.CoreToLogic
   ( coreToDef
   , coreToFun
   , coreToLogic
+  , firstOrderOnly
   , mkLit, mkI, mkS
   , runToLogic
   , runToLogicWithBoolBinds
@@ -31,7 +32,7 @@ import           Liquid.GHC.API       hiding (Expr, Located, get, panic)
 import qualified Liquid.GHC.API       as Ghc
 import qualified Liquid.GHC.API       as C
 import qualified Data.List                             as L
-import           Data.Maybe                            (listToMaybe)
+import           Data.Maybe                            (listToMaybe, fromMaybe)
 import qualified Data.Text                             as T
 import qualified Data.Char
 import qualified Text.Printf as Printf
@@ -59,7 +60,7 @@ import           Language.Haskell.Liquid.Types.Types
 import qualified Data.HashMap.Strict                   as M
 import qualified Data.HashSet                          as HS
 import Control.Monad.Reader
-import Language.Fixpoint.Types.Visitor (mapExprOnExpr)
+import Language.Fixpoint.Types.Visitor (mapExprOnExpr, lamSize)
 import Language.Haskell.Liquid.UX.Config
 
 import Data.Ratio
@@ -148,9 +149,15 @@ data LState = LState
   , lsError   :: String -> Error
   , lsEmb     :: TCEmb TyCon
   , lsBools   :: [Var]
-  , lsDCMap   :: DataConMap
+  , lsDCMap   :: Maybe DataConMap
+    -- ^ 'Nothing' at the inline leaf, which is lifted before the module's
+    -- datatypes are declared (see 'firstOrderOnly' and @Bare.Measure@).
   , lsConfig  :: Config
   }
+
+-- | The datatype map, empty where the leaf carries none.
+dcMap :: LState -> DataConMap
+dcMap = fromMaybe mempty . lsDCMap
 
 throw :: String -> LogicM a
 throw str = do
@@ -161,12 +168,12 @@ getState :: LogicM LState
 getState = ask
 
 runToLogic
-  :: TCEmb TyCon -> LogicMap -> DataConMap -> Config -> (String -> Error)
+  :: TCEmb TyCon -> LogicMap -> Maybe DataConMap -> Config -> (String -> Error)
   -> LogicM t -> Either Error t
 runToLogic = runToLogicWithBoolBinds []
 
 runToLogicWithBoolBinds
-  :: [Var] -> TCEmb TyCon -> LogicMap -> DataConMap -> Config -> (String -> Error)
+  :: [Var] -> TCEmb TyCon -> LogicMap -> Maybe DataConMap -> Config -> (String -> Error)
   -> LogicM t -> Either Error t
 runToLogicWithBoolBinds xs tce lmap dm cfg ferror m
   = runReader (runExceptT m) $ LState
@@ -198,10 +205,10 @@ coreAltToDef locSym z zs y t alts
     mkAlt x ctor _args dx (Alt (C.DataAlt d) xs e)
       = do
           allowTC <- reader (typeclass . lsConfig)
-          dm      <- reader lsDCMap
+          dm      <- reader dcMap
           embs    <- reader lsEmb
           let xs' = filter (not . if allowTC then GM.isEmbeddedDictVar else GM.isEvVar) xs
-          body    <- coreToLg e
+          body    <- coreToLg e >>= firstOrderOnly
           -- The alternative's binders @xs'@ are the constructor's REPRESENTATION
           -- arguments, but a measure equation is written against its SOURCE
           -- fields -- which is what the logic knows @d@ to take. The two agree
@@ -238,7 +245,7 @@ coreAltToDef locSym z zs y t alts
       = throw $ "Bad alternative" ++ GM.showPpr alt
 
     mkDef x ctor _args dx (Just dtss) (Just e) = do
-      e0     <- coreToLg e
+      e0     <- coreToLg e >>= firstOrderOnly
       let dxt = Just (varRType dx)
       -- The DEFAULT body may mention the scrutinee @dx@; for each data
       -- constructor @d@ covered by the default alternative, we re-express it as
@@ -309,7 +316,7 @@ coreToFun _ _v s = do
       let isE = if allowTC then GM.isEmbeddedDictVar else isErasable
       if isE x then go acc e else go (x:acc) e
     go acc (C.Tick _ e) = go acc e
-    go acc e            = (reverse acc,) . Right <$> coreToLg e
+    go acc e            = (reverse acc,) . Right <$> (coreToLg e >>= firstOrderOnly)
 
 
 instance Show C.CoreExpr where
@@ -320,6 +327,126 @@ coreToLogic cb = do
   allowTC <- reader $ typeclass . lsConfig
   coreToLg $ normalizeCoreExpr allowTC cb
 
+
+-- | Make a lifted DEFINITION first-order where eta-reduction can, and refuse
+-- it where eta cannot, unless higher-order logic is on.
+--
+-- 'coreToLg' lifts a 'C.Lam' to an 'ELam' unconditionally, but liquid-fixpoint
+-- can only send a lambda to the SMT solver when its @allowHO@ flag is set,
+-- which 'higherOrderFlag' controls: @Defunctionalize.txExpr@ renames lambda
+-- binders to @lam_arg##i@ (and declares those) only under that flag, while
+-- @Serialize.smt2Lam@ always renders the binder through @smtLamArg@. Without the
+-- flag the binder reaches z3 as @x##0@ beside a body that says @x@, neither of
+-- them declared, and the whole query dies with
+-- @crash: SMTLIB2 respSat = Error "... unknown constant x##0"@ -- no
+-- location, no binder, and no mention that a flag exists.
+--
+-- GHC manufactures such a lambda from source that has none: a data constructor
+-- passed as a VALUE desugars to @\\ds -> $WW ds@ (@\\ds -> W ds@ for a lazy
+-- field), at -O0 as much as at -O2, so @mkW n = apply W n@ under @reflect@
+-- lifts to @apply (\\ds -> W ds) n@ once 'toLogicApp' has put the wrapper
+-- @$WW@ back onto the logic constructor @W@. That lambda is exactly
+-- @\\x -> f x@ with @x@ not free in @f@, and 'etaReduce' turns it into @f@,
+-- so the definition becomes @apply W n@ -- a function SYMBOL in argument
+-- position, which liquid-fixpoint represents without @allowHO@ through its
+-- @apply##@ encoding, the same way it represents @apply inc n@ for a
+-- reflected @inc@.
+--
+-- Whatever lambda eta cannot remove -- @\\x -> x + 1@, or any body that is not
+-- an application to the bound variable -- is refused here, through 'LogicM''s
+-- 'throw', so the error is an 'ErrHMeas' located at the reflect/inline/measure
+-- pragma, naming the function and the flag.
+--
+-- ONE lambda is withheld from eta: under 'adtFlag' (@--adt@, or @--reflection@
+-- which implies it), a lambda whose eta result has a DATA CONSTRUCTOR at its
+-- head. With that flag 'Constraint.ToFixpoint.makeDecls' declares the module's
+-- datatypes to z3 through @declare-datatypes@, and a constructor used as a
+-- VALUE -- the bare @W@ of @apply W n@, or the partial @MkPair x@ of
+-- @State (MkPair x)@ -- is then read by z3 at the function-as-array sort
+-- @(Array Int W)@, which neither @apply## (Int Int)@ nor a constructor field
+-- declared @Int@ accepts:
+--
+-- > unknown constant apply##1 (Int (Array Int W)) declared: (declare-fun apply##1 (Int Int) Int)
+-- > unknown constant MkPair (Int) (Pair Int Int) declared: (declare-fun MkPair (Int Int) (Pair Int Int))
+--
+-- Without the flag every symbol is an @Int@-sorted @declare-fun@ and the same
+-- eta result is well sorted; a function that is not a constructor (@plus a@)
+-- is well sorted either way. The lambda itself serializes under @allowHO@ as an
+-- @Int@-sorted @smt_lambda##@, so for that one shape the lambda is KEPT when
+-- 'higherOrderFlag' is on and REFUSED when it is off, where both encodings
+-- crash. The head test is membership in the 'Bare.DataConMap' ('lsDCMap'),
+-- keyed on @(constructor symbol, 0)@ for every constructor the logic has a
+-- datatype for -- the same map 'knownDataCon' reads and the same set of
+-- datatypes @makeDecls@ declares, so at the reflect and measure leaves, which
+-- carry that map, the guard fires on exactly the symbols z3 will see as
+-- constructors. The inline leaf carries NO map ('lsDCMap' is 'Nothing'): it
+-- is lifted at stage 0 of @Bare.makeGhcSpec0@, before 'Bare.makeTycEnv0'
+-- builds the map, and the map depends on the inlines themselves through the
+-- alias expansion of the data declarations, so threading it there would make
+-- a data refinement that names such an inline force its own body. There the
+-- guard has no oracle and withholds eta from EVERY lambda under 'adtFlag',
+-- erring toward the refusal: an inlined constructor-as-value is kept and
+-- serialized under @--reflection@ and refused under @--adt@ alone, and so is
+-- an inlined @\\x -> plus a x@ under @--adt@ alone, which the reflect leaf
+-- would have proved. Under @--adt@ from -O1 up GHC eta-reduces the Core lambda
+-- itself and 'workerApp' is off, so @mkW@ lifts to @apply $WW n@ and is
+-- merely unprovable; that is not this function's to fix.
+--
+-- Both steps sit on what becomes a logic DEFINITION -- a reflected body
+-- ('Bare.Axiom.makeAssumeType'), an inlined body and a bound ('coreToFun'), a
+-- measure alternative ('coreAltToDef') -- and deliberately NOT inside
+-- 'coreToLg' itself. Its other callers want the lambdas: the typeclass
+-- elaborator ('Bare.Elaborate.elaborateSpecType') lifts a lambda per binder
+-- on purpose, peels them off again with @grabLams@, and PANICS if the count it
+-- gets back differs from the count it wrapped, which an eta step under it
+-- would cause for any refinement of the form @p x@; and
+-- 'Constraint.Generate.lamExpr' is only reached under 'higherOrderFlag'.
+firstOrderOnly :: Expr -> LogicM Expr
+firstOrderOnly e0 = do
+  cfg  <- reader lsConfig
+  dmMb <- reader lsDCMap
+  let ctorHead f = case (dmMb, F.splitEAppThroughECst f) of
+                     (Nothing, _)           -> True
+                     (Just dm, (EVar c, _)) -> M.member (c, 0) dm
+                     (Just _,  _)           -> False
+      e = etaReduce (if adtFlag cfg then ctorHead else const False) e0
+  if higherOrderFlag cfg || lamSize e == 0
+    then return e
+    else throw $ unwords
+      [ "the body contains a lambda, which requires the --higherorder flag"
+      , "(implied by --reflection); without it liquid-fixpoint cannot represent"
+      , "the term:", F.showpp e ]
+
+-- | Rewrite every @\\x -> f x@ whose @x@ does not occur in @f@ to @f@,
+-- innermost lambda first, so @\\a -> \\b -> f a b@ becomes @f@ -- except where
+-- the predicate says the result @f@ must not stand alone (see
+-- 'firstOrderOnly').
+--
+-- This is sound in the logic because its functions are TOTAL and
+-- EXTENSIONAL: a function-sorted term denotes a mathematical function, two of
+-- them are equal exactly when they agree at every argument, and
+-- @(\\x -> f x) a@ and @f a@ are the same term for every @a@ -- there is no
+-- bottom, no partial application that fails, and no observable difference
+-- between a lambda and the function it wraps. liquid-fixpoint's encoding
+-- keeps that reading: a function value is an uninterpreted symbol and its
+-- application is @apply##@ over it, so @f@ in argument position means what
+-- @\\x -> f x@ would have meant had the lambda been representable.
+--
+-- The guard, @x@ not among @syms f@, is what makes it a REDUCTION rather than
+-- a rewrite: in @\\x -> plus x x@ the function part mentions the binder, the
+-- two terms differ, and the lambda is left alone. 'F.syms' collects every
+-- symbol in @f@, bound or free, so the test is conservative -- it withholds
+-- the reduction from a term that shadows @x@ inside @f@ as well.
+--
+-- 'mapExprOnExpr' is post-order and descends into lambda bodies, so the inner
+-- lambda of @\\a -> \\b -> f a b@ is reduced first, to @\\a -> f a@, and the
+-- outer one then reduces to @f@.
+etaReduce :: (Expr -> Bool) -> Expr -> Expr
+etaReduce withheld = mapExprOnExpr step
+  where
+    step (ELam (x, _) (EApp f (EVar y)))
+      | x == y, not (x `HS.member` F.syms f), not (withheld f) = f
+    step e = e
 
 coreToLg :: C.CoreExpr -> LogicM Expr
 coreToLg (C.Let (C.NonRec x (C.Coercion c)) e)
@@ -353,7 +480,7 @@ coreToLg (C.Cast e c)
            return $ F.mkEApp (GM.namedLocSymbol dc) [e']
          -- @e |> (NT ~ Rep)@ is the newtype field selector applied to @e@.
          UnwrapCoercion -> do
-           dm <- reader lsDCMap
+           dm <- reader dcMap
            return $ EApp (EVar (makeDataConSelector (Just dm) dc 1)) e'
 coreToLg (C.Cast e c)          = do (s, t) <- coerceToLg c
                                     e'     <- coreToLg e
@@ -469,7 +596,7 @@ normalizeAlts alts      = ctorAlts ++ defAlts
 altToLg :: Expr -> C.CoreAlt -> LogicM (C.AltCon, Expr)
 altToLg de (Alt a@(C.DataAlt d) xs e) = do
     p  <- coreToLg e
-    dm <- reader lsDCMap
+    dm <- reader dcMap
     embs <- reader lsEmb
     allowTC <- reader (typeclass . lsConfig)
     let xs' = filter (not . if allowTC then GM.isEmbeddedDictVar else GM.isEvVar) xs
@@ -698,7 +825,7 @@ toLogicApp e = do
   case f of
     C.Var v -> do args <- mapM coreToLg es
                   embs <- reader lsEmb
-                  dm   <- reader lsDCMap
+                  dm   <- reader dcMap
                   cfg  <- reader lsConfig
                   case workerApp cfg embs dm v args of
                     Just w  -> return w

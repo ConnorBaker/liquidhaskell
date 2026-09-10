@@ -2,6 +2,20 @@
 
 ## Next
 
+- Eta-reduce the lambda GHC manufactures for a data constructor passed as a
+  value, so a reflected `mkW n = apply W n` is proved under plain `--ple`, and
+  refuse any lambda eta cannot remove in a reflected, inlined or measure body
+  with an error naming `--higherorder`, instead of handing liquid-fixpoint a
+  term it serializes with an undeclared binder and crashing the SMT solver with
+  `unknown constant`. The refusal is unconditional where the crash needed the
+  equation to be serialized, so a `reflect` without `--ple` whose body keeps a
+  lambda now errors where it used to get a verdict. Under `--adt` (implied by
+  `--reflection`) a lambda whose eta result is a data constructor is left
+  alone, since z3 reads a bare `declare-datatypes` constructor at an array
+  sort: it is kept under `--higherorder` and refused without it. The inline
+  leaf is lifted before the `DataConMap` exists and gets no oracle, so under
+  `--adt`/`--reflection` every lambda in an inlined body is withheld from eta
+  and refused with the located error instead of crashing z3
 - Stop crashing constraint generation when a class method is applied to a
   dictionary that is not its own class's, as `mapM` and `foldMap` do
   [#1693](https://github.com/ucsd-progsys/liquidhaskell/issues/1693)

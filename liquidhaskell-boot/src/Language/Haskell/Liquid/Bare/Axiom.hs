@@ -354,7 +354,7 @@ makeAssumeType cfg tce lmap dm sym mbT v def
     out   = rTypeSort tce $ ares at
     xArgs = F.EVar . fst <$> aargs at
     _msg  = unwords [showpp sym, showpp mbT]
-    le    = case runToLogicWithBoolBinds bbs tce lmap dm cfg mkErr (coreToLogic def') of
+    le    = case runToLogicWithBoolBinds bbs tce lmap (Just dm) cfg mkErr (coreToLogic def' >>= firstOrderOnly) of
               Right e -> e
               Left  e -> Ex.throw e
     ref        = F.Reft (F.vv_, F.PAtom F.Eq (F.EVar F.vv_) le)
