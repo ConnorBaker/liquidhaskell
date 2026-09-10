@@ -1446,6 +1446,11 @@ executable unit-neg
                     , SemigroupNegativeMultiplier
                     , SemigroupNonPositiveBranch
                     , SemigroupZeroMultiplier
+                    , RemainderNegativeDividend
+                    , QuotRemainderNegativeDividend
+                    , RemainderFalseResult
+                    , QuotRemainderFalseResult
+                    , RemainderUnconditionalBounds
                     , TotalityCaughtPureThrowNoPrelude
                     , TotalityCaughtUndefined
                     , TotalityErrorFacade
@@ -1516,6 +1521,7 @@ executable unit-pos-1
                     , SemigroupNoPrelude
                     , SemigroupNoPreludeDefault
                     , SemigroupPositiveMultiplier
+                    , RemainderSigns
                     , SemigroupTotalOverride
                     , TotalityErrorUnreachable
                     , TotalityDisabledThrowNoPrelude
