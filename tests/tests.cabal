@@ -2843,11 +2843,13 @@ test-suite tasty
     type:             exitcode-stdio-1.0
     main-is:          Main.hs
     other-modules:    ErrorFilterReportTests
+                    , TidyTests
     hs-source-dirs:   tasty
     build-depends:    base
                     , mtl
                     , tasty
                     , tasty-hunit
+                    , liquid-fixpoint
                     , liquidhaskell-boot
     ghc-options:      -threaded -Werror
 

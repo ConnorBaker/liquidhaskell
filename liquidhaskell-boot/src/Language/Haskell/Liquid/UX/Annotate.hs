@@ -83,14 +83,19 @@ mkOutput :: Config -> ErrorResult -> FInfo a -> FixDelayedSolution -> AnnInfo (A
 mkOutput cfg res si sol anna
   = (O { o_vars   = Nothing
       -- , o_errors = []
-      , o_types  = toDoc <$> annTy
+      , o_types  = toDoc <$> annDoc
       , o_templs = toDoc <$> annTmpl
       , o_bots   = mkBots    annTy
       , o_result = res
       }, annTy)
   where
     annTmpl      = closeAnnots anna
-    annTy        = tidySpecType Lossy <$> applySolution si sol annTmpl
+    annSol       = applySolution si sol annTmpl
+    annTy        = tidySpecType Lossy <$> annSol
+    -- The rendered annotations drop the constructor-test conjuncts that
+    -- every other consumer of the inferred types (the `Found false`
+    -- check, RefCore) keeps; see `tidyAnnotSpecType`.
+    annDoc       = tidyAnnotSpecType  <$> annSol
     toDoc        = rtypeDoc tidy
     tidy         = if shortNames cfg then Lossy else Full
 
