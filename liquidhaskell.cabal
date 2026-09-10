@@ -64,6 +64,7 @@ library
                       GHC.Real_LHAssumptions
                       GHC.Word_LHAssumptions
                       Liquid.Prelude.Real_LHAssumptions
+                      Liquid.Prelude.Error_LHAssumptions
                       Liquid.Prelude.Totality_LHAssumptions
                       Prelude_LHAssumptions
 
@@ -86,8 +87,9 @@ library
                       text,
                       ghc-prim
   default-language:   Haskell98
-  ghc-options:        -Wall
+  -- Identify the trusted package while its assumptions are bootstrapping.
+  -- Applications must load the completed policy instead of taking this path.
+  ghc-options:        -Wall -this-package-name liquidhaskell
 
   if flag(devel)
     ghc-options:      -Werror
-

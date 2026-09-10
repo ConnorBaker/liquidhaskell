@@ -1439,12 +1439,21 @@ executable unit-neg
                     , TopLevel
                     , TotalHaskell
                     , TotalityCaughtPureThrowNoPrelude
+                    , TotalityCaughtUndefined
+                    , TotalityErrorFacade
+                    , TotalityErrorNoPrelude
+                    , TotalityErrorNoTotality
+                    , TotalityErrorWithoutStack
+                    , TotalityErrorWithoutStackNoPrelude
                     , TotalityExceptionFacade
                     , TotalityThrowBaseNoPrelude
                     , TotalityThrowDefiningNoPrelude
                     , TotalityThrowFacadeNoPrelude
                     , TotalityThrowGHCNoPrelude
                     , TotalityThrowNoPrelude
+                    , TotalityUndefined
+                    , TotalityUndefinedFacade
+                    , TotalityUndefinedNoPrelude
                     , Trans
                     , Truespec
                     , Tyclass0_unsafe
@@ -1494,6 +1503,9 @@ executable unit-pos-1
     other-modules:
                       Malformed0
                     , TotalityDisabledThrowNoPrelude
+                    , TotalityBottomsNoTotality
+                    , TotalityUndefinedLocal
+                    , TotalityUndefinedUnreachable
                     , TotalityThrowIONoPrelude
                     , Map0
                     , Map2

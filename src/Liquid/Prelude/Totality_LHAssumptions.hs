@@ -7,6 +7,8 @@ import GHC.Prim
 -- This policy is also loaded without Prelude. Its primitive argument types
 -- (notably Addr# in call stacks and pattern failures) need their own embeddings.
 import GHC.Types_LHAssumptions ()
+import GHC.Err (errorWithoutStackTrace)
+import Liquid.Prelude.Error_LHAssumptions ()
 
 {-@
 measure totalityError :: a -> Bool
@@ -14,6 +16,8 @@ measure totalityError :: a -> Bool
 // A pure exception cannot inhabit an arbitrary refinement. In particular,
 // evaluate/catch does not make its suspended argument a total pure value.
 assume throw :: Exception e => {v:e | false} -> a
+
+assume errorWithoutStackTrace :: {v:_ | false} -> a
 
 assume patError :: {v:Addr# | totalityError "Pattern match(es) are non-exhaustive"} -> a
 

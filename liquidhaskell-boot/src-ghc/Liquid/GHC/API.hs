@@ -173,6 +173,7 @@ import GHC.Builtin.Names              as Ghc
     , gt_RDR
     , fractionalClassKey
     , fractionalClassKeys
+    , gHC_INTERNAL_ERR
     , getUnique
     , hasKey
     , isStringClassName
@@ -506,6 +507,7 @@ import GHC.Driver.Backend.Internal    as Ghc (BackendName(NoBackend))
 import GHC.Driver.DynFlags            as Ghc
     ( DumpFlag(Opt_D_dump_timings)
     , dopt_set
+    , thisPackageName
     )
 import GHC.Driver.Env                 as Ghc
     ( HscEnv(hsc_NC, hsc_unit_env, hsc_dflags, hsc_plugins)

@@ -129,18 +129,27 @@ findTotalitySpec :: HscEnv -> Config -> TcM [SpecFinderResult]
 findTotalitySpec env cfg
   | not (totalityCheck cfg) = pure []
   | otherwise = do
-      policyModule <- liftIO $ lookupLiquidBaseModule env totalityModuleName
-      currentModule <- tcg_mod <$> getGblEnv
-      case policyModule of
-        -- During bootstrap the assumptions package is itself being built.
-        -- Its ordinary imports establish the dependency order; do not try
-        -- to load a not-yet-built interface from the current home unit.
-        Just mdl | moduleUnit mdl /= moduleUnit currentModule -> do
-          _ <- initIfaceTcRn $ loadInterface "liquidhaskell totality policy" mdl ImportBySystem
-          eps <- liftIO $ readIORef (euc_eps $ ue_eps $ hsc_unit_env env)
-          liftIO $ fmap maybeToList $ runMaybeT $
-            lookupInterfaceAnnotationsEPS eps (hsc_NC env) mdl
-        _ -> pure []
+      flags <- getDynFlags
+      -- Only the package that builds the assumptions may bootstrap without
+      -- them. An application using LiquidHaskellBoot directly must not
+      -- silently lose the selected totality policy.
+      if thisPackageName flags == Just "liquidhaskell"
+        then pure []
+        else do
+          policyModule <- liftIO $ lookupLiquidBaseModule env totalityModuleName
+          case policyModule of
+            Just mdl -> do
+              _ <- initIfaceTcRn $ loadInterface "liquidhaskell totality policy" mdl ImportBySystem
+              eps <- liftIO $ readIORef (euc_eps $ ue_eps $ hsc_unit_env env)
+              spec <- liftIO $ runMaybeT $
+                lookupInterfaceAnnotationsEPS eps (hsc_NC env) mdl
+              case spec of
+                Just found -> pure [found]
+                Nothing -> missingPolicy
+            Nothing -> missingPolicy
+  where
+    missingPolicy = failWithTc $ mkTcRnUnknownMessage $ mkPlainError [] $
+      text "LiquidHaskell totality policy is unavailable; expose the liquidhaskell package with its compiled LH assumptions."
 
 totalityModuleName :: ModuleName
 totalityModuleName = mkModuleName "Liquid.Prelude.Totality_LHAssumptions"

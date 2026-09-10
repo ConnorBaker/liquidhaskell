@@ -72,7 +72,7 @@ import Language.Haskell.Liquid.UX.Config
       Config(typeclass, checkDerived, extensionality,
              nopolyinfer, dependantCase, rankNTypes, warnOnTermHoles),
       patternFlag,
-      higherOrderFlag, warnOnTermHoles )
+      higherOrderFlag, totalityCheck, warnOnTermHoles )
 import qualified GHC.Data.Strict as Strict
 
 -- Note [Term holes]
@@ -769,7 +769,14 @@ consE γ (Var x) | GM.isDataConId x
        return t
 
 consE γ (Var x)
-  = do t <- varRefType γ x
+  = do -- undefined has no ordinary argument on which to put an impossible
+       -- domain. Check an obligation at its use site instead of assuming a
+       -- false result refinement, which would poison the environment.
+       when (totalityCheck γ && isUndefinedPrimitive x) $
+         addC (SubC γ (rApp boolTyCon [] [] mempty)
+                      (rApp boolTyCon [] [] (uTop F.falseReft)))
+              "strict totality: undefined"
+       t <- varRefType γ x
        addLocA (Just x) (getLocation γ) (varAnn γ x t)
        return t
 
@@ -911,6 +918,15 @@ consEApp γ e'@(App e a)
        cconsE γ' a tx
        makeSingleton γ' (simplify e') <$> addPost γ' (maybe (checkUnbound γ' e' x t a) (F.subst1 t . (x,)) (argExpr γ $ simplify a))
 consEApp _ _ = panic Nothing "Constraint.Generate.consEApp called on invalid inputs"
+
+-- Test the defining binder, not its source-level spelling or reexport module.
+-- A user's total binding also named undefined must remain an ordinary value.
+isUndefinedPrimitive :: Var -> Bool
+isUndefinedPrimitive x =
+  nameModule_maybe name == Just gHC_INTERNAL_ERR
+    && occNameString (nameOccName name) == "undefined"
+  where
+    name = varName x
 
 caseKVKind ::[Alt Var] -> KVKind
 caseKVKind [Alt (DataAlt _) _ (Var _)] = ProjectE
