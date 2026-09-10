@@ -1438,6 +1438,13 @@ executable unit-neg
                     , Test2
                     , TopLevel
                     , TotalHaskell
+                    , TotalityCaughtPureThrowNoPrelude
+                    , TotalityExceptionFacade
+                    , TotalityThrowBaseNoPrelude
+                    , TotalityThrowDefiningNoPrelude
+                    , TotalityThrowFacadeNoPrelude
+                    , TotalityThrowGHCNoPrelude
+                    , TotalityThrowNoPrelude
                     , Trans
                     , Truespec
                     , Tyclass0_unsafe
@@ -1462,6 +1469,7 @@ executable unit-neg
 
     ghc-options:      -ddump-to-file
     build-depends:    base
+                    , ghc-internal
                     , liquid-prelude
                     , containers
                     , liquid-vector
@@ -1485,6 +1493,8 @@ executable unit-pos-1
 
     other-modules:
                       Malformed0
+                    , TotalityDisabledThrowNoPrelude
+                    , TotalityThrowIONoPrelude
                     , Map0
                     , Map2
                     , MapFusion

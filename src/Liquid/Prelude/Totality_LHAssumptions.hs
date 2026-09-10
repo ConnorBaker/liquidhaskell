@@ -4,6 +4,9 @@ module Liquid.Prelude.Totality_LHAssumptions where
 
 import Control.Exception.Base
 import GHC.Prim
+-- This policy is also loaded without Prelude. Its primitive argument types
+-- (notably Addr# in call stacks and pattern failures) need their own embeddings.
+import GHC.Types_LHAssumptions ()
 
 {-@
 measure totalityError :: a -> Bool

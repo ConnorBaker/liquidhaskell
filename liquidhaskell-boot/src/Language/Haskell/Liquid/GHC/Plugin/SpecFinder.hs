@@ -21,6 +21,7 @@ requiring users to mind how they specify dependencies.
 
 module Language.Haskell.Liquid.GHC.Plugin.SpecFinder
     ( findRelevantSpecs
+    , findTotalitySpec
     , SpecFinderResult(..)
     , configToRedundantDependencies
     ) where
@@ -120,6 +121,42 @@ lookupInterfaceAnnotationsEPS eps nameCache thisModule = do
   lib <- MaybeT $ Serialisation.deserialiseLiquidLibFromEPS thisModule eps nameCache
   pure $ LibFound thisModule lib
 
+-- | Totality is a checking policy, not a property of importing Prelude.
+-- A NoImplicitPrelude client can obtain a partial primitive through any
+-- reexport, including a facade compiled without LH annotations. Load the
+-- existing policy independently of those imports; do not duplicate its specs.
+findTotalitySpec :: HscEnv -> Config -> TcM [SpecFinderResult]
+findTotalitySpec env cfg
+  | not (totalityCheck cfg) = pure []
+  | otherwise = do
+      policyModule <- liftIO $ lookupLiquidBaseModule env totalityModuleName
+      currentModule <- tcg_mod <$> getGblEnv
+      case policyModule of
+        -- During bootstrap the assumptions package is itself being built.
+        -- Its ordinary imports establish the dependency order; do not try
+        -- to load a not-yet-built interface from the current home unit.
+        Just mdl | moduleUnit mdl /= moduleUnit currentModule -> do
+          _ <- initIfaceTcRn $ loadInterface "liquidhaskell totality policy" mdl ImportBySystem
+          eps <- liftIO $ readIORef (euc_eps $ ue_eps $ hsc_unit_env env)
+          liftIO $ fmap maybeToList $ runMaybeT $
+            lookupInterfaceAnnotationsEPS eps (hsc_NC env) mdl
+        _ -> pure []
+
+totalityModuleName :: ModuleName
+totalityModuleName = mkModuleName "Liquid.Prelude.Totality_LHAssumptions"
+
+lookupLiquidBaseModule :: HscEnv -> ModuleName -> IO (Maybe Module)
+lookupLiquidBaseModule env mn = do
+  res <- findImportedModule env mn (renamePkgQual (hsc_unit_env env) mn (Just "liquidhaskell"))
+  case res of
+    Found _ mdl -> pure $ Just mdl
+    _ -> do
+      -- Plugin packages occupy a separate visibility namespace.
+      res2 <- findPluginModule env mn
+      case res2 of
+        Found _ mdl -> pure $ Just mdl
+        _           -> pure Nothing
+
 -- | Returns a list of 'StableModule's which can be filtered out of the dependency list, because they are
 -- selectively \"toggled\" on and off by the LiquidHaskell's configuration, which granularity can be
 -- /per module/.
@@ -129,21 +166,8 @@ configToRedundantDependencies env cfg = do
   where
     lookupModule' :: (Bool, ModuleName) -> IO (Maybe StableModule)
     lookupModule' (fetchModule, modName)
-      | fetchModule = lookupLiquidBaseModule modName
+      | fetchModule = fmap toStableModule <$> lookupLiquidBaseModule env modName
       | otherwise   = pure Nothing
-
-    lookupLiquidBaseModule :: ModuleName -> IO (Maybe StableModule)
-    lookupLiquidBaseModule mn = do
-      res <- findImportedModule env mn (renamePkgQual (hsc_unit_env env) mn (Just "liquidhaskell"))
-      case res of
-        Found _ mdl -> pure $ Just (toStableModule mdl)
-        _ -> do
-          -- Fall back to plugin package visibility
-          -- See Note [Module Visibility and Lookup in GHC] for details.
-          res2 <- findPluginModule env mn
-          case res2 of
-            Found _ mdl -> pure $ Just (toStableModule mdl)
-            _           -> pure Nothing
 
 -- | Static associative map of the 'ModuleName' that needs to be filtered from the final 'TargetDependencies'
 -- due to some particular configuration options.
@@ -153,6 +177,6 @@ configToRedundantDependencies env cfg = do
 --
 configSensitiveDependencies :: [(Config -> Bool, ModuleName)]
 configSensitiveDependencies = [
-    (not . totalityCheck, mkModuleName "Liquid.Prelude.Totality_LHAssumptions")
+    (not . totalityCheck, totalityModuleName)
   , (linear, mkModuleName "Liquid.Prelude.Real_LHAssumptions")
   ]

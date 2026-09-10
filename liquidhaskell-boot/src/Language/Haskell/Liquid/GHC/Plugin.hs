@@ -495,8 +495,9 @@ loadDependencies currentModuleConfig mods = do
   hscEnv    <- env_top <$> getEnv
   results   <- SpecFinder.findRelevantSpecs
                  (excludeAutomaticAssumptionsFor currentModuleConfig) hscEnv mods
+  totality  <- SpecFinder.findTotalitySpec hscEnv currentModuleConfig
   -- REVIEW: What does reversing the list accomplishes here?
-  let deps = TargetDependencies $ foldl' processResult mempty (reverse results)
+  let deps = TargetDependencies $ foldl' processResult mempty (reverse results <> totality)
   redundant <- liftIO $ configToRedundantDependencies hscEnv currentModuleConfig
 
   debugLog $ "Redundant dependencies ==> " ++ show redundant
