@@ -633,7 +633,10 @@ cconsE' γ (Cast e co) t
   = cconsE γ (f e) t
 
 cconsE' γ e@(Cast e' c) t
-  = do t' <- (`strengthen` uTop (rTypeReft t)) <$> castTy γ (exprType e) e' c
+  -- The expected refinement is an obligation, not a premise. Adding it to
+  -- the synthesized cast type accepts false specifications and turns an
+  -- inferred KVar's defining constraint into the tautology k => k.
+  = do t' <- castTy γ (exprType e) e' c
        addC (SubC γ (F.notracepp ("Casted Type for " ++ GM.showPpr e ++ "\n init type " ++ showpp t) t') t) ("cconsE Cast: " ++ GM.showPpr e)
 
 cconsE' γ e t
