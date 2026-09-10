@@ -63,6 +63,18 @@
   module under `--eliminate=all` that verifies in 8 GB needed more than 64 GB
   to render its annotations
   [#2650](https://github.com/ucsd-progsys/liquidhaskell/issues/2650)
+- Drop the selector of an unpacked field whose one worker argument sits at a
+  sort other than the one the type it stands for embeds to -- `!Word8` becomes
+  a `Word8#`, which embeds to nothing while `Word8` embeds to `int`, and
+  likewise `Word16`, `Word32`, `Int8`, `Int16`, `Int32`, `Int64`, an
+  `{-# UNPACK #-}`ed sum such as `Maybe Int`, a newtype chain landing on one of
+  them, and a user-embedded product GHC unboxes -- instead of declaring
+  `sel (D y) = y` across the two sorts and rejecting a constructor with such a
+  field at its own declaration from `-O1` up, spec or no spec; `RepMap` records
+  the seam as `frLeafResorted` and `fieldRebuildable` is false for it. A
+  `{-@ data @-}` block on such a constructor is still rejected from `-O1` up,
+  whether the refinement is written on the sub-word field or only on a
+  sibling, because that field has no selector in the logic there
 - Reject `ple` and `automatic-instances` annotations in modules that enable
   neither `--ple-local` nor `--ple`
   [#2737](https://github.com/ucsd-progsys/liquidhaskell/issues/2737)
