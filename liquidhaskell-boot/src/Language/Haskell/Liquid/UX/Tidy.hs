@@ -14,6 +14,7 @@ module Language.Haskell.Liquid.UX.Tidy (
 
     -- * Tidying functions
     tidySpecType
+  , tidyAnnotSpecType
   , tidySymbol
 
     -- * Panic and Exit
@@ -88,6 +89,25 @@ tidySpecType k
   . tidyFunBinds
   . tidyTyVars
 
+-- | Tidy a type for an ANNOTATION -- the inferred types written under
+--   @.liquid/@ as @.json@, @.html@ and @.vim.annot@ -- as opposed to an
+--   error message.
+--
+--   This is 'tidySpecType' 'Lossy' with the internal-refinement filter
+--   'tidyInternalRefas' in front of it. That filter used to be a stage of
+--   'tidySpecType' itself and was removed from it for #2650: an error
+--   message must keep a conjunct that mentions @is$Con@, because a user
+--   predicate over an @inline@d function expands to exactly that and the
+--   message showed only the base type without it. An annotation may still
+--   drop them, and must: they are inlining artefacts with no name in the
+--   source, and under @--eliminate=all@ every KVar's solution is the full
+--   disjunction of its cubes, in which the constructor tests are the bulk.
+--   Substituting that into every annotated binder's type and rendering it
+--   in full did not fit in 64 GB on a module that verifies in 8 GB when the
+--   filter is applied here, or when annotations are switched off.
+tidyAnnotSpecType :: SpecType -> SpecType
+tidyAnnotSpecType = tidySpecType Lossy . tidyInternalRefas
+
 tidyValueVars :: SpecType -> SpecType
 tidyValueVars = mapReft $ \u -> u { ur_reft = tidyVV $ ur_reft u }
 
@@ -125,6 +145,16 @@ tidyEqual = mapReft txReft
   where
     txReft u                      = u { ur_reft = mapPredReft dropInternals $ ur_reft u }
     dropInternals                 = pAnd . L.nub . conjuncts
+
+-- | Drop conjuncts that contain data constructor testing or
+--   selector functions. Not part of 'tidySpecType', so that an error
+--   message keeps them (#2650); see 'tidyAnnotSpecType'.
+tidyInternalRefas   :: SpecType -> SpecType
+tidyInternalRefas = mapReft txReft
+  where
+    txReft u                      = u { ur_reft = mapPredReft dropInternals $ ur_reft u }
+    dropInternals                 = pAnd . filter (not . any isIntern . syms) . conjuncts
+    isIntern x                    = "is$" `isPrefixOfSym` x || "$select" `isSuffixOfSym` x
 
 tidyDSymbols :: SpecType -> SpecType
 tidyDSymbols t = mapBind tx $ substa tx t

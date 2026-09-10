@@ -2,6 +2,12 @@
 
 ## Next
 
+- Drop the `is$Con`/`$select` conjuncts from the inferred types written as
+  annotations (`.liquid/*.json`, `.html`, `.vim.annot`) again, without
+  bringing them back into error messages: with the filter gone from both, a
+  module under `--eliminate=all` that verifies in 8 GB needed more than 64 GB
+  to render its annotations
+  [#2650](https://github.com/ucsd-progsys/liquidhaskell/issues/2650)
 - Reject `ple` and `automatic-instances` annotations in modules that enable
   neither `--ple-local` nor `--ple`
   [#2737](https://github.com/ucsd-progsys/liquidhaskell/issues/2737)
