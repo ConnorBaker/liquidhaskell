@@ -69,6 +69,13 @@ mapTyVars allowTC (FunTy { ft_arg = τ, ft_res = τ'}) t
   | isErasable τ
   = mapTyVars allowTC τ' t
   where isErasable = if allowTC then isEmbeddedDictType else isClassPred
+-- Nested method quantifiers can retain class predicates after bkUnivClass has
+-- removed the outer context. Erase these on both sides before matching value
+-- arguments; otherwise a method-local dictionary shifts the type-variable map.
+mapTyVars allowTC τ (RFun _ _ t t' _)
+  | isErasable t
+  = mapTyVars allowTC τ t'
+  where isErasable = if allowTC then isEmbeddedClass else isClassType
 mapTyVars allowTC (FunTy { ft_arg = τ, ft_res = τ'}) (RFun _ _ t t' _)
    = mapTyVars allowTC τ t >> mapTyVars allowTC τ' t'
 mapTyVars allowTC τ (RAllT _ t _)

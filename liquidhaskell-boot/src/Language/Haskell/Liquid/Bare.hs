@@ -290,6 +290,10 @@ makeGhcSpec0 stratNames cfg ghcTyLookupEnv tcg instEnvs lenv localVars src lmap 
                   -- Preserve user-defined 'dvariance'.
                 , rinstance = specInstances
                   -- Preserve rinstances.
+                , classes = Ms.classes mySpec
+                  -- Selector signatures alone constrain callers, but clients
+                  -- also need class dictionaries to check instance methods
+                  -- (including compiler-generated default implementations).
                 , asmReflectSigs = Ms.asmReflectSigs mySpec
                 , reflects = Ms.reflects mySpec0
                 , cmeasures  = mconcat $ map Ms.cmeasures $ map snd dependencySpecs ++ [bareSpec]

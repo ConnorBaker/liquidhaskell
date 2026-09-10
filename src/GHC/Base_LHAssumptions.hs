@@ -1,12 +1,17 @@
 {-# OPTIONS_GHC -fplugin=LiquidHaskellBoot #-}
 {-# OPTIONS_GHC -Wno-unused-imports #-}
-module GHC.Base_LHAssumptions where
+-- Reexport the class so its method contracts are available to clients.
+module GHC.Base_LHAssumptions (module GHC.Base_LHAssumptions, Semigroup(..)) where
 
-import GHC.Base (assert)
+import GHC.Base (assert, Semigroup(..), NonEmpty)
 import GHC.CString_LHAssumptions()
 import GHC.Exts_LHAssumptions()
 import GHC.Types_LHAssumptions()
 import Data.Tuple_LHAssumptions()
+-- The default stimes guard uses comparison and fromInteger even when a client
+-- does not import Prelude or write any numeric expression of its own.
+import GHC.Classes_LHAssumptions()
+import GHC.Num_LHAssumptions()
 
 {-@ LIQUID "--higherorder" @-}
 {-@ reflect comp @-}
@@ -16,6 +21,18 @@ comp f g x = f (g x)
 
 
 {-@
+
+// The default stimes implementation is defined only for positive multipliers.
+// This is the common Semigroup domain, not an assertion that every override
+// fails outside it; an instance may provide a total, broader implementation.
+class Semigroup a where
+  (<>) :: a -> a -> a
+  sconcat :: NonEmpty a -> a
+  stimes :: forall b. Integral b => {n:b | n > 0} -> a -> a
+
+// Generated method contracts are not among the signatures from which LH mines
+// qualifiers. Keep this domain's candidate with its contract, not with Prelude.
+qualif PositiveMultiplier(v:a) { v > 0 }
 
 assume . :: forall <p :: b -> c -> Bool, q :: a -> b -> Bool, r :: a -> c -> Bool>.
                    {xcmp::a, wcmp::b<q xcmp> |- c<p wcmp> <: c<r xcmp>}

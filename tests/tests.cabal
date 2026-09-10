@@ -1438,6 +1438,14 @@ executable unit-neg
                     , Test2
                     , TopLevel
                     , TotalHaskell
+                    , ClassMethodImportedBody
+                    , ClassMethodImportedCall
+                    , ClassMethodImportedSpec
+                    , ClassMethodNonPositive
+                    , ClassMethodTypeMismatch
+                    , SemigroupNegativeMultiplier
+                    , SemigroupNonPositiveBranch
+                    , SemigroupZeroMultiplier
                     , TotalityCaughtPureThrowNoPrelude
                     , TotalityCaughtUndefined
                     , TotalityErrorFacade
@@ -1502,6 +1510,14 @@ executable unit-pos-1
 
     other-modules:
                       Malformed0
+                    , ClassMethodImported
+                    , ClassMethodLibrary
+                    , ClassMethodLocalConstraint
+                    , SemigroupNoPrelude
+                    , SemigroupNoPreludeDefault
+                    , SemigroupPositiveMultiplier
+                    , SemigroupTotalOverride
+                    , TotalityErrorUnreachable
                     , TotalityDisabledThrowNoPrelude
                     , TotalityBottomsNoTotality
                     , TotalityUndefinedLocal

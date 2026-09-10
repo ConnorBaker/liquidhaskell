@@ -7,6 +7,9 @@ import GHC.Prim
 -- This policy is also loaded without Prelude. Its primitive argument types
 -- (notably Addr# in call stacks and pattern failures) need their own embeddings.
 import GHC.Types_LHAssumptions ()
+-- Strict checking of generated Semigroup defaults needs their admitted domain,
+-- including in clients that do not import Prelude.
+import GHC.Base_LHAssumptions ()
 import GHC.Err (errorWithoutStackTrace)
 import Liquid.Prelude.Error_LHAssumptions ()
 
