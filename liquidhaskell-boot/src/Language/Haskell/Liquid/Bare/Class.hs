@@ -63,7 +63,11 @@ makeMethodTypes allowTC (DEnv hm) cls cbs
         case filter ((==d) . Ghc.dataConWorkId . dcpCon) cls of
           (di:_) ->
             (dcpLoc di `F.atLoc`) . subst (zip (dcpFreeTyVars di) ts) <$>
-            L.lookup (mkSymbol x) (map (first lhNameToResolvedSymbol) $ dcpTyArgs di)
+            -- The owning class has already been matched by its constructor.
+            -- Its resolved selector names are qualified, whereas generated
+            -- instance methods have local names such as $cstimes. Compare
+            -- occurrence names only within that class, not across classes.
+            L.lookup (mkSymbol x) (map (first (GM.dropModuleNames . lhNameToResolvedSymbol)) $ dcpTyArgs di)
           _      -> Nothing
 
       methodType d x m = ihastype (M.lookup d m) x

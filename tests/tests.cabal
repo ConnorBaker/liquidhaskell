@@ -1441,6 +1441,9 @@ executable unit-neg
                     , ClassMethodImportedBody
                     , ClassMethodImportedCall
                     , ClassMethodImportedSpec
+                    , ClassMethodOwnerScopeBad
+                    , SemigroupZeroEliminateAll
+                    , SemigroupNegativeEliminateAll
                     , ClassMethodNonPositive
                     , ClassMethodTypeMismatch
                     , SemigroupNegativeMultiplier
@@ -1521,6 +1524,9 @@ executable unit-pos-1
                     , SemigroupNoPrelude
                     , SemigroupNoPreludeDefault
                     , SemigroupPositiveMultiplier
+                    , ClassMethodOwnerScope
+                    , SemigroupEliminateAll
+                    , SemigroupNoPreludeEliminateAll
                     , RemainderSigns
                     , SemigroupTotalOverride
                     , TotalityErrorUnreachable
