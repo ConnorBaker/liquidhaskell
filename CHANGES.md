@@ -91,6 +91,12 @@
   size grows along the edges between mutually recursive types
   [#2736](https://github.com/ucsd-progsys/liquidhaskell/issues/2736)
   [#2742](https://github.com/ucsd-progsys/liquidhaskell/pull/2742)
+- Stop conjoining the expected refinement onto a `Cast` expression's type
+  before checking it: a `newtype` constructor application is a `Cast` in
+  Core, so a spec'd result built that way satisfied any postcondition,
+  `false` included, and an unspecified newtype constant's inferred type was
+  `false`; keep an `embed`ded newtype's wrap equal to its representation, as
+  its unwrap already is
 
 ## 0.9.14.1.1 (2026-06-04)
 

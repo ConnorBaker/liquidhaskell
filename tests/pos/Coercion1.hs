@@ -1,4 +1,5 @@
 {-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE GADTs #-}
 {-@ LIQUID "--no-positivity-check" @-}
 {-@ LIQUID "--reflection" @-}
 {-@ LIQUID "--ple" @-}

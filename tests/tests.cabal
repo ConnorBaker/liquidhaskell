@@ -1258,6 +1258,8 @@ executable unit-neg
                     , CheckDerived
                     -- , Card
                     , CastedTotality
+                    , CastEmbeddedNewtypeFalse
+                    , CastExpectedRefinement
                     , CharLiterals
                     , CheckedNum
                     , Class1
@@ -1352,6 +1354,10 @@ executable unit-neg
                     , MyBagDefine
                     , NameResolution
                     , NestedRecursion
+                    , NewtypeCastEmbeddedFalse
+                    , NewtypeCastFalse
+                    , NewtypeCastIngressFalse
+                    , NewtypeCastNullaryFalse
                     , NoExhaustiveGuardsError
                     , Null
                     , Pair0
@@ -2081,6 +2087,9 @@ executable unit-pos-4
                     , Case_lambda_join
                     , CasesToLogic
                     , Cat
+                    , CastEmbeddedNewtype
+                    , CastEstablishedRefinement
+                    , CastInferredRefinement
                     , CharLiterals
                     , CheckedNum
                     , Chunks
@@ -2091,6 +2100,11 @@ executable unit-pos-4
                     , ClojurVector
                     , Cmptag0
                     , Coercion
+                    , Coercion1
+                    , NewtypeCast
+                    , NewtypeCastEmbedded
+                    , NewtypeCastNullary
+                    , NewtypeCastNullaryPrivate
                     , Comma
                     , CommentedOut
                     , Compare1
