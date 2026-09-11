@@ -1355,7 +1355,7 @@ hmeasureP = do
   do b <- try (locBinderLogicNameP <* reservedOp "::")
      ty <- located genBareTypeP
      popLayout >> popLayout
-     eqns <- block $ try $ measureDefP LHLogicNameBinder (rawBodyP <|> tyBodyP ty)
+     eqns <- block $ measureDefP LHLogicNameBinder (rawBodyP <|> tyBodyP ty)
      return (Meas $ Measure.mkM b ty eqns MsMeasure mempty)
     <|>
    do b <- locBinderLHNameP
@@ -1488,12 +1488,39 @@ binderP =
 
 measureDefP :: LHNameSpace -> Parser (BodyV LocSymbol) -> Parser (DefV LocSymbol (Located BareTypeParsed) (Located LHName))
 measureDefP ns bodyP
-  = do mname   <- fmap (makeUnresolvedLHName ns) <$> locSymbolP
-       (c, xs) <- measurePatP
-       reservedOp "="
+  = do (mname, c, xs) <- try $ do
+         name <- fmap (makeUnresolvedLHName ns) <$> locSymbolP
+         (ctor, fields) <- measurePatP
+         reservedOp "="
+         return (name, ctor, fields)
        body    <- bodyP
-       let xs'  = symbol . val <$> xs
+       let names = val <$> xs
+           bodyNames = F.syms (val <$> body)
+           resultNames = case body of R x _ -> [x]; _ -> []
+           occupied = S.fromList (names ++ resultNames ++ (val <$> F.toList body))
+       checkNames S.empty names
+       when ("_" `S.member` bodyNames) $
+         fail "anonymous measure pattern wildcard '_' cannot be used in the body"
+       xs' <- mapM (freshWildcard occupied) names
        return   $ Def mname c Nothing ((, Nothing) <$> xs') body
+  where
+    -- Constructor refinements use these names as dependent arrow binders.
+    -- Reusing a name aliases different fields during substitution, even when
+    -- the measure's own body does not mention either field.
+    checkNames _ [] = return ()
+    checkNames seen (x:xs)
+      | x == "_" = checkNames seen xs
+      | x `S.member` seen = fail ("duplicate measure pattern binder: " ++ symbolString x)
+      | otherwise = checkNames (S.insert x seen) xs
+
+    -- Anonymous fields bind distinct, inaccessible names. Avoid user-written
+    -- field and body names as well as each other; freshIntP supplies a distinct
+    -- candidate for every attempt, including rejected collisions.
+    freshWildcard occupied "_" = fresh
+      where
+        fresh = do x <- tempSymbol "measureWildcard" <$> freshIntP
+                   if x `S.member` occupied then fresh else return x
+    freshWildcard _ x = return x
 
 measurePatP :: Parser (Located LHName, [LocSymbol])
 measurePatP

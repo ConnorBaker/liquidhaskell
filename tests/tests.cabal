@@ -1452,6 +1452,7 @@ executable unit-neg
                     , DataToTagFake
                     , DataToTagNewtype
                     , DataToTagSmallOverflow
+                    , MeasurePatternDuplicate
                     , SemigroupZeroEliminateAll
                     , SemigroupNegativeEliminateAll
                     , ClassMethodNonPositive
@@ -1541,6 +1542,7 @@ executable unit-pos-1
                     , SemigroupConstrainedInstance
                     , DataToTag
                     , DataToTagRepresentation
+                    , MeasurePatternWildcards
                     , SemigroupEliminateAll
                     , SemigroupNoPreludeEliminateAll
                     , RemainderSigns
