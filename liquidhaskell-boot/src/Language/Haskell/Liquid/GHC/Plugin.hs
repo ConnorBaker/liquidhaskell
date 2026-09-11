@@ -38,6 +38,8 @@ import           Language.Haskell.Liquid.GHC.Plugin.SpecFinder
 import           Language.Haskell.Liquid.GHC.Types       (MGIModGuts(..), miModGuts)
 import           Language.Haskell.Liquid.Transforms.InlineAux (inlineAux)
 import           Language.Haskell.Liquid.Transforms.Rewrite (rewriteBinds)
+import           GHC.Cmm.Utils (mAX_PTR_TAG)
+import           GHC.Driver.Session (targetPlatform)
 
 import           Control.Monad
 import qualified Control.Monad.Catch as Ex
@@ -686,6 +688,7 @@ makeTargetSrc cfg file modGuts hscEnv rdrEnv methodSpans instanceSpans = do
     , gsFiDcs     = fiDcs
     , gsPrimTcs   = GHC.primTyCons
     , giInstSpans = instanceSpans
+    , giMaxSmallTag = mAX_PTR_TAG (targetPlatform (GHC.hsc_dflags hscEnv))
     }, refCoreCbs)
   where
     mgiModGuts :: MGIModGuts

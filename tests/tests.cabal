@@ -1448,6 +1448,10 @@ executable unit-neg
                     , InstanceMethodSpecializedPartial
                     , InstanceMethodHigherArgumentResult
                     , SemigroupConstrainedNonPositive
+                    , DataToTagWrong
+                    , DataToTagFake
+                    , DataToTagNewtype
+                    , DataToTagSmallOverflow
                     , SemigroupZeroEliminateAll
                     , SemigroupNegativeEliminateAll
                     , ClassMethodNonPositive
@@ -1535,6 +1539,8 @@ executable unit-pos-1
                     , InstanceMethodRefinedPolymorphic
                     , InstanceMethodHigherArgument
                     , SemigroupConstrainedInstance
+                    , DataToTag
+                    , DataToTagRepresentation
                     , SemigroupEliminateAll
                     , SemigroupNoPreludeEliminateAll
                     , RemainderSigns

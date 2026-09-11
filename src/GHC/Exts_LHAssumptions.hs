@@ -11,6 +11,7 @@ import GHC.Types_LHAssumptions()
 assume GHC.Prim.+#  :: x:Int# -> y:Int# -> {v: Int# | v = x + y}
 assume GHC.Prim.-#  :: x:Int# -> y:Int# -> {v: Int# | v = x - y}
 assume GHC.Prim.==# :: x:Int# -> y:Int# -> {v:Int# | v = 1 <=> x = y}
+assume GHC.Prim./=# :: x:Int# -> y:Int# -> {v:Int# | 0 <= v && v <= 1 && (v = 1 <=> x /= y)}
 assume GHC.Prim.>=# :: x:Int# -> y:Int# -> {v:Int# | v = 1 <=> x >= y}
 assume GHC.Prim.<=# :: x:Int# -> y:Int# -> {v:Int# | v = 1 <=> x <= y}
 assume GHC.Prim.<#  :: x:Int# -> y:Int# -> {v:Int# | v = 1 <=> x < y}

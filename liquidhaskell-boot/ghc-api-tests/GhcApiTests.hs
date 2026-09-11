@@ -22,6 +22,8 @@ import           Liquid.GHC.API
     , untick
     )
 import           Liquid.GHC.API.Extra (addNoInlinePragmasToBinds)
+import           Language.Haskell.Liquid.Transforms.Rewrite (rewriteBinds)
+import           Language.Haskell.Liquid.UX.CmdLine (defConfig)
 import           GHC.Hs (cid_binds)
 import           Test.Tasty
 import           Test.Tasty.HUnit
@@ -31,15 +33,18 @@ import qualified GHC as GHC
 import qualified GHC.Builtin.Names as GHC
 import qualified GHC.Builtin.Types as GHC
 import qualified GHC.Core as GHC
+import qualified GHC.Core.Lint as GHC
 import qualified GHC.Data.EnumSet as EnumSet
 import qualified GHC.Data.FastString as GHC
 import qualified GHC.Data.StringBuffer as GHC
 import qualified GHC.Driver.Main as GHC (hscDesugar)
+import qualified GHC.Driver.Config.Core.Lint as GHC
 import qualified GHC.Parser as Parser
 import qualified GHC.Parser.Lexer as GHC
 import qualified GHC.Types.Id as GHC
 import qualified GHC.Types.Name as GHC
 import qualified GHC.Types.SrcLoc as GHC
+import qualified GHC.Types.Unique as GHC
 import qualified GHC.Unit.Module.ModGuts as GHC
 import qualified GHC.Unit.Types as GHC
 import qualified GHC.Utils.Error as GHC
@@ -61,7 +66,32 @@ testTree =
       , testCase "deadBindingPreservation" testDeadBindingPreservation
       , testCase "exportedBindingNotInlined" testExportedBindingNotInlined
       , testCase "derivingCheck" testDerivingCheck
+      , testCase "singleCaseCaptureAvoidance" testSingleCaseCaptureAvoidance
       ]
+
+-- A spelling-only test would be alpha-renamed by GHC before reaching Rewrite.
+-- Instead deliberately reuse the Unique of a variable free in the outer
+-- continuation as the inner case binder. Extending its scope must freshen it.
+testSingleCaseCaptureAvoidance :: IO ()
+testSingleCaseCaptureAvoidance = GHC.runGhc (Just libdir) $ do
+    flags <- GHC.getSessionDynFlags
+    let variable n = GHC.mkSysLocal (GHC.fsLit "sameName") (GHC.mkUnique 'q' n)
+                      GHC.manyDataConTy GHC.intTy
+        x = variable 1
+        y = variable 2
+        z = variable 3
+        holder = variable 4
+        original = Case (Case (Var y) x GHC.intTy [Alt DEFAULT [] (Var x)])
+                        z GHC.intTy [Alt DEFAULT [] (Var x)]
+    case rewriteBinds defConfig [GHC.NonRec holder original] of
+      [GHC.NonRec _ result@(Case (Var source) fresh _
+        [Alt DEFAULT [] (Case (Var innerResult) outer _ [Alt DEFAULT [] (Var answer)])])] -> do
+          liftIO $ assertBool "commuting captured the outer variable"
+            (source == y && fresh /= x && innerResult == fresh && outer == z && answer == x)
+          case GHC.lintExpr (GHC.initLintConfig flags []) (Lam x (Lam y result)) of
+            Nothing -> return ()
+            Just problems -> liftIO $ assertFailure (showPprQualified problems)
+      _ -> liftIO $ assertFailure "commuting did not preserve both case evaluations"
 
 -- Tests that Liquid.GHC.API.Extra.apiComments can retrieve the comments in
 -- the right order from an AST

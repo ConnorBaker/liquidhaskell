@@ -187,6 +187,7 @@ data TargetSrc = TargetSrc
   , gsFiDcs     :: ![(F.Symbol, DataCon)] -- ^ Family instance DataCons
   , gsPrimTcs   :: ![TyCon]               -- ^ Primitive GHC TyCons (from TysPrim.primTyCons)
   , giInstSpans :: ![SrcSpan]             -- ^ Full source spans of instance declarations
+  , giMaxSmallTag :: !Int                -- ^ GHC target's maximum pointer constructor tag
   }
 
 -- | 'QImports' is a map of qualified imports.
@@ -887,6 +888,7 @@ data GhcSrc = Src
   , _gsFiDcs     :: ![(F.Symbol, DataCon)] -- ^ Family instance DataCons
   , _gsPrimTcs   :: ![TyCon]               -- ^ Primitive GHC TyCons (from TysPrim.primTyCons)
   , _giInstSpans :: ![SrcSpan]             -- ^ Full source spans of instance declarations
+  , _giMaxSmallTag :: !Int
   }
 
 data GhcSpec = SP
@@ -922,6 +924,7 @@ toTargetSrc a = TargetSrc
   , gsFiDcs     = _gsFiDcs a
   , gsPrimTcs   = _gsPrimTcs a
   , giInstSpans = _giInstSpans a
+  , giMaxSmallTag = _giMaxSmallTag a
   }
 
 fromTargetSrc :: TargetSrc -> GhcSrc
@@ -940,6 +943,7 @@ fromTargetSrc a = Src
   , _gsFiDcs     = gsFiDcs a
   , _gsPrimTcs   = gsPrimTcs a
   , _giInstSpans = giInstSpans a
+  , _giMaxSmallTag = giMaxSmallTag a
   }
 
 toTargetSpec ::  GhcSpec -> TargetSpec

@@ -66,7 +66,11 @@ import           Language.Haskell.Liquid.Constraint.Template
 import           Language.Haskell.Liquid.Constraint.Termination
 import           Language.Haskell.Liquid.Constraint.RewriteCase
 import           Language.Haskell.Liquid.Transforms.CoreToLogic (weakenResult, runToLogic, coreToLogic)
-import           Language.Haskell.Liquid.Bare.DataType (dataConMap, makeDataConChecker)
+import           Language.Haskell.Liquid.Bare.DataType (dataConMap, knownDataCon, makeDataConChecker)
+import           GHC.Builtin.PrimOps (PrimOp(DataToTagSmallOp, DataToTagLargeOp))
+import           GHC.Core.DataCon (dataConTagZ)
+import           GHC.Core.TyCon (isValidDTT2TyCon)
+import           GHC.Types.Id (isPrimOpId_maybe)
 import Language.Haskell.Liquid.UX.Config
     ( HasConfig(getConfig),
       Config(typeclass, checkDerived, extensionality,
@@ -787,7 +791,7 @@ consE γ e'@(App _ _) =
   do
     t <- if warnOnTermHoles (getConfig γ) then synthesizeWithHole else consEApp γ e'
     checkANFHoleInExpr e' t
-    return t
+    strengthenDataToTag γ e' t
   where
     -- See Note [Term holes]
     -- Record the synthesized type of a direct hole encountered in synthesis
@@ -874,6 +878,38 @@ collectVars (Case e x _ alts) =
   x : collectVars e ++ concatMap collectAltVars alts
   where collectAltVars (Alt _ xs e') = xs ++ collectVars e'
 collectVars _ = []
+
+-- | GHC's actual tag primitives return the zero-based constructor index.
+-- Connect that result to the existing constructor testers, not to payload
+-- equality. The overloaded selector is deliberately absent: its dictionary
+-- may be supplied by withDict. Pre-normalization exposes known method fields.
+-- See GHC.Tc.Instance.Class, Note [DataToTag overview], DTT2 and DTW5.
+strengthenDataToTag :: CGEnv -> CoreExpr -> SpecType -> CG SpecType
+strengthenDataToTag γ expression t
+  | (Var primitive, [Type _, Type ty, value]) <- collectArgs expression
+  , Just op <- isPrimOpId_maybe primitive
+  , op == DataToTagSmallOp || op == DataToTagLargeOp
+  , Just (tc, _) <- splitTyConApp_maybe ty
+  , isValidDTT2TyCon tc
+  , let constructors = tyConDataCons tc
+  , not (null constructors)
+  , op == DataToTagLargeOp || length constructors <= giMaxSmallTag (giSrc (cgInfo γ))
+  , Just argument <- argExpr γ value
+  , F.FTC logicalTyCon : _ <- F.unFApp (typeSort (emb γ) ty)
+  = do declarations <- gets cgADTs
+       -- A declaration elsewhere is insufficient: the argument itself must
+       -- inhabit that ADT, rather than an embedded numeric/string sort.
+       let dm = dataConMap (filter ((== logicalTyCon) . F.ddTyCon) declarations)
+           tag = F.EVar F.vv_
+           range = [ F.PAtom F.Le (F.expr (0 :: Integer)) tag
+                   , F.PAtom F.Lt tag (F.expr (toInteger (length constructors))) ]
+           equation constructor = F.PIff
+             (F.PAtom F.Eq tag (F.expr (toInteger (dataConTagZ constructor))))
+             (F.EApp (F.EVar (makeDataConChecker constructor)) argument)
+       return $ if all (knownDataCon dm) constructors
+         then strengthenMeet t (uTop (F.Reft (F.vv_, F.PAnd (range ++ map equation constructors))))
+         else t
+  | otherwise = return t
 
 consEApp :: CGEnv -> CoreExpr -> CG SpecType
 consEApp γ e'@(App e a@(Type τ))

@@ -33,6 +33,11 @@ import           Language.Haskell.Liquid.GHC.Misc (unTickExpr, isTupleId, mkAliv
 import           Language.Haskell.Liquid.Types.Errors (impossible)
 import           Language.Haskell.Liquid.UX.Config  (Config, noSimplifyCore)
 import qualified Data.List as L
+import GHC.Builtin.Names (dataToTagClassName)
+import GHC.Builtin.PrimOps (PrimOp(DataToTagSmallOp, DataToTagLargeOp))
+import GHC.Core.Class (className)
+import GHC.Core.DataCon (dataConTyCon)
+import GHC.Types.Id (isClassOpId_maybe, isDataConWorkId_maybe, isPrimOpId_maybe)
 
 --------------------------------------------------------------------------------
 -- | Top-level rewriter --------------------------------------------------------
@@ -46,12 +51,76 @@ rewriteBinds cfg
        . rewriteBindWith inlineLoopBreakerTx
        . inlineLoopBreaker
        . rewriteBindWith strictifyLazyLets
+       . rewriteBindWith commuteSingleCase
+       . normalizeDataToTag
        . inlineFailCases)
   | otherwise
   = id
 
 simplifyCore :: Config -> Bool
 simplifyCore = not . noSimplifyCore
+
+-- | Keep a single-alternative scrutinee's evidence in scope for its consumer:
+--
+-- @case (case e of p -> rhs) of q -> body@
+-- becomes @case e of p -> case rhs of q -> body@.
+--
+-- Both evaluations and every alternative are retained; no continuation is
+-- duplicated. GHC's non-shortcutting substitution freshens inner binders against
+-- the outer expression's free variables before their scope is extended. This
+-- includes type/coercion binders and avoids capturing the outer continuation.
+commuteSingleCase :: RewriteRule
+commuteSingleCase expression@(Case inner@(Case _ _ _ [_]) x t alts)
+  | Case scrutinee y _ [Alt con fields rhs] <- Ghc.substExpr fresh inner
+  = let result = Case scrutinee y t [Alt con fields (Case rhs x t alts)]
+    in Just (fromMaybe result (commuteSingleCase result))
+  where
+    fresh = Ghc.mkEmptySubst (Ghc.mkInScopeSet (Ghc.exprFreeVars expression))
+commuteSingleCase _ = Nothing
+
+-- | Expose the actual method of a known DataToTag dictionary. The selector
+-- itself has no constructor-tag axiom: withDict can supply a different method.
+-- Only nonrecursive primitive/dictionary aliases are substituted, using GHC's
+-- capture-avoiding substitution; method type applications and casts are retained.
+normalizeDataToTag :: CoreBind -> CoreBind
+normalizeDataToTag = goBind
+  where
+    goBind (NonRec x e) = NonRec x (go e)
+    goBind (Rec xes) = Rec (map (fmap go) xes)
+    go (Let (NonRec x rhs) body)
+      | let rhs' = go rhs
+      , tagRelated rhs' = go (substitute x rhs' body)
+    go (Let b e) = Let (goBind b) (go e)
+    go (App f a) = selectMethod (App (go f) (go a))
+    go (Lam x e) = Lam x (go e)
+    go (Case e x t alts) = Case (go e) x t [Alt c ys (go rhs) | Alt c ys rhs <- alts]
+    go (Cast e c) = Cast (go e) c
+    go (Tick t e) = Tick t (go e)
+    go e = e
+
+    selectMethod e
+      | (Var selector, [Type _, Type _, dict]) <- collectArgs e
+      , Just cls <- isClassOpId_maybe selector
+      , className cls == dataToTagClassName
+      , (Var constructor, [Type _, Type _, method]) <- collectArgs (unTickExpr dict)
+      , tagDictionary constructor
+      , exprType method `eqType` exprType e
+      = method
+      | otherwise = e
+
+    tagRelated e = case collectArgs (unTickExpr e) of
+      (Var v, _) -> tagDictionary v || case isPrimOpId_maybe v of
+        Just DataToTagSmallOp -> True
+        Just DataToTagLargeOp -> True
+        _ -> False
+      _ -> False
+    tagDictionary v = case isDataConWorkId_maybe v of
+      Just dc -> tyConName (dataConTyCon dc) == dataToTagClassName
+      Nothing -> False
+    substitute x rhs body = Ghc.substExpr substitution body
+      where
+        scope = Ghc.mkInScopeSet (Ghc.exprFreeVars rhs `unionVarSet` Ghc.exprFreeVars body)
+        substitution = Ghc.extendIdSubstList (Ghc.mkEmptySubst scope) [(x, rhs)]
 
 undollar :: RewriteRule
 undollar e
