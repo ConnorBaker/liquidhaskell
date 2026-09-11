@@ -50,93 +50,109 @@ import Control.Monad (forM)
 -------------------------------------------------------------------------------
 makeMethodTypes :: Bool -> DEnv Ghc.Var LocSpecType -> [DataConP] -> [Ghc.CoreBind] -> [(Ghc.Var, MethodType LocSpecType)]
 -------------------------------------------------------------------------------
-makeMethodTypes allowTC (DEnv hm) cls cbs
-  = [(x, MT (addCC allowTC x . fromRISig <$> methodType d x hm) (addCC allowTC x <$> classType (splitDictionary e) x)) | (d,e) <- ds, x <- grepMethods e]
-    where
-      grepMethods = filter GM.isMethod . freeVars mempty
-      ds = filter (GM.isDictionary . fst) (concatMap unRec cbs)
-      unRec (Ghc.Rec xes) = xes
-      unRec (Ghc.NonRec x e) = [(x,e)]
+makeMethodTypes allowTC (DEnv hm) cls cbs =
+    [(x, MT (addCC allowTC x . fromRISig <$> methodType d x hm) (Just $ classOrHaskellType d x)) | (d, e) <- ds, x <- grepMethods e]
+  where
+    -- A dictionary exposes each method at its declared domain. Without a
+    -- refined class contract, infer neither a smaller nor an empty domain
+    -- for the private implementation stored in that public dictionary.
+    classOrHaskellType d x = case classType d x of
+        Just t -> addCC allowTC x t
+        Nothing -> GM.varLocInfo (ofType . Ghc.expandTypeSynonyms) x
 
-      classType Nothing _ = Nothing
-      classType (Just (d, ts, _)) x =
-        case filter ((==d) . Ghc.dataConWorkId . dcpCon) cls of
-          (di:_) ->
-            (dcpLoc di `F.atLoc`) . subst (zip (dcpFreeTyVars di) ts) <$>
-            -- The owning class has already been matched by its constructor.
-            -- Its resolved selector names are qualified, whereas generated
-            -- instance methods have local names such as $cstimes. Compare
-            -- occurrence names only within that class, not across classes.
-            L.lookup (mkSymbol x) (map (first (GM.dropModuleNames . lhNameToResolvedSymbol)) $ dcpTyArgs di)
-          _      -> Nothing
+    grepMethods = filter GM.isMethod . freeVars mempty
+    ds = filter (Ghc.isDFunId . fst) (concatMap unRec cbs)
+    unRec (Ghc.Rec xes) = xes
+    unRec (Ghc.NonRec x e) = [(x, e)]
 
-      methodType d x m = ihastype (M.lookup d m) x
+    classType d x =
+        case filter ((== Ghc.classDataCon owner) . dcpCon) cls of
+            (di : _) ->
+                (dcpLoc di `F.atLoc`) . subst (zip (dcpFreeTyVars di) ts)
+                    <$>
+                    -- The owning class has already been matched by its constructor.
+                    -- Its resolved selector names are qualified, whereas generated
+                    -- instance methods have local names such as $cstimes. Compare
+                    -- occurrence names only within that class, not across classes.
+                    L.lookup (mkSymbol x) (map (first (GM.dropModuleNames . lhNameToResolvedSymbol)) $ dcpTyArgs di)
+            _ -> Nothing
+      where
+        (_, _, owner, ts) = Ghc.tcSplitDFunTy (Ghc.varType d)
 
-      ihastype Nothing _    = Nothing
-      ihastype (Just xts) x = M.lookup (mkSymbol x) xts
+    methodType d x m = ihastype (M.lookup d m) x
 
-      mkSymbol x = F.dropSym 2 $ GM.simplesymbol x
+    ihastype Nothing _ = Nothing
+    ihastype (Just xts) x = M.lookup (mkSymbol x) xts
 
-      subst [] t = t
-      subst ((a,ta):su) t = subsTyVarMeet' (a,ofType ta) (subst su t)
+    mkSymbol x = F.dropSym 2 $ GM.simplesymbol x
+
+    subst [] t = t
+    subst ((a, ta) : su) t = subsTyVarMeet' (a, ofType ta) (subst su t)
 
 addCC :: Bool -> Ghc.Var -> LocSpecType -> LocSpecType
-addCC allowTC var zz@(Loc l l' st0)
-  = Loc l l'
-  . addForall hst
-  . mkArrow [] ps' []
-  . makeCls cs'
-  . mapExprReft (\_ -> F.applyCoSub coSub)
-  . subts su
-  $ st
+addCC allowTC var zz@(Loc l l' st0) =
+    Loc l l'
+        . addForall hst
+        . mkArrow [] ps' []
+        . makeCls cs'
+        . mapExprReft (\_ -> F.applyCoSub coSub)
+        . subts su
+        $ st
   where
-    hst           = ofType (Ghc.expandTypeSynonyms t0) :: SpecType
-    t0            = Ghc.varType var
-    tyvsmap       = case Bare.runMapTyVars allowTC t0 st err of
-                          Left e  -> Ex.throw e
-                          Right s -> Bare.vmap s
-    su            = [(y, rTyVar x)               | (x, y) <- tyvsmap]
-    su'           = [(y, RVar (rTyVar x) NoReft) | (x, y) <- tyvsmap] :: [(RTyVar, RSort)]
-    coSub         = M.fromList [(F.symbol y, F.FObj (F.symbol x)) | (y, x) <- su]
-    ps'           = fmap (subts su') <$> ps
-    cs'           = [(F.dummySymbol, RApp c ts [] mempty) | (c, ts) <- cs ]
-    (_,_,cs,_)    = bkUnivClass (F.notracepp "hs-spec" $ ofType (Ghc.expandTypeSynonyms t0) :: SpecType)
-    (_,ps,_ ,st)  = bkUnivClass (F.notracepp "lq-spec" st0)
+    hst = ofType (Ghc.expandTypeSynonyms t0) :: SpecType
+    t0 = Ghc.varType var
+    tyvsmap = case Bare.runMapTyVars allowTC t0 st err of
+        Left e -> Ex.throw e
+        Right s -> Bare.vmap s
+    su = [(y, rTyVar x) | (x, y) <- tyvsmap]
+    su' = [(y, RVar (rTyVar x) NoReft) | (x, y) <- tyvsmap] :: [(RTyVar, RSort)]
+    coSub = M.fromList [(F.symbol y, F.FObj (F.symbol x)) | (y, x) <- su]
+    ps' = fmap (subts su') <$> ps
+    cs' = [(F.dummySymbol, RApp c ts [] mempty) | (c, ts) <- cs]
+    (_, _, cs, _) = bkUnivClass (F.notracepp "hs-spec" $ ofType (Ghc.expandTypeSynonyms t0) :: SpecType)
+    (_, ps, _, st) = bkUnivClass (F.notracepp "lq-spec" st0)
 
-    makeCls c t  = foldr (uncurry rFun) t c
-    err hsT lqT   = ErrMismatch (GM.fSrcSpan zz) (pprint var)
-      (text "makeMethodTypes")
-      (pprint $ Ghc.expandTypeSynonyms t0)
-      (pprint $ toRSort st0)
-      (Just (hsT, lqT))
-      (Ghc.getSrcSpan var)
+    makeCls c t = foldr (uncurry rFun) t c
+    err hsT lqT =
+        ErrMismatch
+            (GM.fSrcSpan zz)
+            (pprint var)
+            (text "makeMethodTypes")
+            (pprint $ Ghc.expandTypeSynonyms t0)
+            (pprint $ toRSort st0)
+            (Just (hsT, lqT))
+            (Ghc.getSrcSpan var)
 
-    addForall (RAllT v t r) tt@(RAllT v' _ _)
-      | v == v'
-      = tt
-      | otherwise
-      = RAllT (updateRTVar v) (addForall t tt) r
-    addForall (RAllT v t r) t'
-      = RAllT (updateRTVar v) (addForall t t') r
-    addForall (RAllP _ t) t'
-      = addForall t t'
-    addForall _ (RAllP p t')
-      = RAllP (fmap (subts su') p) t'
-    addForall (RFun _ _ t1 t2 _) (RFun x i t1' t2' r)
-      = RFun x i (addForall t1 t1') (addForall t2 t2') r
-    addForall _ t
-      = t
+    -- Ordinary substitution preserves bound variables. Use the checked
+    -- correspondence to alpha-rename an opened nested binder's body instead
+    -- of mistaking its distinct resolved name for an additional quantifier.
+    addForall (RAllT v t r) tt@(RAllT v' t' r')
+        | v == v' =
+            RAllT v' (addForall t t') r'
+        | lookup (ty_var_value v') su == Just (ty_var_value v) =
+            RAllT (updateRTVar v) (addForall t (subsTyVarMeet' (ty_var_value v', RVar (ty_var_value v) mempty) t')) r'
+        | otherwise =
+            RAllT (updateRTVar v) (addForall t tt) r
+    addForall (RAllT v t r) t' =
+        RAllT (updateRTVar v) (addForall t t') r
+    addForall (RAllP _ t) t' =
+        addForall t t'
+    addForall _ (RAllP p t') =
+        RAllP (fmap (subts su') p) t'
+    -- A method-local forall can occur after the instance context. Its class
+    -- evidence is not among the outer constraints collected by bkUnivClass.
+    -- Preserve that arrow from GHC's type before aligning value arguments.
+    addForall (RFun x i t1 t2 r) t'
+        | isClassType t1
+        , not (startsWithClass t') =
+            RFun x i t1 (addForall t2 t') r
+    addForall (RFun _ _ t1 t2 _) (RFun x i t1' t2' r) =
+        RFun x i (addForall t1 t1') (addForall t2 t2') r
+    addForall _ t =
+        t
 
-
-splitDictionary :: Ghc.CoreExpr -> Maybe (Ghc.Var, [Ghc.Type], [Ghc.Var])
-splitDictionary = go [] []
-  where
-    go ts xs (Ghc.App e (Ghc.Tick _ a)) = go ts xs (Ghc.App e a)
-    go ts xs (Ghc.App e (Ghc.Type t))   = go (t:ts) xs e
-    go ts xs (Ghc.App e (Ghc.Var x))    = go ts (x:xs) e
-    go ts xs (Ghc.Tick _ t) = go ts xs t
-    go ts xs (Ghc.Var x) = Just (x, reverse ts, reverse xs)
-    go _ _ _ = Nothing
+    startsWithClass (RFun _ _ t _ _) = isClassType t
+    startsWithClass _ = False
 
 
 -------------------------------------------------------------------------------

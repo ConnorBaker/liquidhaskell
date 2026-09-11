@@ -1442,6 +1442,12 @@ executable unit-neg
                     , ClassMethodImportedCall
                     , ClassMethodImportedSpec
                     , ClassMethodOwnerScopeBad
+                    , InstanceMethodPartial
+                    , InstanceMethodNarrowDomain
+                    , InstanceMethodOddDomain
+                    , InstanceMethodSpecializedPartial
+                    , InstanceMethodHigherArgumentResult
+                    , SemigroupConstrainedNonPositive
                     , SemigroupZeroEliminateAll
                     , SemigroupNegativeEliminateAll
                     , ClassMethodNonPositive
@@ -1525,6 +1531,10 @@ executable unit-pos-1
                     , SemigroupNoPreludeDefault
                     , SemigroupPositiveMultiplier
                     , ClassMethodOwnerScope
+                    , InstanceMethodTotal
+                    , InstanceMethodRefinedPolymorphic
+                    , InstanceMethodHigherArgument
+                    , SemigroupConstrainedInstance
                     , SemigroupEliminateAll
                     , SemigroupNoPreludeEliminateAll
                     , RemainderSigns
