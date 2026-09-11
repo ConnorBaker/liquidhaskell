@@ -1543,6 +1543,7 @@ executable unit-pos-1
                     , DataToTag
                     , DataToTagRepresentation
                     , MeasurePatternWildcards
+                    , SymbolLiteralSorts
                     , SemigroupEliminateAll
                     , SemigroupNoPreludeEliminateAll
                     , RemainderSigns

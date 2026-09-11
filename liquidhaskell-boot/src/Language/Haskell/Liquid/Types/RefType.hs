@@ -1586,6 +1586,10 @@ typeSort tce = go
     go (TyVarTy tv)     = tyVarSort tv
     go (CastTy t _)     = go t
     go (LitTy (NumTyLit _)) = FInt
+    -- Core lambda/coercion sorts must agree with the refinement-type path
+    -- through ofLitType. The internal RHole sentinel is not a string type.
+    go (LitTy lit@(StrTyLit _))
+      | lit /= holeLit = tyConFTyCon tce listTyCon [tyConFTyCon tce charTyCon []]
     go τ                = FObj (typeUniqueSymbol τ)
 
 tyConFTyCon :: TCEmb TyCon -> TyCon -> [Sort] -> Sort

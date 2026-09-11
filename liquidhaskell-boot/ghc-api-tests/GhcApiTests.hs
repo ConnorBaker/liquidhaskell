@@ -23,6 +23,9 @@ import           Liquid.GHC.API
     )
 import           Liquid.GHC.API.Extra (addNoInlinePragmasToBinds)
 import           Language.Haskell.Liquid.Transforms.Rewrite (rewriteBinds)
+import qualified Language.Haskell.Liquid.Types.RefType as RefType
+import           Language.Haskell.Liquid.Types.RType (SpecType)
+import qualified Language.Fixpoint.Types as F
 import           Language.Haskell.Liquid.UX.CmdLine (defConfig)
 import           GHC.Hs (cid_binds)
 import           Test.Tasty
@@ -34,6 +37,8 @@ import qualified GHC.Builtin.Names as GHC
 import qualified GHC.Builtin.Types as GHC
 import qualified GHC.Core as GHC
 import qualified GHC.Core.Lint as GHC
+import qualified GHC.Core.Type as GHC
+import qualified GHC.Core.Utils as Core
 import qualified GHC.Data.EnumSet as EnumSet
 import qualified GHC.Data.FastString as GHC
 import qualified GHC.Data.StringBuffer as GHC
@@ -67,6 +72,65 @@ testTree =
       , testCase "exportedBindingNotInlined" testExportedBindingNotInlined
       , testCase "derivingCheck" testDerivingCheck
       , testCase "singleCaseCaptureAvoidance" testSingleCaseCaptureAvoidance
+      , testCase "stringLiteralSortCorrespondence" testStringLiteralSortCorrespondence
+      , testCase "stringLiteralDomainsRemainDistinct" testStringLiteralDomainsRemainDistinct
+      ]
+
+-- Core lambdas retain GHC type literals, whereas refinement types pass through
+-- ofType. Both paths must produce the same logical sort, including embeddings.
+testStringLiteralSortCorrespondence :: IO ()
+testStringLiteralSortCorrespondence = do
+    binds <- compileToCore "LiteralSorts" $ unlines
+      [ "{-# LANGUAGE DataKinds, KindSignatures #-}"
+      , "module LiteralSorts where"
+      , "import GHC.TypeLits (Symbol)"
+      , "newtype Tagged (label :: Symbol) = Tagged Int"
+      , "nested :: Maybe (Tagged \"component id\") -> Maybe (Tagged \"component id\")"
+      , "nested x = x"
+      ]
+    case findExpr "nested" binds of
+      Nothing -> assertFailure "missing nested literal control"
+      Just nested -> do
+        let literal = GHC.mkStrLitTy (GHC.fsLit "component id")
+            hole = GHC.mkStrLitTy (GHC.fsLit "$LH_RHOLE")
+            custom = F.tceFromList
+              [ (GHC.listTyCon, (F.FObj (F.symbol "CustomList"), F.NoArgs))
+              , (GHC.charTyCon, (F.FObj (F.symbol "CustomChar"), F.NoArgs))
+              ]
+            collapsed = F.tceFromList
+              [(GHC.listTyCon, (F.FObj (F.symbol "EmbeddedString"), F.WithArgs))]
+            types = [literal, Core.exprType nested]
+            agrees embeddings ty =
+              RefType.typeSort embeddings ty @?=
+                RefType.rTypeSort embeddings (RefType.ofType ty :: SpecType)
+        forM_ [mempty, custom, collapsed] $ \embeddings -> do
+          forM_ types (agrees embeddings)
+          RefType.typeSort embeddings (GHC.mkNumLitTy 7) @?= F.FInt
+          agrees embeddings hole
+          assertBool "hole sentinel became a string sort"
+            (RefType.typeSort embeddings hole /= RefType.typeSort embeddings literal)
+
+-- Logical sort normalization does not change GHC's type-level label equality.
+-- This is a type-equality control, not a claim about visible newtype coercions.
+testStringLiteralDomainsRemainDistinct :: IO ()
+testStringLiteralDomainsRemainDistinct = do
+    -- First check the same template and environment with equal labels, so an
+    -- unrelated source error cannot make the distinct-label control pass.
+    _ <- GHC.runGhc (Just libdir) $
+      typecheckSourceCode "DistinctLabels" (source "component id")
+    rejected <- GHC.runGhc (Just libdir) $
+      GHC.handleSourceError (\_ -> return True) $ do
+        _ <- typecheckSourceCode "DistinctLabels" (source "platform name")
+        return False
+    assertBool "GHC identified distinct type-level labels" rejected
+  where
+    source label = unlines
+      [ "{-# LANGUAGE DataKinds, KindSignatures #-}"
+      , "module DistinctLabels where"
+      , "import GHC.TypeLits (Symbol)"
+      , "newtype Tagged (label :: Symbol) = Tagged Int"
+      , "identity :: Tagged \"component id\" -> Tagged " ++ show label
+      , "identity x = x"
       ]
 
 -- A spelling-only test would be alpha-renamed by GHC before reaching Rewrite.
