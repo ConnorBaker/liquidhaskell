@@ -159,23 +159,38 @@ checkStratCtor ltycon spec datacon
 ----------------------------------------------------------------------------------------------
 checkBareSpec :: Ms.BareSpec -> Either Diagnostics ()
 checkBareSpec sp
-  | allChecks == emptyDiagnostics = Right ()
-  | otherwise = Left allChecks
+    | allChecks == emptyDiagnostics = Right ()
+    | otherwise = Left allChecks
   where
-    allChecks = mconcat [ checkUnique   "measure"    measures
-                        , checkUnique   "field"      fields
-                        , checkDisjoints             [ inlines
-                                                     , hmeasures
-                                                     , S.fromList measures
-                                                     , reflects
-                                                     , S.fromList fields
-                                                     ]
-                        ]
-    inlines   = S.map (fmap getLHNameSymbol) (Ms.inlines sp)
+    allChecks =
+        mconcat
+            [ checkUnique "measure" measures
+            , checkUnique "field" fields
+            , checkDisjoints
+                [ inlines
+                , hmeasures
+                , S.fromList independentMeasures
+                , reflects
+                , S.fromList fields
+                ]
+            ]
+    inlines = S.map (fmap getLHNameSymbol) (Ms.inlines sp)
     hmeasures = S.map (fmap getLHNameSymbol) (Ms.hmeas sp)
-    reflects  = S.map (fmap getLHNameSymbol) (Ms.reflects sp)
-    measures  = fmap getLHNameSymbol . msName <$> Ms.measures sp
-    fields    = map (fmap getLHNameSymbol) $ concatMap dataDeclFields (Ms.dataDecls sp)
+    reflects = S.map (fmap getLHNameSymbol) (Ms.reflects sp)
+    measures = fmap getLHNameSymbol . msName <$> Ms.measures sp
+    fields = map (fmap getLHNameSymbol) fieldNames
+    fieldNames = concatMap dataDeclFields (Ms.dataDecls sp)
+    -- An exported generated selector is the elaborated definition of this
+    -- exact field, not an independently authored measure. Keep it in the
+    -- uniqueness check above; the field still participates in all namespace
+    -- conflicts. Neither a different resolved origin with the same spelling
+    -- nor an authored measure receives this exemption.
+    independentMeasures =
+        [ getLHNameSymbol <$> msName m
+        | m <- Ms.measures sp
+        , not (msKind m == MsSelector && val (msName m) `S.member` fieldIdentities)
+        ]
+    fieldIdentities = S.fromList $ val <$> fieldNames
 
 dataDeclFields :: DataDecl -> [F.Located LHName]
 dataDeclFields = filter (not . GM.isTmpSymbol . getLHNameSymbol . F.val)

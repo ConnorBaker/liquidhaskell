@@ -274,7 +274,8 @@ makeGhcSpec0 stratNames cfg ghcTyLookupEnv tcg instEnvs lenv localVars src lmap 
                 , dataDecls = Bare.dataDeclSize mySpec $ dataDecls mySpec
                   -- Placing mySpec at the end causes local measures to take precedence over
                   -- imported measures when their names clash.
-                , measures  = mconcat $ map Ms.measures $ map snd dependencySpecs ++ [mySpec]
+                , measures  = exportMeasureClosure measEnv $
+                    mconcat $ map Ms.measures $ map snd dependencySpecs ++ [mySpec]
                   -- We want to export measures in a 'LiftedSpec', especially if they are
                   -- required to check termination of some 'liftedSigs' we export. Due to the fact
                   -- that 'lSpec1' doesn't contain the measures that we compute via 'makeHaskellMeasures',
@@ -498,6 +499,24 @@ addDefinesToExprAliases env lmap mySpec =
       -- elaborated
       else [ e | (_, xl) <- M.toList (lmSymDefs lmap), let e = lmapEAlias xl ]
     }
+
+{- | Export the generated declarations that the verified signatures and equations
+refer to. Reconstructing these in a client is insufficient: private imported
+constructors need not occur in its Core, and its higher-order setting may
+differ from the producer's. Preserve the actual measure definitions, including
+their constructor equations, rather than exporting just uninterpreted sorts.
+Ordinary measures retain their existing ordering and precedence.
+-}
+exportMeasureClosure :: Bare.MeasEnv -> [BareMeasure] -> [BareMeasure]
+exportMeasureClosure env measures = generated ++ filter absent measures
+  where
+    generated =
+        [ Bare.measureToBare $ first (F.atLoc $ msName m) m
+        | m <- L.sortOn msName $ M.elems $ measMap $ Bare.meMeasureSpec env
+        , msKind m `elem` [MsSelector, MsChecker]
+        ]
+    names = S.fromList $ val . msName <$> generated
+    absent m = not $ val (msName m) `S.member` names
 
 --------------------------------------------------------------------------------
 -- | [NOTE]: REFLECT-IMPORTS

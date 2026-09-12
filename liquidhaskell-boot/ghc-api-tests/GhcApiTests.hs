@@ -56,6 +56,7 @@ import qualified GHC.Utils.Error as GHC
 
 import GHC.Paths (libdir)
 import qualified WiredInTests
+import qualified SpecClosureTests
 
 main :: IO ()
 main =
@@ -76,6 +77,7 @@ testTree =
         , testCase "stringLiteralSortCorrespondence" testStringLiteralSortCorrespondence
         , testCase "stringLiteralDomainsRemainDistinct" testStringLiteralDomainsRemainDistinct
         , WiredInTests.tests
+        , SpecClosureTests.tests
         ]
 
 -- Core lambdas retain GHC type literals, whereas refinement types pass through

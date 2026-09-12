@@ -713,7 +713,8 @@ instance Monoid (Spec lname ty) where
 data LiftedSpec = LiftedSpec
   { -- | Measures (a.k.a.  user-defined properties for ADTs)
     --
-    -- The key of the HashMap is the unqualified name of the measure.
+    -- The key is the unqualified name of an ordinary measure, or the full
+    -- identity of a generated logic name (which is not source qualification).
     -- Constructing such a map discards preceding measures with the same name
     -- as later measures, which makes possible to predict which of a few
     -- conflicting measures will be exported.
@@ -963,7 +964,7 @@ toLiftedSpec :: BareSpecLHName -> LiftedSpec
 toLiftedSpec a = LiftedSpec
   { liftedMeasures   =
       M.fromList
-        [ (dropModuleNames $ lhNameToResolvedSymbol n, m)
+        [ (lhNameToUnqualifiedSymbol n, m)
         | m <- measures a
         , let n = val $ msName m
         ]

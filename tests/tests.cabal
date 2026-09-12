@@ -660,6 +660,7 @@ executable errors
                     , ShadowFieldInline
                     , ShadowFieldReflect
                     , ShadowMeasure
+                    , ImportedMeasureAuthoredConflict
                     -- , ShadowMeasureVar
                     , SplitSubtype
                     , T1140
@@ -1127,6 +1128,13 @@ executable datacon-pos
                     , PolymorphicEmptyAliases
                     , PolymorphicMemptyArgument
                     , PolymorphicNested
+                    , ImportedMeasureArrowLib
+                    , ImportedMeasureReexport
+                    , ImportedMeasureDomainLib
+                    , ImportedMeasureMapLib
+                    , ImportedMeasureArrow
+                    , ImportedMeasureDomain
+                    , ImportedMeasureMap
                     , NewtypeEmbeddedReflectionSource
                     , NewtypeEmbeddedReflectionClient
                     , NonEmbeddedReflectionControl
@@ -1144,6 +1152,7 @@ executable datacon-pos
 
     hs-source-dirs:   app
                     , datacon/pos
+                    , datacon/lib
 
 flag datacon-neg
      default: False
@@ -1201,6 +1210,14 @@ executable datacon-neg
                     , PolymorphicEmptyFalseMember
                     , PolymorphicMemptyWrongValue
                     , PolymorphicNestedWrong
+                    , ImportedMeasureArrowLib
+                    , ImportedMeasureReexport
+                    , ImportedMeasureDomainLib
+                    , ImportedMeasureMapLib
+                    , ImportedMeasureArrowWrong
+                    , ImportedMeasureDomainWrong
+                    , ImportedMeasureFieldWrong
+                    , ImportedMeasureMapWrong
                     , CrossFieldReft
                     , CrossFieldReftMulti
                     , NestedCaseProjectionUnknown
@@ -1217,6 +1234,7 @@ executable datacon-neg
 
     hs-source-dirs:   app
                     , datacon/neg
+                    , datacon/lib
 
 flag datacon-unsound
      default: False
