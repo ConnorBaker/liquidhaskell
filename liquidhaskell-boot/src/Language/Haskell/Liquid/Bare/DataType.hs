@@ -267,7 +267,12 @@ makeDataDecls tce name tds ds = (mkDiagnostics warns [], okDecs)
       (mkWarnDecl . fmap pprint . dataNameSymbol . tycName . fst . fst . snd <$> badTcs) ++
       (mkWarnDecl . (\d -> F.atLoc d (pprint $ F.symbol d)) <$> badDecs)
     tds'             = resolveTyCons name tds
-    tcDds            = filter ((/= Ghc.listTyCon) . fst)
+    -- Embedded types already have their declared logical carrier. Declaring
+    -- a second SMT datatype at the Haskell tycon name gives its constructor,
+    -- checker and selectors a different domain from every embedded value.
+    -- Keep their refined constructor specifications; only the incompatible
+    -- SMT datatype declaration is omitted here.
+    tcDds            = filter (\(tc, _) -> tc /= Ghc.listTyCon && not (F.tceMember tc tce))
                      $ groupDataCons tds' ds
     (okTcs, badTcs)  = L.partition isVanillaTc tcDds
     decs             = [ makeFDataDecls tce tc dd ctors | (tc, (dd, ctors)) <- okTcs]
