@@ -65,8 +65,8 @@ import           Language.Haskell.Liquid.Constraint.Constraint ( addConstraints 
 import           Language.Haskell.Liquid.Constraint.Template
 import           Language.Haskell.Liquid.Constraint.Termination
 import           Language.Haskell.Liquid.Constraint.RewriteCase
-import           Language.Haskell.Liquid.Transforms.CoreToLogic (weakenResult, runToLogic, coreToLogic)
-import           Language.Haskell.Liquid.Bare.DataType (dataConMap, knownDataCon, makeDataConChecker)
+import           Language.Haskell.Liquid.Transforms.CoreToLogic (weakenResult, runToLogic, coreToLogic, NewtypeCoercion (..), newtypeCoercionDataCon)
+import           Language.Haskell.Liquid.Bare.DataType (dataConMap, knownDataCon, makeDataConChecker, makeDataConSelector)
 import           GHC.Builtin.PrimOps (PrimOp(DataToTagSmallOp, DataToTagLargeOp))
 import           GHC.Core.DataCon (dataConTagZ)
 import           GHC.Core.TyCon (isValidDTT2TyCon)
@@ -1095,27 +1095,16 @@ unRRTy t              = t
 castTy  :: CGEnv -> Type -> CoreExpr -> Coercion -> CG SpecType
 castTy' :: CGEnv -> Type -> CoreExpr -> CG SpecType
 --------------------------------------------------------------------------------
-castTy γ t e (AxiomCo ca _)
-  = do
-    msp <- case isNewtypeAxiomRule_maybe ca of
-      Just (tc, _) -> lookupNewType tc
-      _ -> return Nothing
-    sp <- castTy' γ t e
-    return (fromMaybe sp msp)
+castTy γ t e co
+  | Just (dc, WrapCoercion) <- newtypeCoercionDataCon co
+  -- Recognize the exact instantiated representation, not just a bare axiom:
+  -- eta-reduced newtypes apply their axiom with AppCo nodes. The constructor
+  -- application checks its instantiated refined field by ordinary application
+  -- checking, including fields from explicit refined newtype declarations.
+  = castTyNewtypeWrap γ t e dc
 
-castTy γ t e (SymCo (AxiomCo ca _))
-  | Just (tc, _) <- isNewtypeAxiomRule_maybe ca
-  = do
-      -- When the user gave an explicit @{-@ newtype … @-}@ spec, we must also
-      -- check the representation @e@ against the declared field invariant.
-      mtc <- lookupNewType tc
-      forM_ mtc $ cconsE γ e
-      -- A newtype wrap is, logically, the constructor applied to @e@. Whenever
-      -- possible we type it as that constructor application ('castTyNewtypeWrap')
-      -- the same as in the @data@ case.
-      case Ghc.tyConSingleDataCon_maybe tc of
-        Just dc -> castTyNewtypeWrap γ t e dc
-        Nothing -> castTy' γ t e
+  | Just (dc, UnwrapCoercion) <- newtypeCoercionDataCon co
+  = castTyNewtypeUnwrap γ t e dc
 
 castTy γ t e _
   = castTy' γ t e
@@ -1141,6 +1130,32 @@ castTyNewtypeWrap γ τ e dc
   = castTy' γ τ e
   where
     logicalSort = typeSort (emb γ) . Ghc.expandTypeSynonyms
+
+-- | Eliminate a newtype using its instantiated constructor field type. Reuse
+-- the same type/predicate substitution as caseEnv, retaining refinements on
+-- the input's type arguments rather than substituting only its GHC types.
+castTyNewtypeUnwrap :: CGEnv -> Type -> CoreExpr -> Ghc.DataCon -> CG SpecType
+castTyNewtypeUnwrap γ τ e dc = do
+  nt <- consE γ e
+  td <- γ ??= Ghc.dataConWorkId dc
+  sp <- castTy' γ τ e
+  case nt of
+    RApp _ ts rs _ -> do
+      let ti = instantiatePvs (instantiateTys td ts) (reverse rs)
+          RFun _ _ field _ _ = checkFun ("Newtype constructor", dc) γ ti
+          result = sp `meet` field
+      adts <- gets cgADTs
+      fieldValue <- fresh
+      let dm = dataConMap adts
+      return $ case argExpr γ e of
+        Just value | knownDataCon dm dc ->
+          let F.Reft (whole, predicate) = dataConMsReft ti [fieldValue]
+              measureFacts = F.Reft (fieldValue, F.subst1 predicate (whole, value))
+              selectorFact = F.uexprReft
+                (F.EApp (F.EVar (makeDataConSelector (Just dm) dc 1)) value)
+          in result `strengthen` uTop (measureFacts `meet` selectorFact)
+        _ -> result
+    _ -> return sp
 
 
 castTy' γ τ (Var x)

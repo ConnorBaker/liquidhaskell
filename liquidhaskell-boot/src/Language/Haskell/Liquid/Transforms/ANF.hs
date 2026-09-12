@@ -36,6 +36,8 @@ import           Data.Hashable
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HM
 import GHC.Core.Type (ForAllTyBinder)
+import GHC.Core.TyCo.Rep (Coercion (..))
+import qualified GHC.Core.Coercion as Co
 
 --------------------------------------------------------------------------------
 -- | A-Normalize a module ------------------------------------------------------
@@ -204,6 +206,12 @@ normalize _ e@(Lit _)
 
 normalize _ e@(Type _)
   = return e
+
+-- Keep coercion composition explicit so a refined newtype introduction or
+-- elimination is checked at its own intermediate representation boundary.
+normalize γ (Cast e co)
+  | Just (first, second) <- splitCoercionComposition co
+  = normalize γ (Cast (Cast e first) second)
 
 normalize γ (Cast e τ)
   = do e' <- normalizeName γ e
@@ -418,3 +426,17 @@ incrCaseDepth _       γ = γ
 
 at :: AnfEnv -> CoreTickish -> AnfEnv
 at γ tt = γ { aeSrcSpan = Sp.push (Sp.Tick tt) (aeSrcSpan γ)}
+
+-- The argument guard is essential: applying the same non-reflexive argument
+-- coercion twice would not compose at the intermediate type. We expose only
+-- composition and its symmetry/reflexive-application congruences here.
+splitCoercionComposition :: Coercion -> Maybe (Coercion, Coercion)
+splitCoercionComposition (TransCo first second) = Just (first, second)
+splitCoercionComposition (SymCo co) = do
+  (first, second) <- splitCoercionComposition co
+  pure (Co.mkSymCo second, Co.mkSymCo first)
+splitCoercionComposition (AppCo function argument)
+  | Co.isReflCo argument = do
+      (first, second) <- splitCoercionComposition function
+      pure (Co.mkAppCo first argument, Co.mkAppCo second argument)
+splitCoercionComposition _ = Nothing

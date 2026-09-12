@@ -1109,6 +1109,13 @@ executable datacon-pos
                     , NestedCaseProjectionDeep
                     , UnpackedFieldSubstSort
                     , NewtypeFieldReftPle
+                    , NewtypeCast
+                    , NewtypeCastRefined
+                    , NewtypeCastMap
+                    , NewtypeCastComposed
+                    , NewtypeCastEmbedded
+                    , NewtypeCastPredicates
+                    , NewtypeCastComposedRefined
                     , UnpackedFieldSubWord
                     , UnpackedFieldSubWordNewtype
                     , UnpackedFieldEmbeddedProduct
@@ -1163,6 +1170,14 @@ executable datacon-neg
                     , GadtUnpackMiddle
                     , ReflectionCaseEmbedded
                     , NewtypeFieldReft
+                    , NewtypeCastWrongValue
+                    , NewtypeCastEmpty
+                    , NewtypeCastTypeArgument
+                    , NewtypeCastGeneric
+                    , NewtypeCastEmbeddedWrong
+                    , NewtypeCastPredicatesWrong
+                    , NewtypeCastUnwrapWrong
+                    , NewtypeCastComposedDomain
                     , CrossFieldReft
                     , CrossFieldReftMulti
                     , NestedCaseProjectionUnknown

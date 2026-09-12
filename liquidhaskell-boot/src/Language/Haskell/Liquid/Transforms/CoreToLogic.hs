@@ -21,6 +21,8 @@ module Language.Haskell.Liquid.Transforms.CoreToLogic
   , weakenResult
   , normalizeCoreExpr
   , workerApp
+  , NewtypeCoercion (..)
+  , newtypeCoercionDataCon
   ) where
 
 import           Data.Bifunctor (first)
