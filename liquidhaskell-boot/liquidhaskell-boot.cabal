@@ -177,6 +177,7 @@ test-suite ghc-api-tests
   type:             exitcode-stdio-1.0
   main-is:          GhcApiTests.hs
   hs-source-dirs:   ghc-api-tests
+  other-modules:    WiredInTests
   build-depends:    base
                   , ghc
                   , ghc-paths

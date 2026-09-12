@@ -79,11 +79,11 @@ dcPrefix = "lqdc"
 
 wiredSortedSyms :: [(F.Symbol, F.Sort)]
 wiredSortedSyms =
-    (selfSymbol,selfSort) :
-    [(pappV n, pappSort n) | n <- [1..pappArity]] ++
-    wiredTheorySortedSyms
+    (selfSymbol, selfSort)
+        : [(pappV n, pappSort n) | n <- [1 .. pappArity]]
+        ++ wiredTheorySortedSyms
   where
-    selfSort = F.FAbs 1 (F.FVar 0)
+    selfSort = F.mkFFunc 1 [F.FVar 0]
 
 wiredTheorySortedSyms :: [(F.Symbol, F.Sort)]
 wiredTheorySortedSyms =
@@ -248,4 +248,3 @@ mkps_ (n:ns) (t:ts) ((f, x):xs) args ps = mkps_ ns ts xs (a:args) (p:ps)
     p                                   = PV n t args
     a                                   = (t, f, x)
 mkps_ _     _       _          _    _ = panic Nothing "Bare : mkps_"
-

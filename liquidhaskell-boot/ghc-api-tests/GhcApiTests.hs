@@ -55,26 +55,28 @@ import qualified GHC.Unit.Types as GHC
 import qualified GHC.Utils.Error as GHC
 
 import GHC.Paths (libdir)
-
+import qualified WiredInTests
 
 main :: IO ()
 main =
-  defaultMainWithIngredients (antXMLRunner:defaultIngredients) testTree
+    defaultMainWithIngredients (antXMLRunner : defaultIngredients) testTree
 
 testTree :: TestTree
 testTree =
-    testGroup "GHC API"
-      [ testCase "apiComments" testApiComments
-      , testCase "caseDesugaring" testCaseDesugaring
-      , testCase "numericLiteralDesugaring" testNumLitDesugaring
-      , testCase "dollarDesugaring" testDollarDesugaring
-      , testCase "deadBindingPreservation" testDeadBindingPreservation
-      , testCase "exportedBindingNotInlined" testExportedBindingNotInlined
-      , testCase "derivingCheck" testDerivingCheck
-      , testCase "singleCaseCaptureAvoidance" testSingleCaseCaptureAvoidance
-      , testCase "stringLiteralSortCorrespondence" testStringLiteralSortCorrespondence
-      , testCase "stringLiteralDomainsRemainDistinct" testStringLiteralDomainsRemainDistinct
-      ]
+    testGroup
+        "GHC API"
+        [ testCase "apiComments" testApiComments
+        , testCase "caseDesugaring" testCaseDesugaring
+        , testCase "numericLiteralDesugaring" testNumLitDesugaring
+        , testCase "dollarDesugaring" testDollarDesugaring
+        , testCase "deadBindingPreservation" testDeadBindingPreservation
+        , testCase "exportedBindingNotInlined" testExportedBindingNotInlined
+        , testCase "derivingCheck" testDerivingCheck
+        , testCase "singleCaseCaptureAvoidance" testSingleCaseCaptureAvoidance
+        , testCase "stringLiteralSortCorrespondence" testStringLiteralSortCorrespondence
+        , testCase "stringLiteralDomainsRemainDistinct" testStringLiteralDomainsRemainDistinct
+        , WiredInTests.tests
+        ]
 
 -- Core lambdas retain GHC type literals, whereas refinement types pass through
 -- ofType. Both paths must produce the same logical sort, including embeddings.

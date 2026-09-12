@@ -1123,6 +1123,10 @@ executable datacon-pos
                     , NewtypeFunctionCastPolymorphic
                     , NewtypeEmbeddedReflectionSet
                     , NewtypeEmbeddedReflectionDomain
+                    , PolymorphicEmptyTwoSorts
+                    , PolymorphicEmptyAliases
+                    , PolymorphicMemptyArgument
+                    , PolymorphicNested
                     , NewtypeEmbeddedReflectionSource
                     , NewtypeEmbeddedReflectionClient
                     , NonEmbeddedReflectionControl
@@ -1194,6 +1198,9 @@ executable datacon-neg
                     , NewtypeFunctionCastBottomBad
                     , NewtypeEmbeddedReflectionDomainBad
                     , NewtypeEmbeddedReflectionContentBad
+                    , PolymorphicEmptyFalseMember
+                    , PolymorphicMemptyWrongValue
+                    , PolymorphicNestedWrong
                     , CrossFieldReft
                     , CrossFieldReftMulti
                     , NestedCaseProjectionUnknown
