@@ -121,6 +121,8 @@ library
                       LiquidHaskellBoot
                       Paths_liquidhaskell_boot
   other-modules:      Language.Haskell.Liquid.GHC.Plugin.Serialisation
+                      Language.Haskell.Liquid.GHC.Plugin.AnnotationCodec
+                      Language.Haskell.Liquid.GHC.Plugin.AnnotationIdentity
                       Language.Haskell.Liquid.GHC.Plugin.SpecFinder
                       Language.Haskell.Liquid.GHC.Plugin.Types
                       Language.Haskell.Liquid.RefCore.CoreToLH
@@ -167,11 +169,46 @@ library
                     , vector               >= 0.10
                     , free
                     , extra
+                    , zstd                 >= 0.1.3 && < 0.2
   default-language:   Haskell98
   default-extensions: PatternGuards, RecordWildCards, DoAndIfThenElse
   ghc-options:        -W -fwarn-missing-signatures -Wno-x-partial
   if flag(devel)
     ghc-options:      -Wall -Werror -Wno-x-partial
+
+library annotation-identity-old
+  hs-source-dirs:   serialization-tests/identity-fixture
+  exposed-modules: IdentityFixture
+  build-depends:   base
+  default-language: Haskell2010
+
+library annotation-identity-current
+  hs-source-dirs:   serialization-tests/identity-fixture
+  exposed-modules: IdentityFixture
+  build-depends:   base
+  default-language: Haskell2010
+
+test-suite serialization-tests
+  type:             exitcode-stdio-1.0
+  main-is:          Main.hs
+  hs-source-dirs:   serialization-tests src
+  other-modules:    CodecTests
+                   AnnotationIdentityTests
+                   Language.Haskell.Liquid.GHC.Plugin.AnnotationCodec
+                   Language.Haskell.Liquid.GHC.Plugin.AnnotationIdentity
+  build-depends:    base
+                  , binary
+                  , bytestring
+                  , ghc
+                  , ghc-boot
+                  , annotation-identity-old
+                  , annotation-identity-current
+                  , tasty
+                  , tasty-hunit
+                  , zstd >= 0.1.3 && < 0.2
+  mixins:          annotation-identity-old (IdentityFixture as Old.IdentityFixture)
+                 , annotation-identity-current (IdentityFixture as Current.IdentityFixture)
+  default-language: Haskell2010
 
 test-suite ghc-api-tests
   type:             exitcode-stdio-1.0

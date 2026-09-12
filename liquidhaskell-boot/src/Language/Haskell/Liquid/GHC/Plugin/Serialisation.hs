@@ -3,32 +3,37 @@ module Language.Haskell.Liquid.GHC.Plugin.Serialisation (
       -- * Serialising and deserialising things from/to specs.
         serialiseLiquidLib
       , deserialiseLiquidLib
-      , deserialiseLiquidLibFromEPS
 
       ) where
 
 import qualified Data.Array                               as Array
-import           Data.Foldable                            ( asum )
-
-import           Control.Monad
-
 import qualified Data.Binary                             as B
 import qualified Data.Binary.Builder                     as Builder
 import qualified Data.Binary.Put                         as B
 import qualified Data.ByteString.Lazy                    as B
+import qualified Data.ByteString                         as Strict
 import           Data.Data (Data)
 import           Control.Exception
 import           Control.Exception.Backtrace
 import           Control.Exception.Context
 import           Data.Generics (ext0, gmapAccumT)
 import           Data.HashMap.Strict                     as M
-import           Data.Maybe                               ( listToMaybe )
+import           Data.Typeable                            ( typeOf )
 import           Data.Word                               (Word8)
 import           GHC.Stack (HasCallStack)
+import           GHC.Data.Maybe (MaybeErr (..))
+import           GHC.Iface.Load (findAndReadIface)
+import           GHC.Iface.Syntax (ifAnnotatedTarget)
+import           GHC.Unit.Module (getModuleInstantiation)
+import           GHC.Unit.Module.ModIface (ModIface)
+import qualified GHC.Unit.Home.Graph as HUG
+import           GHC.Driver.Env (hsc_HUG)
 
 import qualified Liquid.GHC.API as GHC
 import           Language.Haskell.Liquid.GHC.Plugin.Types (LiquidLib)
 import           Language.Haskell.Liquid.Types.Names
+import qualified Language.Haskell.Liquid.GHC.Plugin.AnnotationCodec as Codec
+import qualified Language.Haskell.Liquid.GHC.Plugin.AnnotationIdentity as Identity
 
 
 --
@@ -36,67 +41,84 @@ import           Language.Haskell.Liquid.Types.Names
 --
 
 getLiquidLibBytesFromEPS
-  :: GHC.Module
+  :: GHC.HscEnv
+  -> GHC.Module
   -> GHC.ExternalPackageState
-  -> Maybe LiquidLibBytes
-getLiquidLibBytesFromEPS thisModule eps = extractFromEps
-  where
-    extractFromEps :: Maybe LiquidLibBytes
-    extractFromEps = listToMaybe $ GHC.findAnns LiquidLibBytes (GHC.eps_ann_env eps) (GHC.ModuleTarget thisModule)
+  -> IO (Maybe LiquidLibBytes)
+getLiquidLibBytesFromEPS env thisModule eps =
+    case GHC.findAnns LiquidLibBytes (GHC.eps_ann_env eps) (GHC.ModuleTarget thisModule) of
+      [payload] -> pure (Just payload)
+      [] -> do
+        -- EPS deliberately discards raw annotations from its cached interfaces.
+        -- Audit a typed lookup miss against the checked on-disk interface so an
+        -- annotation from an obsolete compiler unit cannot masquerade as absent.
+        result <- findAndReadIface env (GHC.text "LiquidHaskell annotation identity")
+          (fst $ getModuleInstantiation thisModule) thisModule GHC.NotBoot
+        case result of
+          Succeeded (iface, _) -> getIfacePayload iface
+          Failed _ -> ioError $ userError $
+            "LiquidHaskell cannot audit annotations for "
+            ++ GHC.showSDocUnsafe (GHC.ppr thisModule)
+            ++ "; rebuild the dependency with the current compiler."
+      _ -> identityFailure Identity.DuplicateAnnotations
 
-getLiquidLibBytes :: GHC.Module
+getLiquidLibBytes :: GHC.HscEnv
+                        -> GHC.Module
                         -> GHC.ExternalPackageState
-                        -> GHC.HomePackageTable
                         -> IO (Maybe LiquidLibBytes)
-getLiquidLibBytes thisModule eps hpt = do
-    fromHpt <- extractFromHpt
-    pure $ asum [fromHpt, getLiquidLibBytesFromEPS thisModule eps]
+getLiquidLibBytes env thisModule eps = do
+    mb_modInfo <- HUG.lookupHugByModule thisModule (hsc_HUG env)
+    case mb_modInfo of
+      Just modInfo | thisModule == GHC.mi_module (GHC.hm_iface modInfo) ->
+        getIfacePayload (GHC.hm_iface modInfo)
+      _ -> getLiquidLibBytesFromEPS env thisModule eps
+
+getIfacePayload :: ModIface -> IO (Maybe LiquidLibBytes)
+getIfacePayload iface =
+    case Identity.selectAnnotationPayload (typeOf $ LiquidLibBytes []) payloads of
+      Left err -> identityFailure err
+      Right bytes -> pure (LiquidLibBytes <$> bytes)
   where
-    extractFromHpt :: IO (Maybe LiquidLibBytes)
-    extractFromHpt = do
-      mb_modInfo <- GHC.lookupHpt hpt (GHC.moduleName thisModule)
-      pure $ do
-          modInfo <- mb_modInfo
-          guard (thisModule == (GHC.mi_module . GHC.hm_iface $ modInfo))
-          xs <- mapM (GHC.fromSerialized LiquidLibBytes . GHC.ifAnnotatedValue) (GHC.mi_anns . GHC.hm_iface $ modInfo)
-          listToMaybe xs
+    payloads = [ GHC.ifAnnotatedValue annotation
+               | annotation <- GHC.mi_anns iface
+               , GHC.ModuleTarget _ <- [ifAnnotatedTarget annotation]
+               ]
+
+identityFailure :: Identity.AnnotationIdentityError -> IO a
+identityFailure = ioError . userError . Identity.annotationIdentityError
 
 newtype LiquidLibBytes = LiquidLibBytes { unLiquidLibBytes :: [Word8] }
 
--- | Serialise a 'LiquidLib', removing the termination checks from the target.
+-- | Serialise the complete 'LiquidLib' and its resolved-name table into a
+-- losslessly compressed annotation payload.
 serialiseLiquidLib :: LiquidLib -> GHC.Module -> IO GHC.Annotation
 serialiseLiquidLib lib thisModule = do
     bs <- encodeLiquidLib lib
+    -- Force the compact encoding before returning an annotation thunk. Otherwise
+    -- the boxed-byte payload can retain the whole transformed specification.
+    payload <- evaluate $ Codec.encodePayload (B.toStrict bs)
     return $ GHC.Annotation
       (GHC.ModuleTarget thisModule)
-      (GHC.toSerialized unLiquidLibBytes (LiquidLibBytes $ B.unpack bs))
+      (GHC.toSerialized unLiquidLibBytes (LiquidLibBytes $ Strict.unpack payload))
 
 deserialiseLiquidLib
-  :: GHC.Module
+  :: GHC.HscEnv
+  -> GHC.Module
   -> GHC.ExternalPackageState
-  -> GHC.HomePackageTable
   -> GHC.NameCache
   -> IO (Maybe LiquidLib)
-deserialiseLiquidLib thisModule eps hpt nameCache = do
-    mlibbs <- getLiquidLibBytes thisModule eps hpt
+deserialiseLiquidLib env thisModule eps nameCache = do
+    mlibbs <- getLiquidLibBytes env thisModule eps
     case mlibbs of
       Just (LiquidLibBytes ws) -> do
-        let bs = B.pack ws
+        bs <- decodePayload ws
         Just <$> decodeLiquidLib nameCache bs
       _ -> return Nothing
 
-deserialiseLiquidLibFromEPS
-  :: GHC.Module
-  -> GHC.ExternalPackageState
-  -> GHC.NameCache
-  -> IO (Maybe LiquidLib)
-deserialiseLiquidLibFromEPS thisModule eps nameCache = do
-    let mlibbs = getLiquidLibBytesFromEPS thisModule eps
-    case mlibbs of
-      Just (LiquidLibBytes ws) -> do
-        let bs = B.pack ws
-        Just <$> decodeLiquidLib nameCache bs
-      _ -> return Nothing
+decodePayload :: [Word8] -> IO B.ByteString
+decodePayload ws = case Codec.decodePayload (Strict.pack ws) of
+    Left message -> ioError (userError message)
+    Right bytes -> pure (B.fromStrict bytes)
 
 encodeLiquidLib :: LiquidLib -> IO B.ByteString
 encodeLiquidLib lib0 = rethrowWithCallStackIO $ do

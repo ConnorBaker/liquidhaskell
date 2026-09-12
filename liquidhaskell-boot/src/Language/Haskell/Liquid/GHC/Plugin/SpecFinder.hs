@@ -31,6 +31,11 @@ import           Language.Haskell.Liquid.GHC.Plugin.Types
 import           Language.Haskell.Liquid.UX.Config
 
 import           Liquid.GHC.API         as GHC
+import           GHC.Data.Maybe (MaybeErr (..))
+import           GHC.Driver.Env (hsc_HUG)
+import           GHC.Driver.Session (ghcMode, isOneShot)
+import qualified GHC.Unit.Home.Graph as HUG
+import           GHC.Unit.Module (getModuleInstantiation)
 
 import           Data.Bifunctor
 import qualified Data.Char
@@ -69,7 +74,7 @@ findRelevantSpecs lhAssmPkgExcludes hscEnv mods = do
     loadRelevantSpec :: ExternalPackageState -> Module -> TcM SpecFinderResult
     loadRelevantSpec eps currentModule = do
       res <- liftIO $ runMaybeT $
-        lookupInterfaceAnnotations eps (ue_hpt $ hsc_unit_env hscEnv) (hsc_NC hscEnv) currentModule
+        lookupInterfaceAnnotations hscEnv eps (hsc_NC hscEnv) currentModule
       case res of
         Nothing         -> do
           mAssm <- loadModuleLHAssumptionsIfAny currentModule
@@ -93,11 +98,24 @@ findRelevantSpecs lhAssmPkgExcludes hscEnv mods = do
           _       -> findPluginModule hscEnv assumptionsModName
       case res of
         Found _ assumptionsMod -> do
-          _ <- initIfaceTcRn $ loadInterface "liquidhaskell assumptions" assumptionsMod ImportBySystem
-          -- read the EPS again
-          eps2 <- liftIO $ readIORef (euc_eps $ ue_eps $ hsc_unit_env hscEnv)
-          -- now look up the assumptions
-          liftIO $ runMaybeT $ lookupInterfaceAnnotationsEPS eps2 (hsc_NC hscEnv) assumptionsMod
+          -- Mirror GHC.Iface.Load's HomeModError boundary before loading:
+          -- an optional future/self home module has no completed interface.
+          -- Calling loadInterface here would cache an empty failed interface
+          -- in the EPS, making subsequent discovery mistake it for a load.
+          homeInfo <- liftIO $ HUG.lookupHugByModule assumptionsMod (hsc_HUG hscEnv)
+          let installedMod = fst $ getModuleInstantiation assumptionsMod
+              unavailableHome =
+                HUG.memberHugUnitId (moduleUnit installedMod) (hsc_HUG hscEnv)
+                && not (isOneShot (ghcMode $ hsc_dflags hscEnv))
+                && isNothing homeInfo
+          if unavailableHome then pure Nothing else do
+            loaded <- initIfaceTcRn $ loadInterface "liquidhaskell assumptions" assumptionsMod ImportBySystem
+            case loaded of
+              Failed err -> failWithTc $ mkTcRnUnknownMessage $ mkPlainError [] $
+                missingInterfaceErrorDiagnostic (initIfaceMessageOpts $ hsc_dflags hscEnv) err
+              Succeeded _ -> do
+                eps2 <- liftIO $ readIORef (euc_eps $ ue_eps $ hsc_unit_env hscEnv)
+                liftIO $ runMaybeT $ lookupInterfaceAnnotations hscEnv eps2 (hsc_NC hscEnv) assumptionsMod
         FoundMultiple{} -> failWithTc $ mkTcRnUnknownMessage $ mkPlainError [] $
                              missingInterfaceErrorDiagnostic (initIfaceMessageOpts $ hsc_dflags hscEnv) $
                              cannotFindModule hscEnv assumptionsModName res
@@ -111,14 +129,9 @@ findRelevantSpecs lhAssmPkgExcludes hscEnv mods = do
       mkModuleNameFS $ moduleNameFS (moduleName m) <> "_LHAssumptions"
 
 -- | Load specs from an interface file.
-lookupInterfaceAnnotations :: ExternalPackageState -> HomePackageTable -> NameCache -> SpecFinder m
-lookupInterfaceAnnotations eps hpt nameCache thisModule = do
-  lib <- MaybeT $ Serialisation.deserialiseLiquidLib thisModule eps hpt nameCache
-  pure $ LibFound thisModule lib
-
-lookupInterfaceAnnotationsEPS :: ExternalPackageState -> NameCache -> SpecFinder m
-lookupInterfaceAnnotationsEPS eps nameCache thisModule = do
-  lib <- MaybeT $ Serialisation.deserialiseLiquidLibFromEPS thisModule eps nameCache
+lookupInterfaceAnnotations :: HscEnv -> ExternalPackageState -> NameCache -> SpecFinder m
+lookupInterfaceAnnotations env eps nameCache thisModule = do
+  lib <- MaybeT $ Serialisation.deserialiseLiquidLib env thisModule eps nameCache
   pure $ LibFound thisModule lib
 
 -- | Totality is a checking policy, not a property of importing Prelude.
@@ -139,10 +152,14 @@ findTotalitySpec env cfg
           policyModule <- liftIO $ lookupLiquidBaseModule env totalityModuleName
           case policyModule of
             Just mdl -> do
-              _ <- initIfaceTcRn $ loadInterface "liquidhaskell totality policy" mdl ImportBySystem
+              loaded <- initIfaceTcRn $ loadInterface "liquidhaskell totality policy" mdl ImportBySystem
+              case loaded of
+                Failed err -> failWithTc $ mkTcRnUnknownMessage $ mkPlainError [] $
+                  missingInterfaceErrorDiagnostic (initIfaceMessageOpts $ hsc_dflags env) err
+                Succeeded _ -> pure ()
               eps <- liftIO $ readIORef (euc_eps $ ue_eps $ hsc_unit_env env)
               spec <- liftIO $ runMaybeT $
-                lookupInterfaceAnnotationsEPS eps (hsc_NC env) mdl
+                lookupInterfaceAnnotations env eps (hsc_NC env) mdl
               case spec of
                 Just found -> pure [found]
                 Nothing -> missingPolicy
