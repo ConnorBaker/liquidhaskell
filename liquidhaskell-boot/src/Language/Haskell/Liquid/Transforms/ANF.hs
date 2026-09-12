@@ -36,8 +36,12 @@ import           Data.Hashable
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HM
 import GHC.Core.Type (ForAllTyBinder)
-import GHC.Core.TyCo.Rep (Coercion (..))
+import GHC.Core (varToCoreExpr)
+import GHC.Core.TyCo.Rep (Coercion (..), MCoercion)
 import qualified GHC.Core.Coercion as Co
+import qualified GHC.Core.Opt.Arity as Arity
+import qualified GHC.Core.Type as Type
+import qualified GHC.Core.Utils as Core
 
 --------------------------------------------------------------------------------
 -- | A-Normalize a module ------------------------------------------------------
@@ -212,6 +216,23 @@ normalize _ e@(Type _)
 normalize γ (Cast e co)
   | Just (first, second) <- splitCoercionComposition co
   = normalize γ (Cast (Cast e first) second)
+
+-- A function coercion converts its argument contravariantly and its result
+-- covariantly. Expose those value conversions to the ordinary checker without
+-- beta-reducing the original function or cancelling representation boundaries.
+normalize γ (Cast e co)
+  | Just (binders, arguments, resultCoercion) <- functionCoercionApplication e co
+  = let expand function = mkLams binders $
+          Core.mkCastMCo (mkApps function arguments) resultCoercion
+    in if Core.exprIsHNF e
+       then normalize γ (expand e)
+       else do
+         -- A cast preserves divergence of the function itself. Bare eta
+         -- expansion does not: bottom and (\x -> bottom x) differ under seq.
+         -- Force the original function before exposing its converted lambda.
+         function <- lift $ freshNormalVar γ (exprType e)
+         normalize γ $ Case e function (exprType (Cast e co))
+           [Alt DEFAULT [] (expand (Var function))]
 
 normalize γ (Cast e τ)
   = do e' <- normalizeName γ e
@@ -440,3 +461,20 @@ splitCoercionComposition (AppCo function argument)
       (first, second) <- splitCoercionComposition function
       pure (Co.mkAppCo first argument, Co.mkAppCo second argument)
 splitCoercionComposition _ = Nothing
+
+functionCoercionApplication :: CoreExpr -> Coercion -> Maybe ([CoreBndr], [CoreArg], MCoercion)
+functionCoercionApplication expression coercion
+  | Ghc.Pair source target <- Co.coercionKind coercion
+  , (_, sourceBody) <- Type.splitForAllTyCoVars source
+  , (targetBinders, targetBody) <- Type.splitForAllTyCoVars target
+  , Type.isFunTy sourceBody
+  , all isTyVar targetBinders
+  , Just (_, _, argumentType, _) <- Type.splitFunTy_maybe targetBody
+  , Type.typeHasFixedRuntimeRep argumentType
+  , let (binders, _) = Arity.etaExpandToJoinPoint
+                        (length targetBinders + 1) (Cast expression coercion)
+  , Just (arguments, resultCoercion) <-
+      Arity.pushCoArgs coercion (map varToCoreExpr binders)
+  = Just (binders, arguments, resultCoercion)
+  | otherwise
+  = Nothing

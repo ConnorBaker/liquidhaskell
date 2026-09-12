@@ -1116,6 +1116,11 @@ executable datacon-pos
                     , NewtypeCastEmbedded
                     , NewtypeCastPredicates
                     , NewtypeCastComposedRefined
+                    , NewtypeFunctionCastMap
+                    , NewtypeFunctionCastDomain
+                    , NewtypeFunctionCastResult
+                    , NewtypeFunctionCastTransport
+                    , NewtypeFunctionCastPolymorphic
                     , UnpackedFieldSubWord
                     , UnpackedFieldSubWordNewtype
                     , UnpackedFieldEmbeddedProduct
@@ -1178,6 +1183,10 @@ executable datacon-neg
                     , NewtypeCastPredicatesWrong
                     , NewtypeCastUnwrapWrong
                     , NewtypeCastComposedDomain
+                    , NewtypeFunctionCastDomainBad
+                    , NewtypeFunctionCastResultBad
+                    , NewtypeFunctionCastContentBad
+                    , NewtypeFunctionCastBottomBad
                     , CrossFieldReft
                     , CrossFieldReftMulti
                     , NestedCaseProjectionUnknown
