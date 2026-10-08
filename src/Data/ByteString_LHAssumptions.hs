@@ -369,7 +369,7 @@ assume Data.ByteString.copy
 assume Data.ByteString.hGet
     :: _
     -> n : { n : Int | 0 <= n }
-    -> (IO { bs : ByteString | bslen bs == n || bslen bs == 0 })
+    -> (IO { bs : ByteString | bslen bs <= n })
 
 assume Data.ByteString.hGetSome
     :: _

@@ -337,7 +337,7 @@ assume Data.ByteString.Lazy.copy
 assume Data.ByteString.Lazy.hGet
     :: _
     -> n : { n : Int | 0 <= n }
-    -> IO { bs : ByteString | bllen bs == n || bllen bs == 0 }
+    -> IO { bs : ByteString | bllen bs <= n }
 
 assume Data.ByteString.Lazy.hGetNonBlocking
     :: _
