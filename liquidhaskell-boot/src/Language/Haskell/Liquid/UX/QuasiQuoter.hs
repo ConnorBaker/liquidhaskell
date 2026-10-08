@@ -163,6 +163,11 @@ simplifyBareType'' ([], []) (RApp cc as _ _) =
          | otherwise = ConT $ lhNameToName (btc_tc cc)
   in  foldl' AppT c' <$> sequenceA (filterExprArgs $ simplifyBareType' <$> as)
 
+simplifyBareType'' ([], []) (RLit l) =
+  return $ LitT $ case l of
+    GHC.NumTyLit n -> NumTyLit n
+    GHC.StrTyLit s -> StrTyLit (GHC.unpackFS s)
+    GHC.CharTyLit c -> CharTyLit c
 simplifyBareType'' _ (RExprArg e) =
   FoundExprArg $ fSrcSpan e
 simplifyBareType'' _ (RHole _) =
@@ -234,4 +239,3 @@ textToExpQ text = Just $ varE 'T.pack `appE` stringE (T.unpack text)
 
 extQ :: (Typeable a, Typeable b) => (a -> q) -> (b -> q) -> a -> q
 extQ f g a = maybe (f a) g (cast a)
-

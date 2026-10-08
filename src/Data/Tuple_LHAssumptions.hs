@@ -1,12 +1,14 @@
-{-# OPTIONS_GHC -fplugin=LiquidHaskellBoot #-}
 {-# OPTIONS_GHC -Wno-unused-imports #-}
+{-# OPTIONS_GHC -fplugin=LiquidHaskellBoot #-}
+
 module Data.Tuple_LHAssumptions where
 
 import Data.Tuple
 
 {-@
 assume fst :: {f:(x:(a,b) -> {v:a | v = (fst x)}) | f == fst }
-assume snd :: {f:(x:(a,b) -> {v:b | v = (snd x)}) | f == snd }
+assume snd :: forall a b <p :: a -> b -> Bool>.
+  {f:(x:(a,b)<p> -> {v:b<p (fst x)> | v = (snd x)}) | f == snd }
 
 measure fst :: (a, b) -> a
   fst (a, b) = a

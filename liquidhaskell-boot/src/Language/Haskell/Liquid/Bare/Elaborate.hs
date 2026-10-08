@@ -1,7 +1,6 @@
 {-# LANGUAGE ViewPatterns              #-}
 {-# LANGUAGE ExplicitForAll            #-}
 {-# LANGUAGE TypeFamilies              #-}
-{-# LANGUAGE DeriveFunctor             #-}
 {-# LANGUAGE LambdaCase                #-}
 {-# LANGUAGE OverloadedStrings         #-}
 {-# LANGUAGE TemplateHaskellQuotes     #-}
@@ -14,14 +13,19 @@
 -- TODO: Genearlize to BareType and replace the existing resolution mechanisms
 
 module Language.Haskell.Liquid.Bare.Elaborate
-  ( fixExprToHsExpr
-  , elaborateSpecType
-  , elaborateSpecTypeWith
+  ( elaborateSpecTypeWithPrimitives
+  , kindCheckLogicalMeasure
+  , alignQueryTelescope
+  , freshenQueryTelescope
   -- , buildSimplifier
   )
 where
 
 import qualified Language.Fixpoint.Types       as F
+import qualified Language.Fixpoint.Types.Visitor as F
+import qualified Language.Fixpoint.SortCheck   as SC
+import qualified Language.Fixpoint.Types.Config as FC
+import           Language.Haskell.Liquid.WiredIn (wiredSortedSyms)
 -- import           Control.Arrow
 import           Liquid.GHC.API hiding (panic, varName)
 import qualified Language.Haskell.Liquid.GHC.Misc
@@ -30,16 +34,39 @@ import           Language.Haskell.Liquid.Types.Errors
 import           Language.Haskell.Liquid.Types.RType
 import           Language.Haskell.Liquid.Types.RTypeOp
 import           Language.Haskell.Liquid.Types.RefType
-                                                ( ofType )
+                                                ( ofType, strengthen, strengthenWith, subsTyVarMeet', subts, typeSort, uTop, updateRTVar )
+import qualified Language.Haskell.Liquid.Types.Types as T
+import qualified Language.Haskell.Liquid.Bare.Axiom as Axiom
+import qualified Language.Haskell.Liquid.Measure as Measure
+import Language.Haskell.Liquid.Types.Visitors (letVars)
 import qualified Data.List                     as L
 import qualified Data.HashMap.Strict           as M
 import qualified Data.HashSet                  as S
-import           Control.Monad.Free
+import qualified Data.Text as Text
+import qualified Control.Monad.State.Strict as State
+import Data.Generics (Data, everythingBut, extQ, mkQ)
 
-import           Data.Char                      ( isUpper )
-import           GHC.Types.Name.Occurrence
+import GHC.Builtin.Types (charTy, integerTy, runtimeRepTy)
+import GHC.Hs (HsMatchContext (CaseAlt), HsExpr (HsLet), HsLocalBindsLR (HsValBinds), HsValBindsLR (ValBinds), mkSimpleGeneratedFunBind, mkSimpleMatch, nlConPat, nlHsCase, nlWildPat)
+import qualified GHC.Hs as Hs
+import qualified GHC.Tc.Gen.HsType as TcHs
+import GHC.Tc.Types.Origin (ReportRedundantConstraints (NoRRC))
+import GHC.Types.Name (mkExternalName)
+import GHC.Types.Name.Occurrence
+import GHC.Types.Name.Reader (rdrNameOcc)
+import GHC.Core.Type (mkAppTy, mkInvisFunTy, mkSpecForAllTy, mkTYPEapp, mkVisFunTyMany, typeKind)
+import GHC.Core.Predicate (isCoVarType)
+import qualified GHC.Tc.Utils.TcType as TcType
+import GHC.Core.TyCon (Role (Nominal), isVisibleTyConBinder, isInferredTyConBinder, mkAnonTyConBinder)
+import GHC.Core.SimpleOpt (SimpleOpts (so_eta_red), defaultSimpleOpts, simpleOptExprNoInline)
+import GHC.Unit.Module (getModule)
 import qualified Liquid.GHC.API as Ghc
 import qualified Data.Maybe                    as Mb
+import qualified GHC.Tc.Utils.Env as TcEnv
+import qualified GHC.Rename.Utils as RnUtils
+import GHC.Tc.Utils.Monad (getSrcSpanM, tryTc)
+import qualified Text.PrettyPrint.HughesPJ as PJ
+import Text.Read (readMaybe)
 
 -- TODO: make elaboration monadic so typeclass names are unified to something
 -- that is generated in advance. This can greatly simplify the implementation
@@ -115,123 +142,6 @@ import qualified Data.Maybe                    as Mb
  --  e'        = substExprAll O.empty dictSubst e
 
 
--- | Base functor of RType
-data RTypeF c tv r f
-  = RVarF {
-      _rtf_var   :: !tv
-    , _rtf_reft   :: !r
-    }
-
-  | RFunF  {
-      _rtf_bind   :: !F.Symbol
-    , _rtf_rinfo  :: !RFInfo
-    , _rtf_in     :: !f
-    , _rtf_out    :: !f
-    , _rtf_reft   :: !r
-    }
-  | RAllTF {
-      _rtf_tvbind :: !(RTVU c tv) -- RTVar tv (RType c tv ()))
-    , _rtf_ty     :: !f
-    , _rtf_ref    :: !r
-    }
-
-  -- | "forall x y <z :: Nat, w :: Int> . TYPE"
-  --               ^^^^^^^^^^^^^^^^^^^ (rtf_pvbind)
-  | RAllPF {
-      _rtf_pvbind :: !(PVU c tv)  -- ar (RType c tv ()))
-    , _rtf_ty     :: !f
-    }
-
-  -- | For example, in [a]<{\h -> v > h}>, we apply (via `RApp`)
-  --   * the `RProp`  denoted by `{\h -> v > h}` to
-  --   * the `RTyCon` denoted by `[]`.
-  | RAppF  {
-      _rtf_tycon  :: !c
-    , _rtf_args   :: ![f]
-    , _rtf_pargs  :: ![RTPropF c tv f]
-    , _rtf_reft   :: !r
-    }
-
-  | RExF {
-      _rtf_bind   :: !F.Symbol
-    , _rtf_exarg  :: !f
-    , _rtf_ty     :: !f
-    }
-
-  | RExprArgF (F.Located F.Expr)
-
-  | RAppTyF{
-      _rtf_arg   :: !f
-    , _rtf_res   :: !f
-    , _rtf_reft  :: !r
-    }
-
-  | RRTyF  {
-      _rtf_env   :: ![(F.Symbol, f)]
-    , _rtf_ref   :: !r
-    , _rtf_obl   :: !Oblig
-    , _rtf_ty    :: !f
-    }
-
-  | RHoleF r
-  deriving (Functor)
-
--- It's probably ok to treat (RType c tv ()) as a leaf..
-type RTPropF c tv f = Ref (RType c tv NoReft) f
-
-
--- | SpecType with Holes.
---   It provides us a context to construct the ghc queries.
---   I don't think we can reuse RHole since it is not intended
---   for this use case
-
-type SpecTypeF = RTypeF RTyCon RTyVar RReft
-type PartialSpecType = Free SpecTypeF ()
-
-project :: SpecType -> SpecTypeF SpecType
-project (RVar var reft            ) = RVarF var reft
-project (RFun bind i tin tout reft) = RFunF  bind i tin tout reft
-project (RAllT tvbind ty ref      ) = RAllTF tvbind ty ref
-project (RAllP pvbind ty          ) = RAllPF pvbind ty
-project (RApp c args pargs reft   ) = RAppF c args pargs reft
-project (REx   bind exarg  ty     ) = RExF bind exarg ty
-project (RExprArg e               ) = RExprArgF e
-project (RAppTy arg res reft      ) = RAppTyF arg res reft
-project (RRTy env ref obl ty      ) = RRTyF env ref obl ty
-project (RHole r                  ) = RHoleF r
-
-embed :: SpecTypeF SpecType -> SpecType
-embed (RVarF var reft            ) = RVar var reft
-embed (RFunF bind i tin tout reft) = RFun bind  i tin tout reft
-embed (RAllTF tvbind ty ref      ) = RAllT tvbind ty ref
-embed (RAllPF pvbind ty          ) = RAllP pvbind ty
-embed (RAppF c args pargs reft   ) = RApp c args pargs reft
-embed (RExF   bind exarg  ty     ) = REx bind exarg ty
-embed (RExprArgF e               ) = RExprArg e
-embed (RAppTyF arg res reft      ) = RAppTy arg res reft
-embed (RRTyF env ref obl ty      ) = RRTy env ref obl ty
-embed (RHoleF r                  ) = RHole r
-
-
--- specTypeToLHsType :: SpecType -> LHsType GhcPs
--- specTypeToLHsType = typeToLHsType . toType
-
--- -- Given types like x:a -> y:a -> _, this function returns x:a -> y:a -> Bool
--- -- Free monad takes care of substitution
-
--- A one-way function. Kind of like injecting something into Maybe
-specTypeToPartial :: forall a . SpecType -> SpecTypeF (Free SpecTypeF a)
-specTypeToPartial = cata (fmap wrap)
-  where
-    cata g = g . fmap (cata g) . project
-
-plugType :: SpecType -> PartialSpecType -> SpecType
-plugType t = ana $ \case
-    Pure _   -> specTypeToPartial t
-    Free res -> res
-  where
-    ana g = embed . fmap (ana g) . g
-
 -- build the expression we send to ghc for elaboration
 -- YL: tweak this function to see if ghc accepts explicit dictionary binders
 -- returning both expressions and binders since ghc adds unique id to the expressions
@@ -246,9 +156,8 @@ collectSpecTypeBinders = \case
   RAllT (RTVar (RTV ab) _) t _ ->
     let (bs, abs') = collectSpecTypeBinders t
      in (bs, F.symbol ab : abs')
-  REx b _ t ->
-    let (bs, abs') = collectSpecTypeBinders t
-     in (b : bs, abs')
+  RAllP _ t -> collectSpecTypeBinders t
+  REx _ _ t -> collectSpecTypeBinders t
   RAppTy _ t _ -> collectSpecTypeBinders t
   RRTy _ _ _ t -> collectSpecTypeBinders t
   _ -> ([], [])
@@ -256,432 +165,968 @@ collectSpecTypeBinders = \case
 -- really should be fused with collectBinders. However, we need the binders
 -- to correctly convert fixpoint expressions to ghc expressions because of
 -- namespace related issues (whether the symbol denotes a varName or a datacon)
-buildHsExpr :: LHsExpr GhcPs -> SpecType -> LHsExpr GhcPs
-buildHsExpr result = go
+-- Query locals are fresh exact Names, not qualified source names. References
+-- use the innermost owner of each logical label; the caller restores original
+-- logical binders after elaboration, independently of these temporary names.
+buildHsExpr :: (M.HashMap F.Symbol RdrName -> LHsExpr GhcPs) -> SpecType -> TcRn (LHsExpr GhcPs)
+buildHsExpr result = go M.empty
   where
-    go = \case
+    go bound = \case
       RFun bind _ tin tout _
-        | isClassType tin -> go tout
-        | otherwise       -> mkHsLam (noLocA [nlVarPat (varSymbolToRdrName bind)]) (go tout)
-      RAllT _ t _ -> go t
-      REx _ _ t -> go t
-      RAppTy _ t _ -> go t
-      RRTy _ _ _ t -> go t
-      _ -> result
+        | isClassType tin -> go bound tout
+        | otherwise -> do
+            unique <- getUniqueM
+            let name = nameRdrName (mkInternalName unique (mkVarOcc "lh_query") noSrcSpan)
+            body <- go (M.insert bind name bound) tout
+            pure (mkHsLam (noLocA [nlVarPat name]) body)
+      RAllT _ t _ -> go bound t
+      RAllP _ t -> go bound t
+      REx _ _ t -> go bound t
+      RAppTy _ t _ -> go bound t
+      RRTy _ _ _ t -> go bound t
+      _ -> pure (result bound)
 
 
-canonicalizeDictBinder
-  :: (F.Subable a, F.PPrint (F.Variable a), Ord (F.Variable a)) => [F.Variable a] -> (a, [F.Variable a]) -> (a, [F.Variable a])
-canonicalizeDictBinder [] (e', bs') = (e', bs')
-canonicalizeDictBinder bs (e', [] ) = (e', bs)
-canonicalizeDictBinder bs (e', bs') = (renameDictBinder bs bs' e', bs)
- where
-  renameDictBinder :: (F.Subable a, F.PPrint (F.Variable a), Ord (F.Variable a)) => [F.Variable a] -> [F.Variable a] -> a -> a
-  renameDictBinder []          _  = id
-  renameDictBinder _           [] = id
-  renameDictBinder canonicalDs ds = F.substa $ \x -> M.lookupDefault x x tbl
-    where tbl = F.notracepp "TBL" $ M.fromList (zip ds canonicalDs)
+-- Sort annotations inhabit the type namespace, not the term telescope.
+-- Keep every source binder and occurrence (including predicate defaults),
+-- without evaluating the declaration capabilities stored inside a sort.
+querySourceSymbols :: (Data a) => a -> S.HashSet F.Symbol
+querySourceSymbols = everythingBut S.union (mkQ (S.empty, False) symbol `extQ` sort)
+  where
+    symbol name = (S.singleton name, True)
+    sort :: F.Sort -> (S.HashSet F.Symbol, Bool)
+    sort _ = (S.empty, True)
 
-elaborateSpecType
-  :: (CoreExpr -> F.Expr)
-  -> (CoreExpr -> TcRn CoreExpr)
-  -> SpecType
-  -> TcRn SpecType
-elaborateSpecType coreToLogic simplifier t = GM.withWiredIn $ do
-  elaborateSpecTypeWith (\_ _ -> pure ()) coreToLogic simplifier t
+-- Give every query parameter a distinct lexical coordinate. An arrow's
+-- domain sees the enclosing owners; its result sees its own owner instead.
+-- Anonymous markers own no occurrences, while explicit collisions require
+-- capture-avoiding substitution in precisely their lexical scope.
+freshenQueryTelescope :: Bool -> [F.Symbol] -> SpecType -> SpecType
+freshenQueryTelescope bindSelf reserved original = State.evalState (go M.empty original) occupied
+  where
+    occupied = S.fromList reserved `S.union` querySourceSymbols original
+    substitute owners = F.subst (F.mkSubst [(name, meaning) | (name, meaning) <- M.toList owners, meaning /= F.EVar name])
+    substituteRef owners (MkUReft (F.Reft (value, predicate)) abstract) =
+        let local = M.delete value owners
+         in MkUReft (F.Reft (value, substitute local predicate)) (substitute local abstract)
+    bind name owner = M.insert name (F.EVar owner)
+    freshOwner owners name
+        | name == "" || F.isDummy name || M.member name owners =
+            State.state (\names -> let (names', fresh) = F.freshInNS "lh_query_owner" names in (fresh, names'))
+        | otherwise = pure name
+    extend owners name name'
+        | name == "" || F.isDummy name = owners
+        | otherwise = bind name name' owners
+    go :: M.HashMap F.Symbol F.Expr -> SpecType -> State.State (S.HashSet F.Symbol) SpecType
+    go owners (RFun name info domain result reft) = do
+        domain' <- go owners domain
+        name' <- freshOwner owners name
+        let resultOwners = extend owners name name'
+        RFun name' info domain' <$> go resultOwners result <*> pure (substituteRef owners reft)
+    go owners (RAllT variable rest reft) = do
+        (variable', bodyOwners) <- case ty_var_info variable of
+            RTVNoInfo{} -> pure (variable, owners)
+            info@RTVInfo{rtv_name = name, rtv_kind = kind} -> do
+                name' <- case rTVarToBind variable of
+                    Just _ -> freshOwner owners name
+                    Nothing -> pure name
+                let variable' = variable{ty_var_info = info{rtv_name = name', rtv_kind = substitute owners kind}}
+                    bodyOwners = case rTVarToBind variable of
+                        Just _ -> extend owners name name'
+                        Nothing -> owners
+                pure (variable', bodyOwners)
+        RAllT variable' <$> go bodyOwners rest <*> pure (substituteRef owners reft)
+    go owners (RAllP predicate rest) = do
+        let (resultOwners, arguments) =
+                L.mapAccumL
+                    ( \scope (domain, name, actual) ->
+                        let scope' = M.delete name scope
+                         in (scope', (substitute scope domain, name, substitute scope' actual))
+                    )
+                    owners
+                    (pargs predicate)
+            predicate' = predicate{ptype = substitute resultOwners (ptype predicate), pargs = arguments}
+        RAllP predicate' <$> go owners rest
+    go owners (RApp constructor arguments predicates reft@(MkUReft (F.Reft (value, _)) _)) =
+        let argumentOwners = if bindSelf then M.delete value owners else owners
+         in RApp constructor <$> traverse (go argumentOwners) arguments <*> traverse (property owners) predicates <*> pure (substituteRef owners reft)
+    go owners (RAppTy function argument reft) = RAppTy <$> go owners function <*> go owners argument <*> pure (substituteRef owners reft)
+    go owners (REx name witness rest) = do
+        witness' <- go owners witness
+        name' <- freshOwner owners name
+        REx name' witness' <$> go (extend owners name name') rest
+    go owners (RRTy environment reft obligation rest) = do
+        (environment', localOwners) <- context (obligation == OCons) owners environment
+        let reftOwners = if obligation == OCons then owners else localOwners
+        RRTy environment' (substituteRef reftOwners reft) obligation <$> go owners rest
+    go owners (RVar variable reft) = pure (RVar variable (substituteRef owners reft))
+    go owners (RHole reft) = pure (RHole (substituteRef owners reft))
+    go owners ty = pure (substitute owners ty)
+    property owners (RProp formals body) = do
+        (formals', local) <- formalOwners owners formals
+        RProp formals' <$> go local body
+    formalOwners owners [] = pure ([], owners)
+    formalOwners owners ((name, domain) : rest) = do
+        name' <- freshOwner owners name
+        (rest', local) <- formalOwners (extend owners name name') rest
+        pure ((name', substitute owners domain) : rest', local)
+    context _ owners [] = pure ([], owners)
+    context True owners [(left, lhs), (right, rhs)] =
+        (\lhs' rhs' -> ([(left, lhs'), (right, rhs')], owners)) <$> go owners lhs <*> go owners rhs
+    context endpoints owners ((name, domain) : rest) = do
+        domain' <- go owners domain
+        name' <- freshOwner owners name
+        (rest', localOwners) <- context endpoints (extend owners name name') rest
+        pure ((name', domain') : rest', localOwners)
 
--- | Elaborate a specification to make type class dictionaries explicit,
--- and expose the Core expression generated for every non-trivial
--- refinement together with its refined checking type.
---
--- @elaborateSpecTypeWith collect coreToLogic simplify (x0:t0 -> ... -> v:tn)@ calls
--- @collect et (\<env> -> ti')@ for each @i@, where @ti'@ is @ti@ with the
--- refinement predicate replaced by @true@, @et@ is the elaborated Core
--- expression of @\<env> -> ti@, and @env@ are the local bindings @xi@, @v@ in
--- scope.
-elaborateSpecTypeWith
-  :: (CoreExpr -> SpecType -> TcRn ())
-  -> (CoreExpr -> F.Expr)
-  -> (CoreExpr -> TcRn CoreExpr)
-  -> SpecType
-  -> TcRn SpecType
-elaborateSpecTypeWith collect coreToLogic simplifier t = GM.withWiredIn $ do
-  (t', xs) <- elaborateSpecType' collect (pure ()) coreToLogic simplifier t
-  case xs of
-    _ : _ -> panic
-      Nothing
-      "elaborateSpecType: invariant broken. substitution list for dictionary is not completely consumed"
-    _ -> pure t'
+-- Interpret exactly the lambda telescope GHC checked. Type substitution is
+-- scoped and nominal: equal logical sorts never identify different carriers.
+-- Logical predicate quantifiers introduce no GHC lambda. Dictionaries are
+-- paired by their checked types, independently of their printed names.
+alignQueryTelescope :: SpecType -> CoreExpr -> Either String ([(Id, F.Expr)], [(F.Symbol, F.Sort)])
+alignQueryTelescope = go [] [] [] []
+  where
+    go sourceTypes actualTypes terms sorts signature (Tick _ expression) =
+        go sourceTypes actualTypes terms sorts signature expression
+    -- A nonrecursive let introduces no type or source-arrow parameter. Look
+    -- through its body only for telescope metadata; the caller retains the
+    -- whole checked Core, including this binding, for checking and readback.
+    go sourceTypes actualTypes terms sorts signature (Let (NonRec _ _) expression) =
+        go sourceTypes actualTypes terms sorts signature expression
+    go sourceTypes actualTypes terms sorts (RAllP _ rest) expression =
+        go sourceTypes actualTypes terms sorts rest expression
+    go sourceTypes actualTypes terms sorts (RAllT (ty_var_value -> RTV source) rest _) (Lam actual expression)
+        | isTyVar source && isTyVar actual
+        , eqType (substTyWith sourceTypes actualTypes (tyVarKind source)) (tyVarKind actual) =
+            go (sourceTypes ++ [source]) (actualTypes ++ [mkTyVarTy actual]) terms
+                (sorts ++ [(F.symbol actual, F.FObj (F.symbol source))]) rest expression
+    go _ _ terms _ (RFun name _ domain _ _) _
+        | isClassType domain
+        , any (\(actual, meaning) -> isDictId actual && meaning == F.EVar name) terms =
+            Left "Distinct query dictionaries share an explicit source owner"
+    go sourceTypes actualTypes terms sorts (RFun name _ domain rest _) (Lam actual expression)
+        | let expected = substTyWith sourceTypes actualTypes (specTypeToQueryType domain)
+        , isId actual
+        , isCoVar actual == isCoVarType expected
+        , eqType expected (varType actual) =
+            go sourceTypes actualTypes
+                (if isCoVar actual then terms else terms ++ [(actual, F.EVar name)]) sorts rest expression
+    go sourceTypes actualTypes terms sorts result expression
+        | not (hasBinder result)
+        , eqType (substTyWith sourceTypes actualTypes (specTypeToQueryType result)) (exprType expression) =
+            Right (terms, sorts)
+    go sourceTypes actualTypes _ _ signature expression =
+        Left $ "GHC predicate elaboration changed its typed source telescope\nExpected remaining type: "
+            ++ showPprQualified (substTyWith sourceTypes actualTypes (specTypeToQueryType signature))
+            ++ "\nActual remaining type: " ++ showPprQualified (exprType expression)
+            ++ "\nActual remaining Core: " ++ showPprQualified expression
+    hasBinder RAllT{} = True
+    hasBinder RAllP{} = True
+    hasBinder RFun{} = True
+    hasBinder _ = False
+
+-- The same typed query supplies checking obligations and logical readback.
+-- Generated values have explicit denotations, while source values and their
+-- dictionaries are interpreted from the Core produced by GHC.
+elaborateSpecTypeWithPrimitives ::
+    Bool ->
+    FC.ElabFlags ->
+    Maybe F.SymEnv ->
+    F.TCEmb TyCon ->
+    [(F.Symbol, T.MeasureKind, SpecType)] ->
+    [(F.Symbol, [(DataCon, Int)])] ->
+    [(F.Symbol, TyCon, SpecType)] ->
+    [(F.Symbol, Id)] ->
+    [Var] ->
+    (F.TCEmb TyCon -> CoreExpr -> SpecType -> T.LogicSupport -> TcRn ()) ->
+    (F.TCEmb TyCon -> [(Id, F.Expr)] -> CoreExpr -> (F.Expr, T.LogicSupport)) ->
+    SpecType ->
+    TcRn SpecType
+elaborateSpecTypeWithPrimitives bindSelf flags native embeddings measures projections instances sources captures collect interpret ty =
+    RnUtils.bindLocalNames (map getName (reverse captures)) $
+        TcEnv.tcExtendTyVarEnv (filter isTyVar captures) $
+            TcEnv.tcExtendIdEnv (filter isId captures) $ do
+                location <- getSrcSpanM
+                let declarations =
+                        F.fromListSEnv $
+                            wiredSortedSyms
+                                ++ [(name, typeSort embeddings (logicalDeclarationType kind ty)) | (name, kind, ty) <- measures]
+                                ++ [(name, typeSort embeddings (sourceRho (idType identifier))) | (name, identifier) <- sources]
+                    sourceRho sourceType =
+                        let (variables, _, rho) = TcType.tcSplitSigmaTy sourceType
+                         in foldr mkSpecForAllTy rho variables
+                    logicalDeclarationType T.MsReflect = sourceRho . specTypeToQueryType
+                    logicalDeclarationType _ = specTypeToQueryType
+                    query signature expression = do
+                        (core, checkedType, logicalEmbeddings, definitions) <- primitiveQuery flags native location embeddings measures projections instances sources declarations signature expression
+                        (owners, sorts) <- case alignQueryTelescope checkedType core of
+                            Left message -> uError (ErrTySpec location (Just "refinement formation") "refinement" (F.pprint signature) (PJ.text message))
+                            Right alignment -> pure alignment
+                        let (meaning, support) = interpret logicalEmbeddings (definitions ++ owners) core
+                            expression' = F.sortSubstInExpr (F.mkSortSubst sorts) meaning
+                        collect logicalEmbeddings core checkedType
+                            (T.retainLogicSupport (F.syms expression') [(identifier, F.sortSubst (F.mkSortSubst sorts) sort) | (identifier, sort) <- support])
+                        pure expression'
+                let reserved = map fst wiredSortedSyms ++ [name | (name, _, _) <- measures] ++ map fst projections ++ [name | (name, _, _) <- instances] ++ map fst sources ++ map F.symbol captures ++ maybe [] (map fst . F.toListSEnv . F.seSort) native
+                    named = freshenQueryTelescope bindSelf reserved ty
+                elaborateSpecType' query id named
+
+freshenLogicalType :: SpecType -> TcRn SpecType
+-- Logical declarations distinguish synthetic variables by occurrence as
+-- well as Unique. GHC uses only Unique, so alpha-rename the telescope before
+-- interpreting it as a GHC type. Existing substitution retains refinements.
+freshenLogicalType (RAllT variable@(ty_var_value -> old@(RTV tv)) rest reft) = do
+    unique <- getUniqueM
+    let new = RTV (setVarUnique tv unique)
+    rest' <- freshenLogicalType (subsTyVarMeet' (old, RVar new mempty) rest)
+    pure (RAllT variable{ty_var_value = new} rest' (subts [(old, RVar new mempty :: RSort)] reft))
+freshenLogicalType ty = pure ty
+
+-- Logical declarations have no source Id whose type can supply inferred kinds.
+-- Ask GHC once for the whole declaration, before deriving checking or export
+-- views. Imported declarations have complete type arguments, not source syntax.
+kindCheckLogicalMeasure :: Bool -> T.Measure SpecType ctor -> TcRn (T.Measure SpecType ctor)
+kindCheckLogicalMeasure complete declaration
+    | T.msKind declaration `elem` [T.MsSelector, T.MsChecker, T.MsLifted, T.MsReflect] = pure declaration
+    | otherwise = do
+        (checked, substitution) <- kindCheckLogicalType complete (T.msSort declaration)
+        let renamed = T.mapMeasureTy (\ty -> foldl (flip subsTyVarMeet') ty substitution) declaration
+            sorts = M.fromList [(F.symbol old, typeSort mempty (specTypeToQueryType replacement)) | (old, replacement) <- substitution]
+            expression = F.applyCoSub sorts
+            body (T.E e) = T.E (expression e)
+            body (T.P e) = T.P (expression e)
+            body (T.R x e) = T.R x (expression e)
+        pure
+            renamed
+                { T.msSort = checked
+                , T.msEqns = [equation{T.body = body (T.body equation)} | equation <- T.msEqns renamed]
+                , T.msUnSorted = [(scope, expression e) | (scope, e) <- T.msUnSorted renamed]
+                }
+
+kindCheckLogicalType :: Bool -> SpecType -> TcRn (SpecType, [(RTyVar, SpecType)])
+kindCheckLogicalType complete original = do
+    location <- getSrcSpanM
+    ty <- freshenLogicalType original
+    inferred <-
+        TcHs.tcHsSigType (TcHs.ExprSigCtxt NoRRC) $
+            noLocA (Hs.HsSig noExtField (Hs.HsOuterImplicit []) (syntaxType ty))
+    let inferredBinders = map fst (ty_vars (toRTypeRep (ofType inferred :: SpecType)))
+        variables = map (toTyVar . ty_var_value) inferredBinders
+        representation = toRTypeRep ty
+        declared = ty_vars representation
+        matching (variable, _) =
+            case [v | v <- variables, getName v == getName (toTyVar (ty_var_value variable))] of
+                [v] -> (ty_var_value variable, RTV v)
+                _ -> panic Nothing "Logical kind checking changed a declared type-variable owner"
+        substitution = map matching declared
+        authoredBody =
+            foldl
+                (\t (old, new) -> subsTyVarMeet' (old, RVar new mempty) t)
+                (fromRTypeRep representation{ty_vars = []})
+                substitution
+        inferredBody = fromRTypeRep (toRTypeRep (ofType inferred :: SpecType)){ty_vars = []}
+        body = Mb.fromMaybe authoredBody (alignArguments inferredBody authoredBody)
+        root variable =
+            Mb.fromMaybe mempty $
+                lookup
+                    (getName variable)
+                    [ (getName (toTyVar (ty_var_value v)), subts [(old, RVar new mempty :: RSort) | (old, new) <- substitution] reft)
+                    | (v, reft) <- declared
+                    ]
+        binder variable = case [v | (v, _) <- declared, getName (toTyVar (ty_var_value v)) == getName (toTyVar (ty_var_value variable))] of
+            [v] ->
+                let updated =
+                        updateRTVar
+                            ((subts [(old, RVar new mempty :: RSort) | (old, new) <- substitution] v){ty_var_value = ty_var_value variable})
+                 in updated{ty_var_info = (ty_var_info updated){rtv_is_pol = rtv_is_pol (ty_var_info v)}}
+            _ -> variable
+        result = foldr (\variable rest -> RAllT (binder variable) rest (root (toTyVar (ty_var_value variable)))) body inferredBinders
+        transport =
+            [ (ty_var_value old, RVar new mempty)
+            | ((old, _), (fresh, _)) <- zip (ty_vars (toRTypeRep original)) declared
+            , Just new <- [lookup (ty_var_value fresh) substitution]
+            ]
+    if toRSort result == toRSort (ofType inferred :: SpecType) && eqType (specTypeToQueryType result) inferred
+        then pure (result, transport)
+        else
+            uError
+                ( ErrTySpec
+                    location
+                    (Just "logical declaration")
+                    "refinement"
+                    (F.pprint original)
+                    (PJ.text "logical declaration requires implicit type arguments or nested kinds not present in its refinement type")
+                )
+  where
+    toTyVar (RTV variable) = variable
+    -- Authored applications contain visible arguments. Insert only the kind
+    -- arguments GHC inferred at invisible binders, retaining every authored
+    -- refinement and checking the completed type against GHC below.
+    alignArguments (RFun _ _ domain result _) (RFun x info domain' result' reft) =
+        RFun x info <$> alignArguments domain domain' <*> alignArguments result result' <*> pure reft
+    alignArguments (RApp c arguments _ _) (RApp c' arguments' predicates reft)
+        | c == c'
+        , complete =
+            if length arguments == length arguments'
+                then (\xs -> RApp c' xs predicates reft) <$> sequence (zipWith alignArguments arguments arguments')
+                else Nothing
+        | c == c' = (\xs -> RApp c' xs predicates reft) <$> align (tyConBinders (rtc_tc c)) arguments arguments'
+      where
+        align _ [] [] = Just []
+        align (binder : binders) (t : ts) us
+            | not (isVisibleTyConBinder binder) = (t :) <$> align binders ts us
+        align (_ : binders) (t : ts) (u : us) = (:) <$> alignArguments t u <*> align binders ts us
+        align [] (t : ts) (u : us) = (:) <$> alignArguments t u <*> align [] ts us
+        align _ _ _ = Nothing
+    alignArguments (RAppTy function argument _) (RAppTy function' argument' reft) =
+        RAppTy <$> alignArguments function function' <*> alignArguments argument argument' <*> pure reft
+    alignArguments inferred (RAllP predicate authored) = RAllP predicate <$> alignArguments inferred authored
+    alignArguments inferred authored
+        | toRSort inferred == toRSort authored = Just authored
+        | otherwise = Nothing
+    syntaxType :: RType RTyCon RTyVar r -> LHsType GhcRn
+    syntaxType (RVar (RTV variable) _) = Hs.nlHsTyVar NotPromoted (getName variable)
+    syntaxType (RAllT variable rest _) =
+        noLocA $
+            Hs.HsForAllTy
+                noExtField
+                ( Hs.mkHsForAllInvisTele
+                    noAnn
+                    [ noLocA
+                        (Hs.HsTvb noAnn Ghc.SpecifiedSpec (Hs.HsBndrVar noExtField (noLocA (getName (toTyVar (ty_var_value variable))))) kind)
+                    ]
+                )
+                (syntaxType rest)
+      where
+        kind = case ty_var_info variable of
+            RTVNoInfo{} -> Hs.HsBndrNoKind noExtField
+            RTVInfo{rtv_kind = k} -> Hs.HsBndrKind noExtField (syntaxType k)
+    syntaxType (RFun _ _ domain rest _)
+        | isClassType domain = noLocA (Hs.HsQualTy noExtField (noLocA [syntaxType domain]) (syntaxType rest))
+        | otherwise = Hs.nlHsFunTy (syntaxType domain) (syntaxType rest)
+    syntaxType (RApp RTyCon{rtc_tc = tc} arguments _ _) =
+        foldl apply (Hs.nlHsTyVar NotPromoted (getName tc)) $
+            zip (map Just (tyConBinders tc) ++ repeat Nothing) (filter notExprArg arguments)
+      where
+        apply function (Just binder, _) | complete && isInferredTyConBinder binder = function
+        apply function (Just binder, argument)
+            | complete && not (isVisibleTyConBinder binder) = noLocA (Hs.HsAppKindTy noExtField function (syntaxType argument))
+        apply function (_, argument)
+            | otherwise = Hs.nlHsAppTy function (syntaxType argument)
+    syntaxType (RAppTy function argument _) = Hs.nlHsAppTy (syntaxType function) (syntaxType argument)
+    syntaxType (RLit literal) = noLocA $ Hs.HsTyLit noExtField $ case literal of
+        NumTyLit n -> Hs.HsNumTy NoSourceText n
+        StrTyLit s -> Hs.HsStrTy NoSourceText s
+        CharTyLit c -> Hs.HsCharTy NoSourceText c
+    syntaxType (RAllP _ rest) = syntaxType rest
+    syntaxType (REx _ _ rest) = syntaxType rest
+    syntaxType (RRTy _ _ _ rest) = syntaxType rest
+    syntaxType _ = panic Nothing "Unresolved logical declaration in kind checking"
+
+-- These parameters interpret the logical language, not source class methods.
+-- Their result contracts preserve each original operator. They are local to
+-- the generated query and are never published as source assumptions.
+primitiveQuery ::
+    FC.ElabFlags ->
+    Maybe F.SymEnv ->
+    SrcSpan ->
+    F.TCEmb TyCon ->
+    [(F.Symbol, T.MeasureKind, SpecType)] ->
+    [(F.Symbol, [(DataCon, Int)])] ->
+    [(F.Symbol, TyCon, SpecType)] ->
+    [(F.Symbol, Id)] ->
+    F.SEnv F.Sort ->
+    SpecType ->
+    F.Expr ->
+    TcRn (CoreExpr, SpecType, F.TCEmb TyCon, [(Id, F.Expr)])
+primitiveQuery flags native location embeddings measures projections instances sources declarations signature original = do
+    (expression, (parameters, logicalEmbeddings, projectors)) <- State.runStateT (lower contextual) ([], mempty, [])
+    (core, checkedType) <- elaborate parameters projectors expression
+    -- GHC checks the complete telescope. Its exposed lambda prefix is still
+    -- needed to attach meanings to the actual Core binders.
+    let actualParameters = take (length parameters) [identifier | identifier <- fst (collectBinders core), isId identifier]
+        parameterDefinitions = zip actualParameters [meaning | (_, _, meaning) <- parameters]
+        projectorDefinitions =
+            [ case [identifier | identifier <- letVars core, getName identifier == owner] of
+                [identifier] -> (identifier, meaning)
+                _ -> die "generated source projector lost its exact Core owner"
+            | (owner, _, _, meaning) <- projectors
+            ]
+    if length actualParameters /= length parameters
+        then die "generated primitive query lost its parameter prefix"
+        else pure (core, checkedType, logicalEmbeddings, parameterDefinitions ++ projectorDefinitions)
+  where
+    elaborate parameters projectors expression = do
+        -- Source type variables scope over all primitive parameters as well.
+        let checkedType = prependParameters signature
+            prependParameters (RAllT variable rest reft) = RAllT variable (prependParameters rest) reft
+            prependParameters (RAllP predicate rest) = RAllP predicate (prependParameters rest)
+            prependParameters rest = foldr (\(name, ty, _) -> rFun name ty) rest parameters
+        body <- buildHsExpr (\locals -> foldr bindProjector (expression locals) projectors) checkedType
+        let expected = specTypeToQueryType checkedType
+        elaborated <- GM.elabRnExprWithType body expected
+        -- Checking polymorphic arguments can introduce beta wrappers between
+        -- source lambdas. Discharge these with GHC's capture-safe simplifier,
+        -- without eta reduction or unfolding source definitions. All query
+        -- consumers use this one checked Core and its exact binder identities.
+        let core = simpleOptExprNoInline defaultSimpleOpts{so_eta_red = False} elaborated
+        if exprType elaborated `eqType` expected && exprType core `eqType` expected
+            then pure (core, checkedType)
+            else reject (PJ.text "Administrative query normalization changed its checked source type")
+    bound = S.fromList (fst (collectSpecTypeBinders signature))
+    sourceIds = M.fromList sources
+    measureTypes = M.fromList [(name, (kind, ty)) | (name, kind, ty) <- measures]
+    projectionCases = M.fromList projections
+    -- Infer logical instantiations in the complete predicate, not separately
+    -- at each application. Result-only variables (for example Set_empty's
+    -- element) get their meaning from the surrounding equality. These casts
+    -- annotate only the checking query; the authored refinement is unchanged.
+    contextual =
+        either (reject . PJ.vcat . map F.errMsg . F.errs) id $
+            SC.annotateExprEAt flags native environment "refinement formation" (Just F.boolSort) original
+      where
+        -- These rows declare term values, including lexical captures. None
+        -- declares a sort alias: a term label cannot give an FObj its meaning.
+        environment =
+            F.fromListSEnv [(name, typeSort embeddings (specTypeToQueryType ty)) | (name, ty) <- telescope signature]
+                <> declarations
+        telescope (RAllT _ rest _) = telescope rest
+        telescope (RAllP _ rest) = telescope rest
+        telescope (RFun binder _ domain rest _) = (binder, domain) : telescope rest
+        telescope (REx _ _ rest) = telescope rest
+        telescope (RRTy _ _ _ rest) = telescope rest
+        telescope _ = []
+    occupied = map (rdrNameOcc . varSymbolToRdrName) (M.keys sourceIds ++ S.toList (bound `S.union` F.syms original))
+    bool = ofType boolTy :: SpecType
+    integer = ofType integerTy :: SpecType
+    x = "lh_primitive_x"
+    value = "lh_primitive_result"
+    equality result expression =
+        strengthen result $
+            uTop $
+                F.Reft
+                    (value, F.PAtom F.Eq (F.EVar value) expression)
+    proposition expression =
+        strengthen bool $
+            uTop $
+                F.Reft
+                    (value, F.PIff (F.EVar value) expression)
+    apply name arguments = foldl F.EApp (F.EVar name) arguments
+    isSource name = name `S.member` bound || M.member name sourceIds
+    -- Sort rejection is a source specification error, not a compiler panic.
+    -- Reuse the ordinary Bare diagnostic, preserving its located query owner.
+    reject :: PJ.Doc -> a
+    reject message = uError (ErrTySpec location (Just "refinement formation") "refinement" (F.pprint signature) message)
+    die :: String -> a
+    die message = panic (Just location) ("Refinement primitive lowering: " ++ message)
+
+    freshName = do
+        unique <- State.lift getUniqueM
+        let name = F.symbol ("lh_formation_" ++ show (getKey unique))
+        if rdrNameOcc (varSymbolToRdrName name) `elem` occupied
+            then freshName
+            else pure name
+    freshParameter ty meaning = do
+        name <- freshName
+        State.modify' (\(parameters, logicalEmbeddings, projectors) -> (parameters ++ [(name, ty, meaning)], logicalEmbeddings, projectors))
+        pure (variable name)
+    functionMeaning arguments body = do
+        environment <- queryEmbeddings
+        pure (foldr F.ELam body [(binder, typeSort environment ty) | (binder, ty) <- arguments])
+    polymorphicType kind make = do
+        unique <- State.lift getUniqueM
+        let variable = mkTyVar (mkInternalName unique (mkTyVarOcc "lh_primitive_type") noSrcSpan) kind
+            ty = RVar (RTV variable) mempty
+        pure (RAllT (makeRTVar (RTV variable)) (make ty) mempty)
+    scopeVariables :: SpecType -> [TyVar]
+    scopeVariables (RAllT (ty_var_value -> RTV variable) rest _) = variable : scopeVariables rest
+    scopeVariables (RFun _ _ _ rest _) = scopeVariables rest
+    scopeVariables (RAllP _ rest) = scopeVariables rest
+    scopeVariables (REx _ _ rest) = scopeVariables rest
+    scopeVariables _ = []
+
+    queryEmbeddings = State.gets (\(_, logicalEmbeddings, _) -> logicalEmbeddings <> embeddings)
+
+    -- Canonical primitive carriers interpret the fixed logical vocabulary:
+    -- Bool as Bool, mathematical integers as Integer, and Char as GHC Char
+    -- (the same charSort used by CoreToLogic.mkC). This is not an inverse
+    -- lookup in user embeddings: e.g. Word32's integer meaning stays Integer.
+    -- Logical aggregate values have no source data constructors or source
+    -- invariants. Their fresh GHC identity prevents accidental consumption by
+    -- a source function; only their explicit logical interpretation is shared.
+    -- Real type arguments, rather than free variables hidden in an embedding,
+    -- make this interpretation commute with forall instantiation.
+    logicalType variables sort
+        | sort == F.boolSort = pure bool
+        | sort == F.FInt = pure integer
+        | sort == F.charSort = pure (ofType charTy)
+        | sort == F.FReal = aggregate F.FReal []
+        | F.FObj name <- sort
+        , Just variable <- lookup name [(F.symbol v, v) | v <- variables] =
+            abstract variable
+        | otherwise = case sortApplication sort of
+            (headSort@F.FTC{}, arguments) -> aggregate headSort arguments
+            (headSort@F.FObj{}, []) -> aggregate headSort []
+            _ -> die ("logical result has no closed carrier interpretation: " ++ F.showpp sort)
+      where
+        abstract variable = do
+            local <- State.gets (\(_, current, _) -> current)
+            constructor <- case [ tc
+                                | (tc, (F.FObj name, F.WithArgs)) <- F.tceToList local
+                                , [formal] <- [tyConTyVars tc]
+                                , name == F.symbol formal
+                                , eqType (tyVarKind formal) (tyVarKind variable)
+                                ] of
+                [tc] -> pure tc
+                [] -> do
+                    formal <- freshTypeVariable (tyVarKind variable)
+                    logicalConstructor [formal] (F.FObj (F.symbol formal), F.WithArgs)
+                _ -> die "abstract logical result has multiple query-local representations"
+            pure (ofType (mkTyConApp constructor [mkTyVarTy variable]))
+        aggregate headSort arguments = do
+            argumentTypes <- traverse (logicalType variables) arguments
+            local <- State.gets (\(_, current, _) -> current)
+            constructor <- case [tc | (tc, (meaning, F.NoArgs)) <- F.tceToList local, meaning == headSort, tyConArity tc == length arguments] of
+                [tc] -> pure tc
+                [] -> do
+                    typeVariables <- traverse (const (freshTypeVariable liftedTypeKind)) arguments
+                    logicalConstructor typeVariables (headSort, F.NoArgs)
+                _ -> die "logical constructor has multiple query-local representations"
+            pure (ofType (mkTyConApp constructor (map specTypeToQueryType argumentTypes)))
+    logicalConstructor variables (meaning, arguments) = do
+        unique <- State.lift getUniqueM
+        owner <- State.lift getModule
+        let name = mkExternalName unique owner (mkTcOcc ("LHLogicalValue_" ++ show (getKey unique))) noSrcSpan
+            tc = Ghc.mkPrimTyCon name (map mkAnonTyConBinder variables) liftedTypeKind (map (const Nominal) variables)
+        State.modify' (\(parameters, current, projectors) -> (parameters, F.tceInsert tc meaning arguments current, projectors))
+        pure tc
+    freshTypeVariable kind = do
+        unique <- State.lift getUniqueM
+        pure (mkTyVar (mkInternalName unique (mkTyVarOcc "lh_logical_argument") noSrcSpan) kind)
+    sortApplication = go []
+      where
+        go arguments (F.FApp function argument) = go (argument : arguments) function
+        go arguments function = (function, arguments)
+
+    theory expected name schema =
+        logicalOperation False expected [(name, schema)] (apply name)
+
+    -- The fixpoint judgment owns both the primitive and its result sort.
+    -- Source operands retain their independently elaborated GHC types; no
+    -- source Num/Eq dictionary supplies logical arithmetic or relation meaning.
+    logicalOperation generalize expected declarations operation arguments = do
+        lowered <- traverse lower arguments
+        types <-
+            if generalize
+                then do
+                    -- Infer the homogeneous equality instance jointly: a
+                    -- polymorphic operand gets context from its sibling.
+                    -- This probe contributes no facts or checking Core.
+                    query <- State.get
+                    (common, _) <- State.lift $ tryTc $ State.evalStateT (operandTypes lowered) query
+                    maybe (traverse operandType lowered) pure common
+                else traverse operandType lowered
+        names <- traverse (const freshName) arguments
+        environment <- queryEmbeddings
+        let expression = operation (map F.EVar names)
+            sorts = F.fromListSEnv (declarations ++ zip names (map (typeSort environment) types))
+            checked = maybe expression (F.ECst expression) expected
+        case SC.sortExprE native F.dummySpan mempty sorts checked of
+            Left _ -> reject (PJ.text ("ill-sorted logical primitive application: " ++ F.showpp expression))
+            Right resultSort -> do
+                result <- logicalType (scopeVariables signature) resultSort
+                let summary
+                        | resultSort == F.boolSort = proposition expression
+                        | otherwise = equality result expression
+                operatorType <- case types of
+                    [leftType, rightType]
+                        | generalize && eqType leftType rightType ->
+                            -- Equality consumes values without calling them.
+                            -- Preserve ordinary polymorphic inference for a
+                            -- refined callback's restricted source domain.
+                            polymorphicType (typeKind leftType) (\ty -> foldr (\binder rest -> rFun binder ty rest) summary names)
+                    _ -> pure (foldr (\(binder, ty) rest -> rFun binder (ofType ty) rest) summary (zip names types))
+                denotation <- functionMeaning (zip names types) expression
+                operator <- freshParameter operatorType denotation
+                pure (foldl applyQuery operator lowered)
+
+    conditional condition yes no = do
+        condition' <- lower condition
+        yes' <- lower yes
+        no' <- lower no
+        yesType <- operandType yes'
+        noType <- operandType no'
+        if eqType yesType noType
+            then pure (ifQuery condition' yes' no')
+            else do
+                environment <- queryEmbeddings
+                let sort = typeSort environment yesType
+                if sort /= typeSort environment noType
+                    then die "conditional branches have distinct logical sorts"
+                    else do
+                        carrier <- logicalType (scopeVariables signature) sort
+                        yesValue <- inject carrier yesType yes'
+                        noValue <- inject carrier noType no'
+                        -- Keep the case: source calls inside a branch must
+                        -- retain that branch's path condition during checking.
+                        pure (ifQuery condition' yesValue noValue)
+    inject carrier sourceType expression
+        | eqType sourceType (specTypeToQueryType carrier) = pure expression
+        | otherwise = do
+            denotation <- functionMeaning [(x, sourceType)] (F.EVar x)
+            bridge <- freshParameter (rFun x (ofType sourceType) (equality carrier (F.EVar x))) denotation
+            pure (applyQuery bridge expression)
+
+    -- Only the standard declarations identify these mathematical observations.
+    -- A same-spelled local/source binder is handled first and is never replaced.
+    role name = case F.symbolString (GM.dropModuleUnique name) of
+        "len" -> Just "len"
+        "GHC.Types_LHAssumptions.len" -> Just "len"
+        "GHC.Base_LHAssumptions.len" -> Just "len"
+        "listElts" -> Just "listElts"
+        "Data.Set_LHAssumptions.listElts" -> Just "listElts"
+        _ -> Nothing
+    isMeasure name = M.member name measureTypes || Mb.isJust (role name)
+    declaration name = case M.lookup name measureTypes of
+        Just (_, ty) -> (name, ty)
+        Nothing -> case [(s, ty) | (s, _, ty) <- measures, role s == role name, role s /= Nothing] of
+            [entry] -> entry
+            _ -> die ("no unambiguous resolved measure declaration for " ++ F.showpp name)
+    selectMeasure name argument =
+        let (resolved, declared) = declaration name
+         in case [(receiver, ty) | (owner, receiver, ty) <- instances, owner == resolved] of
+                [] -> pure declared
+                [(_, ty)] -> pure ty
+                candidates -> case argument of
+                    Nothing -> die ("overloaded measure requires a receiver: " ++ F.showpp resolved)
+                    Just receiver -> do
+                        constructor <- receiverTyCon receiver
+                        case [ty | (candidate, ty) <- candidates, candidate == constructor] of
+                            [ty] -> pure ty
+                            _ -> die ("no unique instance for the actual receiver of " ++ F.showpp resolved)
+
+    -- This temporary query asks GHC only for a receiver's source type. It
+    -- never reaches LH and contributes no facts. Nested observations have
+    -- already been resolved; the final query checks their complete contracts.
+    receiverTyCon argument = do
+        receiver <- operandType argument
+        case splitTyConApp_maybe receiver of
+            Just (constructor, _) -> pure constructor
+            Nothing -> die "measure receiver has no uniquely determined source type constructor"
+    operandType argument = do
+        types <- operandTypes [argument]
+        case types of
+            [ty] -> pure ty
+            _ -> die "single operand probe changed its arity"
+    operandTypes arguments = do
+        (parameters, _, projectors) <- State.get
+        probe <- freshName
+        -- The marker consumes an operand at its actual runtime representation;
+        -- it never binds a representation-polymorphic value in generated Core.
+        unique <- State.lift getUniqueM
+        let representation = mkTyVar (mkInternalName unique (mkTyVarOcc "lh_primitive_rep") noSrcSpan) runtimeRepTy
+        body <- polymorphicType (mkTYPEapp (mkTyVarTy representation)) (\ty -> foldr (const (rFun x ty)) bool arguments)
+        let probeType = RAllT (makeRTVar (RTV representation)) body mempty
+        (elaborated, checkedType) <- State.lift $ elaborate ((probe, probeType, F.PTrue) : parameters) projectors (foldl applyQuery (variable probe) arguments)
+        let core = elaborated
+            actualVariables = scopeVariables (ofType (exprType core))
+            sourceVariables = scopeVariables checkedType
+        case withoutTypeLambdas core of
+            Lam marker body -> case markerArguments marker body of
+                receivers
+                    | length receivers == length arguments
+                    , length actualVariables == length sourceVariables ->
+                        -- GHC skolems are alpha-renamed back to this query's
+                        -- original telescope before separate operands are joined.
+                        pure (map (substTyWith actualVariables (map mkTyVarTy sourceVariables)) receivers)
+                _ -> die ("operand probe changed its scoped type-variable telescope: actual=" ++ GM.showPpr actualVariables ++ "; expected=" ++ GM.showPpr sourceVariables ++ "; markers=" ++ GM.showPpr (markerArguments marker body) ++ "; core=" ++ GM.showPpr core)
+            _ -> die "receiver probe lost its scoped parameter"
+    withoutTypeLambdas (Lam variable body)
+        | isTyVar variable = withoutTypeLambdas body
+    withoutTypeLambdas expression = expression
+    markerArguments marker = go [marker]
+      where
+        go aliases expression
+            | (Var identifier, Type _ : arguments) <- collectArgs expression
+            , identifier `elem` aliases =
+                map exprType (dropWhile isTypeArg arguments)
+            | otherwise = case expression of
+                App function argument -> go aliases function ++ go aliases argument
+                Lam _ body -> go aliases body
+                Let (NonRec binder (Var identifier)) body
+                    | identifier `elem` aliases -> go (binder : aliases) body
+                Let (NonRec _ rhs) body -> go aliases rhs ++ go aliases body
+                Let (Rec bindings) body -> concatMap (go aliases . snd) bindings ++ go aliases body
+                Case scrutinee _ _ alternatives -> go aliases scrutinee ++ concatMap (\(Alt _ _ body) -> go aliases body) alternatives
+                Cast body _ -> go aliases body
+                Tick _ body -> go aliases body
+                _ -> []
+
+    measureType name declared
+        | Just (T.MsReflect, _) <- M.lookup name measureTypes =
+            if not (Measure.resolvedSourceInputType declared)
+                then reject (PJ.text "Opaque logical observation requires a resolved source input schema")
+                else
+                    if Measure.supportedOpaqueResult (ty_res $ toRTypeRep declared)
+                        then pure (Axiom.aty $ Axiom.addSingletonApp False name declared)
+                        else reject (PJ.text "Opaque logical observation requires supported native result-domain metadata")
+        | otherwise = go [] [] declared
+      where
+        go variables arguments (RAllT variable@(ty_var_value -> RTV tv) rest reft) =
+            (\result -> RAllT variable result reft) <$> go (tv : variables) arguments rest
+        go variables arguments (RFun binder info domain rest reft) =
+            (\result -> RFun binder info domain result reft) <$> go variables (arguments ++ [F.EVar binder]) rest
+        go variables arguments result = do
+            environment <- queryEmbeddings
+            let resultSort = typeSort environment (specTypeToQueryType result)
+            carrier <- logicalType variables resultSort
+            pure (equality (strengthen carrier (Mb.fromMaybe mempty (stripRTypeBase result))) (apply name arguments))
+
+    -- Preserve the declaration's input refinement before taking the actual
+    -- source field. The following case (not an assumed abstract-result arrow)
+    -- owns the obligation that this constructor exists on the current path.
+    projectionInput (RAllT variable rest reft)
+        | isTauto reft =
+            (\result -> RAllT variable result reft) <$> projectionInput rest
+    projectionInput (RFun binder info domain _ reft)
+        | isTauto reft =
+            pure (RFun binder info domain (equality domain (F.EVar binder)) reft)
+    projectionInput RAllT{} = reject (PJ.text "applied projection has a refined polymorphic telescope")
+    projectionInput RFun{} = reject (PJ.text "applied projection has a refined function value")
+    projectionInput _ = die "source field projection requires one declared input"
+
+    -- A first-class projection checks the actual case function against its
+    -- complete declared arrow, including receiver and returned callback domains.
+    projectionValue (RAllT variable rest reft)
+        | isTauto reft =
+            let (bridge, argument) = projectionValue rest
+             in (RAllT variable bridge reft, argument)
+        | otherwise = reject (PJ.text "first-class projection has a refined polymorphic telescope")
+    projectionValue ty = (rFun x ty (equality ty (F.EVar x)), ty)
+
+    projector name = do
+        existing <- State.gets (\(_, _, projectors) -> L.find (\(_, _, _, meaning) -> meaning == F.EVar name) projectors)
+        owner <- case existing of
+            Just (owner, _, _, _) -> pure owner
+            Nothing -> do
+                ownerUnique <- State.lift getUniqueM
+                argumentUnique <- State.lift getUniqueM
+                let owner = mkInternalName ownerUnique (mkVarOcc "lh_projection") noSrcSpan
+                    argumentName = mkInternalName argumentUnique (mkVarOcc "lh_projected_input") noSrcSpan
+                    alternatives = projectionCases M.! name
+                State.modify' (\(parameters, current, projectors) -> (parameters, current, projectors ++ [(owner, argumentName, alternatives, F.EVar name)]))
+                pure owner
+        pure (const (nlHsVar (nameRdrName owner)))
+
+    lower = lowerAs Nothing
+    lowerAs _ (F.ECst expression sort) = lowerAs (Just sort) expression
+    lowerAs expected expression = case expression of
+        F.EVar name | isSource name -> pure (variable name)
+        _
+            | (F.EVar name, [argument]) <- application expression
+            , not (isSource name)
+            , M.member name projectionCases -> do
+                lowered <- lower argument
+                selected <- selectMeasure name (Just lowered)
+                receiver <- operandType lowered
+                input <- projectionInput selected
+                denotation <- functionMeaning [(x, receiver)] (F.EVar x)
+                bridge <- freshParameter input denotation
+                helper <- projector name
+                pure (applyQuery helper (applyQuery bridge lowered))
+        F.EVar name | M.member name projectionCases -> do
+            selected <- selectMeasure name Nothing
+            helper <- projector name
+            let (bridgeType, argumentType) = projectionValue selected
+            denotation <- functionMeaning [(x, specTypeToQueryType argumentType)] (F.EVar x)
+            bridge <- freshParameter bridgeType denotation
+            pure (applyQuery bridge helper)
+        F.EVar name | isMeasure name -> do
+            ty <- selectMeasure name Nothing >>= measureType name
+            freshParameter ty (F.EVar name)
+        _
+            | (F.EVar name, arguments) <- application expression
+            , not (isSource name)
+            , Just schema <- lookup name wiredSortedSyms ->
+                theory expected name schema arguments
+        F.EVar name -> die ("no exact source identity or supported logical declaration for " ++ F.showpp name)
+        _
+            | (F.EVar name, [argument]) <- application expression
+            , not (isSource name)
+            , isMeasure name -> do
+                lowered <- lower argument
+                selected <- selectMeasure name (Just lowered)
+                ty <- measureType name selected
+                operator <- freshParameter ty (F.EVar name)
+                pure (applyQuery operator lowered)
+        F.EApp function argument -> applyQuery <$> lower function <*> lower argument
+        F.ESym{} -> logicalOperation False expected [] (const expression) []
+        F.ECon F.I{} -> logicalOperation False expected [] (const expression) []
+        F.ECon F.R{} -> logicalOperation False expected [] (const expression) []
+        F.ECon (F.L spelling sort) | sort == F.charSort ->
+            -- CoreToLogic.mkC uses canonical decimal ordinals of GHC Chars.
+            -- Other raw SMT literal text has no source Char interpretation.
+            case readMaybe (Text.unpack spelling) :: Maybe Integer of
+                Just ordinal
+                    | 0 <= ordinal && ordinal <= 0x10ffff
+                    , Text.pack (show ordinal) == spelling ->
+                        logicalOperation False expected [] (const expression) []
+                _ -> reject (PJ.text "Invalid typed Char literal: expected a canonical decimal Unicode code point")
+        F.PAtom relation left right -> logicalOperation (relation `elem` [F.Eq, F.Ne]) expected [] (\[a, b] -> F.PAtom relation a b) [left, right]
+        F.EBin operator left right -> logicalOperation False expected [] (\[a, b] -> F.EBin operator a b) [left, right]
+        F.ENeg argument -> logicalOperation False expected [] (\[a] -> F.ENeg a) [argument]
+        F.PAnd expressions -> foldr (\e rest -> ifQuery e rest false) true <$> traverse lower expressions
+        F.POr expressions -> foldr (\e rest -> ifQuery e true rest) false <$> traverse lower expressions
+        F.PNot expression' -> (\e -> ifQuery e false true) <$> lower expression'
+        F.PImp left right -> (\p q -> ifQuery p q true) <$> lower left <*> lower right
+        F.PIff left right -> (\p q -> ifQuery p q (ifQuery q false true)) <$> lower left <*> lower right
+        F.EIte condition yes no -> conditional condition yes no
+        _ -> die ("unsupported logical syntax (not skipped): " ++ F.showpp expression)
+
+    application = go []
+      where
+        go arguments (F.ECst expression _) = go arguments expression
+        go arguments (F.EApp function argument) = go (argument : arguments) function
+        go arguments function = (function, arguments)
+
+    -- Query expressions compose directly in the lexical environment. Boolean
+    -- scaffolding is expressed as cases, not overloaded source calls.
+    variable name locals
+        | Just local <- M.lookup name locals = nlHsVar local
+        | Just identifier <- M.lookup name sourceIds = nlHsVar (nameRdrName (getName identifier))
+        | otherwise = nlHsVar (varSymbolToRdrName name)
+    applyQuery function argument = mkHsApp <$> function <*> argument
+    ifQuery condition yes no = nlHsIf <$> condition <*> yes <*> no
+    true = const (nlHsVar true_RDR)
+    false = const (nlHsVar (getRdrName falseDataCon))
+    bindProjector (owner, argumentName, alternatives, _) expression =
+        let helper = nameRdrName owner
+            parameter = nameRdrName argumentName
+            body = nlHsCase (nlHsVar parameter) (map fieldAlternative alternatives)
+            binding = mkSimpleGeneratedFunBind noSrcSpan helper (noLocA [nlVarPat parameter]) body
+            bindings = HsValBinds noAnn (ValBinds mempty [binding] [])
+         in noLocA (HsLet (noAnn, noAnn) bindings expression)
+    fieldAlternative (constructor, index) =
+        mkSimpleMatch CaseAlt (noLocA [pattern]) (nlHsVar selected)
+      where
+        selected = mkRdrUnqual (mkVarOcc "lh_selected_field")
+        pattern =
+            nlConPat
+                (getRdrName constructor)
+                [if field == index then nlVarPat selected else nlWildPat | field <- [0 .. length (dataConOrigArgTys constructor) - 1]]
+
+-- The query is checked in its source telescope, not RefType.toType's logical
+-- erasure: keep implicit quantification, original variable identities and
+-- dependent kinds. Class arguments remain givens, not ordinary value arrows.
+-- Existential evidence does not change a value's source type. Its lexical
+-- scope is opened as an explicit query binder when checking its body below.
+specTypeToQueryType :: SpecType -> Type
+specTypeToQueryType = go
+  where
+    go (RLit l) = LitTy l
+    go (RVar (RTV tv) _) = mkTyVarTy tv
+    go (RFun _ _ domain result _)
+        | isClassType domain = mkInvisFunTy (go domain) (go result)
+        | otherwise = mkVisFunTyMany (go domain) (go result)
+    go (RAllT (ty_var_value -> RTV tv) rest _) = mkSpecForAllTy tv (go rest)
+    go (RAllP _ rest) = go rest
+    go (RApp RTyCon{rtc_tc = tc} arguments _ _) = mkTyConApp tc (map go (filter notExprArg arguments))
+    go (REx _ _ result) = go result
+    go (RAppTy _ RExprArg{} _) = impossible Nothing "RExprArg in generated predicate telescope"
+    go (RAppTy function argument _) = mkAppTy (go function) (go argument)
+    go (RRTy _ _ _ rest) = go rest
+    go ty = panic Nothing ("Unsupported generated predicate telescope: " ++ F.showpp ty)
 
 elaborateSpecType'
-  :: (CoreExpr -> SpecType -> TcRn ())
-  -> PartialSpecType
-  -> (CoreExpr -> F.Expr) -- core to logic
-  -> (CoreExpr -> TcRn CoreExpr)
+  :: (SpecType -> F.Expr -> TcRn F.Expr)
+  -> (SpecType -> SpecType)
   -> SpecType
-  -> TcRn (SpecType, [F.Symbol]) -- binders for dictionaries
-                   -- should have returned Maybe [F.Symbol]
-elaborateSpecType' collect partialTp coreToLogic simplify t =
-  case F.notracepp "elaborateSpecType'" t of
-    RVar (RTV tv) (MkUReft reft@(F.Reft (vv, _oldE)) p) -> do
-      elaborateReft
-        (reft, t)
-        (pure (t, []))
-        (\bs' ee -> pure (RVar (RTV tv) (MkUReft (F.Reft (vv, ee)) p), bs'))
-        -- YL : Fix
-    RFun  bind i tin tout ureft@(MkUReft reft@(F.Reft (vv, _oldE)) p) -> do
-      -- the reft is never actually used by the child
-      -- maybe i should enforce this information at the type level
-      let partialFunTp =
-            Free (RFunF bind i (wrap $ specTypeToPartial tin) (pure ()) ureft) :: PartialSpecType
-          partialTp' = partialTp >> partialFunTp :: PartialSpecType
-      (eTin , bs ) <- elaborateSpecType' collect partialTp coreToLogic simplify tin
-      (eTout, bs') <- elaborateSpecType' collect partialTp' coreToLogic simplify tout
-      let buildRFunContTrivial
-            | isClassType tin, dictBinder : bs0' <- bs' = do
-              let (eToutRenamed, canonicalBinders) =
-                    canonicalizeDictBinder bs (eTout, bs0')
-              pure
-                ( F.notracepp "RFunTrivial0"
-                  $ RFun dictBinder i eTin eToutRenamed ureft
-                , canonicalBinders
-                )
-            | otherwise = do
-              let (eToutRenamed, canonicalBinders) =
-                    canonicalizeDictBinder bs (eTout, bs')
-              pure
-                ( F.notracepp "RFunTrivial1" $ RFun bind i eTin eToutRenamed ureft
-                , canonicalBinders
-                )
-          buildRFunCont bs'' ee
-            | isClassType tin, dictBinder : bs0' <- bs' = do
-              let (eToutRenamed, canonicalBinders) =
-                    canonicalizeDictBinder bs (eTout, bs0')
-                  (eeRenamed, canonicalBinders') =
-                    canonicalizeDictBinder canonicalBinders (ee, bs'')
-              pure
-                ( RFun dictBinder i
-                       eTin
-                       eToutRenamed
-                       (MkUReft (F.Reft (vv, eeRenamed)) p)
-                , canonicalBinders'
-                )
-            | otherwise = do
-              let (eToutRenamed, canonicalBinders) =
-                    canonicalizeDictBinder bs (eTout, bs')
-                  (eeRenamed, canonicalBinders') =
-                    canonicalizeDictBinder canonicalBinders (ee, bs'')
-              pure
-                ( RFun bind i
-                       eTin
-                       eToutRenamed
-                       (MkUReft (F.Reft (vv, eeRenamed)) p)
-                , canonicalBinders'
-                )
-      elaborateReft (reft, t) buildRFunContTrivial buildRFunCont
-
-        -- (\bs' ee | isClassType tin -> do
-        --    let eeRenamed = renameDictBinder canonicalBinders bs' ee
-        --    pure (RFun bind eTin eToutRenamed (MkUReft (F.Reft (vv, eeRenamed)) p), bs')
-        -- )
-
-    -- support for RankNTypes/ref
-    RAllT (RTVar tv ty) tout ureft@(MkUReft ref@(F.Reft (vv, _oldE)) p) -> do
-      (eTout, bs) <- elaborateSpecType'
-        collect
-        (partialTp >> Free (RAllTF (RTVar tv ty) (pure ()) ureft))
-        coreToLogic
-        simplify
-        tout
-      elaborateReft
-        (ref, RVar tv mempty)
-        (pure (RAllT (RTVar tv ty) eTout ureft, bs))
-        (\bs' ee ->
-          let (eeRenamed, canonicalBinders) =
-                canonicalizeDictBinder bs (ee, bs')
-          in  pure
-                ( RAllT (RTVar tv ty) eTout (MkUReft (F.Reft (vv, eeRenamed)) p)
-                , canonicalBinders
-                )
-        )
-      -- pure (RAllT (RTVar tv ty) eTout ref, bts')
-    -- todo: might as well print an error message?
-    RAllP pvbind tout -> do
-      (eTout, bts') <- elaborateSpecType'
-        collect
-        (partialTp >> Free (RAllPF pvbind (pure ())))
-        coreToLogic
-        simplify
-        tout
-      pure (RAllP pvbind eTout, bts')
-    -- pargs not handled for now
-    -- RApp tycon args pargs reft
-    RApp tycon args pargs ureft@(MkUReft reft@(F.Reft (vv, _)) p)
-      | isClass tycon -> pure (t, [])
+  -> TcRn SpecType
+-- The context has exactly one hole: the result of the enclosing telescope.
+-- Every query interprets its own checked binders, so sibling types need no
+-- reconciliation of GHC-generated dictionary names.
+elaborateSpecType' query scope t =
+  case t of
+    RVar variable reft -> refine (reft, t) (RVar variable)
+    RFun binder info domain result reft -> do
+      domain' <- elaborateSpecType' query scope domain
+      result' <- elaborateSpecType' query (scope . (\rest -> RFun binder info domain' rest reft)) result
+      refine (reft, RFun binder info domain' result' reft) (RFun binder info domain' result')
+    RAllT variable rest reft -> do
+      rest' <- elaborateSpecType' query (scope . (\result -> RAllT variable result reft)) rest
+      refine (reft, RVar (ty_var_value variable) mempty) (RAllT variable rest')
+    RAllP predicate rest ->
+      RAllP predicate <$> elaborateSpecType' query (scope . RAllP predicate) rest
+    RApp constructor arguments predicates reft
+      | isClass constructor -> pure t
       | otherwise -> do
-        args' <- mapM
-          (fmap fst . elaborateSpecType' collect partialTp coreToLogic simplify)
-          args
-        elaborateReft
-          (reft, t)
-          (pure (RApp tycon args' pargs ureft, []))
-          (\bs' ee ->
-            pure (RApp tycon args' pargs (MkUReft (F.Reft (vv, ee)) p), bs')
-          )
-    RAppTy arg res ureft@(MkUReft reft@(F.Reft (vv, _)) p) -> do
-      (eArg, bs ) <- elaborateSpecType' collect partialTp coreToLogic simplify arg
-      (eRes, bs') <- elaborateSpecType' collect partialTp coreToLogic simplify res
-      let (eResRenamed, canonicalBinders) =
-            canonicalizeDictBinder bs (eRes, bs')
-      elaborateReft
-        (reft, t)
-        (pure (RAppTy eArg eResRenamed ureft, canonicalBinders))
-        (\bs'' ee ->
-          let (eeRenamed, canonicalBinders') =
-                canonicalizeDictBinder canonicalBinders (ee, bs'')
-          in  pure
-                ( RAppTy eArg eResRenamed (MkUReft (F.Reft (vv, eeRenamed)) p)
-                , canonicalBinders'
-                )
-        )
-    -- todo: Existential support
-    REx bind allarg ty -> do
-      (eAllarg, bs ) <- elaborateSpecType' collect partialTp coreToLogic simplify allarg
-      (eTy    , bs') <- elaborateSpecType' collect partialTp coreToLogic simplify ty
-      let (eTyRenamed, canonicalBinders) = canonicalizeDictBinder bs (eTy, bs')
-      pure (REx bind eAllarg eTyRenamed, canonicalBinders)
-    -- YL: might need to filter RExprArg out and replace RHole with ghc wildcard
-    -- in the future
+          arguments' <- traverse (elaborateSpecType' query scope) arguments
+          refine (reft, RApp constructor arguments' predicates reft) (RApp constructor arguments' predicates)
+    RAppTy function argument reft -> do
+      function' <- elaborateSpecType' query scope function
+      argument' <- elaborateSpecType' query scope argument
+      refine (reft, RAppTy function' argument' reft) (RAppTy function' argument')
+    -- A witness scopes over the predicate, not the represented calling convention.
+    REx binder witness rest -> do
+      witness' <- elaborateSpecType' query scope witness
+      rest' <- elaborateSpecType' query (scope . (\result -> RFun binder defRFInfo witness' result mempty)) rest
+      pure (REx binder witness' rest')
+    RLit _ -> pure t
     RExprArg _ -> impossible Nothing "RExprArg should not appear here"
-    RHole    _ -> impossible Nothing "RHole should not appear here"
-    RRTy{}     -> todo Nothing ("Not sure how to elaborate RRTy" ++ F.showpp t)
+    RHole _ -> impossible Nothing "RHole should not appear here"
+    RRTy environment reft OCons rest ->
+      RRTy <$> elaborateConstraint scope environment <*> pure reft <*> pure OCons <*> elaborateSpecType' query scope rest
+    RRTy{} -> todo Nothing ("Not sure how to elaborate RRTy" ++ F.showpp t)
  where
+  -- OCons stores a lexical context followed by two subtype endpoints.
+  -- Its context scopes over those endpoints, independently of the payload.
+  elaborateConstraint context [(left, lhs), (right, rhs)] =
+      (\lhs' rhs' -> [(left, lhs'), (right, rhs')])
+          <$> elaborateSpecType' query context lhs
+          <*> elaborateSpecType' query context rhs
+  elaborateConstraint context ((binder, domain) : rest) = do
+      domain' <- elaborateSpecType' query context domain
+      rest' <- elaborateConstraint (context . (\result -> RFun binder defRFInfo domain' result mempty)) rest
+      pure ((binder, domain') : rest')
+  elaborateConstraint _ [] = impossible Nothing "Subtype obligation has fewer than two endpoints"
+
   boolType = RApp (RTyCon boolTyCon [] defaultTyConInfo) [] [] mempty :: SpecType
-  elaborateReft
-    :: (F.PPrint a)
-    => (F.Reft, SpecType)
-    -> TcRn a
-    -> ([F.Symbol] -> F.Expr -> TcRn a)
-    -> TcRn a
-  elaborateReft (reft@(F.Reft (vv, e)), vvTy) trivial nonTrivialCont =
-    if isTrivial' reft
-      then trivial
-      else do
-        let
-          querySpecType =
-            plugType (rFun' (classRFInfo True) vv vvTy boolType) partialTp :: SpecType
+  refine (original@(MkUReft (F.Reft (value, predicate)) abstract), valueType) rebuild
+      -- Inference placeholders have no source predicate to elaborate.
+      | T.isHole predicate || predicate == F.PTrue = pure (rebuild original)
+      | otherwise = do
+          let originalQuery = scope (rFun' (classRFInfo True) value valueType boolType)
+              occupied = querySourceSymbols originalQuery `S.union` F.syms predicate
+              (_, queryValue) = F.freshInNS value occupied
+              queryType = scope (rFun' (classRFInfo True) queryValue valueType boolType)
+          expression <- query (eraseCheckedRefinement queryType) (F.subst1 predicate (value, F.EVar queryValue))
+          pure (rebuild (MkUReft (F.Reft (value, F.subst1 expression (queryValue, F.EVar value))) abstract))
 
-          (origBinders, origTyBinders) = F.notracepp "collectSpecTypeBinders"
-            $ collectSpecTypeBinders querySpecType
+  eraseCheckedRefinement (RAllT variable rest reft) = RAllT variable (eraseCheckedRefinement rest) reft
+  eraseCheckedRefinement (RAllP predicate rest) = RAllP predicate (eraseCheckedRefinement rest)
+  eraseCheckedRefinement (RFun binder info domain result reft)
+    | hasValueArgument result = RFun binder info domain (eraseCheckedRefinement result) reft
+    | otherwise = RFun binder info
+        (eraseRootContract domain)
+        (eraseRootContract result)
+        reft
+  eraseCheckedRefinement ty = eraseRootContract ty
 
+  -- Formation cannot assume the predicate currently being established. Its
+  -- represented value still has its independently elaborated child contracts.
+  -- Retain the value owner for children whose scope includes the container.
+  eraseRootContract ty =
+      let F.Reft (value, _) = rTypeReft ty
+       in strengthenWith (\_ replacement -> replacement) ty (MkUReft (F.Reft (value, F.PTrue)) mempty)
 
-
-          hsExpr =
-            buildHsExpr (fixExprToHsExpr (S.fromList origBinders) e)
-                        querySpecType :: LHsExpr GhcPs
-          exprWithTySigs = noLocA $ ExprWithTySig
-            noAnn
-            hsExpr
-            (hsTypeToHsSigWcType (specTypeToLHsType querySpecType))
-        eeWithLamsCore <- GM.elabRnExpr exprWithTySigs
-        eeWithLamsCore' <- simplify eeWithLamsCore
-        -- Preserve refinements on the surrounding signature arguments: they
-        -- are the local assumptions under which the predicate occurs. Erase
-        -- the refinement on the final value argument (the value whose
-        -- predicate we are checking) as well as the synthetic Bool result.
-        collect eeWithLamsCore' (eraseCheckedRefinement querySpecType)
-        let
-          (_, tyBinders) =
-            collectSpecTypeBinders
-              . ofType
-              . exprType
-              $ eeWithLamsCore'
-          substTy' = zip tyBinders origTyBinders
-          eeWithLams =
-            coreToLogic (GM.notracePpr "eeWithLamsCore" eeWithLamsCore')
-          (bs', ee) = F.notracepp "grabLams" $ grabLams ([], eeWithLams)
-          (dictbs, nondictbs) =
-            L.partition (F.isPrefixOfSym "$d") bs'
-      -- invariant: length nondictbs == length origBinders
-          subst = if length nondictbs == length origBinders
-            then F.notracepp "SUBST" $ zip (L.reverse nondictbs) origBinders
-            else panic
-              Nothing
-              "Oops, Ghc gave back more/less binders than I expected"
-        ret <- nonTrivialCont
-          dictbs
-          ( renameBinderCoerc (\x -> Mb.fromMaybe x (L.lookup x substTy'))
-          . F.substa (\x -> Mb.fromMaybe x (L.lookup x subst))
-          $ F.notracepp
-              (  "elaborated: subst "
-              ++ F.showpp substTy'
-              ++ "  "
-              ++ F.showpp
-                   (ofType $ exprType eeWithLamsCore' :: SpecType)
-              )
-              ee
-          )  -- (GM.dropModuleUnique <$> bs')
-        pure (F.notracepp "result" ret)
-                           -- (F.substa )
-  eraseCheckedRefinement (RAllT a ty r) = RAllT a (eraseCheckedRefinement ty) r
-  eraseCheckedRefinement (RAllP p ty) = RAllP p (eraseCheckedRefinement ty)
-  eraseCheckedRefinement (RFun x i arg res r)
-    | hasValueArgument res = RFun x i arg (eraseCheckedRefinement res) r
-    | otherwise = RFun x i
-        (mapReft (const mempty) arg)
-        (mapReft (const mempty) res)
-        r
-  eraseCheckedRefinement ty = mapReft (const mempty) ty
-
-  hasValueArgument (RAllT _ ty _) = hasValueArgument ty
-  hasValueArgument (RAllP _ ty)   = hasValueArgument ty
-  hasValueArgument RFun{}         = True
-  hasValueArgument _              = False
-
-  isTrivial' :: F.Reft -> Bool
-  isTrivial' (F.Reft (_, F.PTrue)) = True
-  isTrivial' _                     = False
-
-  grabLams :: ([F.Symbol], F.Expr) -> ([F.Symbol], F.Expr)
-  grabLams (bs, F.ELam (b, _) e) = grabLams (b : bs, e)
-  grabLams bse                   = bse
-  -- dropBinderUnique :: [F.Symbol] -> F.Expr -> F.Expr
-  -- dropBinderUnique binders = F.notracepp "ElaboratedExpr"
-  --   . F.substa (\x -> if L.elem x binders then GM.dropModuleUnique x else x)
-
-renameBinderCoerc :: (F.Symbol -> F.Symbol) -> F.Expr -> F.Expr
-renameBinderCoerc f = rename
- where
-  renameSort = renameBinderSort f
-  rename e'@(F.ESym _          ) = e'
-  rename e'@(F.ECon _          ) = e'
-  rename e'@(F.EVar _          ) = e'
-  rename (   F.EApp e0 e1      ) = F.EApp (rename e0) (rename e1)
-  rename (   F.ENeg e0         ) = F.ENeg (rename e0)
-  rename (   F.EBin bop e0 e1  ) = F.EBin bop (rename e0) (rename e1)
-  rename (   F.EIte e0  e1 e2  ) = F.EIte (rename e0) (rename e1) (rename e2)
-  rename (   F.ECst e' t       ) = F.ECst (rename e') (renameSort t)
-  -- rename (F.ELam (x, t) e') = F.ELam (x, renameSort t) (rename e')
-  rename (   F.PAnd es         ) = F.PAnd (rename <$> es)
-  rename (   F.POr  es         ) = F.POr (rename <$> es)
-  rename (   F.PNot e'         ) = F.PNot (rename e')
-  rename (   F.PImp e0 e1      ) = F.PImp (rename e0) (rename e1)
-  rename (   F.PIff e0 e1      ) = F.PIff (rename e0) (rename e1)
-  rename (   F.PAtom brel e0 e1) = F.PAtom brel (rename e0) (rename e1)
-  rename (F.ECoerc _ _ e') = rename e'
-
-  rename e = panic
-    Nothing
-    ("renameBinderCoerc: Not sure how to handle the expression " ++ F.showpp e)
-
-
-
-renameBinderSort :: (F.Symbol -> F.Symbol) -> F.Sort -> F.Sort
-renameBinderSort f = rename
- where
-  rename F.FInt             = F.FInt
-  rename F.FReal            = F.FReal
-  rename F.FNum             = F.FNum
-  rename (F.FNatNum n)      = F.FNatNum n
-  rename F.FFrac            = F.FFrac
-  rename (   F.FObj s     ) = F.FObj (f s)
-  rename t'@(F.FVar _     ) = t'
-  rename (   F.FFunc t0 t1) = F.FFunc (rename t0) (rename t1)
-  rename (   F.FAbs  x  t') = F.FAbs x (rename t')
-  rename t'@(F.FTC _      ) = t'
-  rename (   F.FApp t0 t1 ) = F.FApp (rename t0) (rename t1)
-
+  hasValueArgument (RAllT _ rest _) = hasValueArgument rest
+  hasValueArgument (RAllP _ rest) = hasValueArgument rest
+  hasValueArgument RFun{} = True
+  hasValueArgument _ = False
 
 -- | Embed fixpoint expressions into parsed haskell expressions.
 --   It allows us to bypass the GHC parser and use arbitrary symbols
 --   for identifiers (compared to using the string API)
-fixExprToHsExpr :: S.HashSet F.Symbol -> F.Expr -> LHsExpr GhcPs
-fixExprToHsExpr _ (F.ECon c) = constantToHsExpr c
-fixExprToHsExpr env (F.EVar x)
-  | x == F.symbol (show '[]) =  GM.notracePpr "Empty" $ nlHsVar (mkVarUnqual (mkFastString "[]"))
-  | x == F.symbol (show '(:)) = GM.notracePpr "Cons" $ nlHsVar (mkVarUnqual (mkFastString ":"))
-  | otherwise = GM.notracePpr "Var" $ nlHsVar (symbolToRdrName env x)
-fixExprToHsExpr env (F.EApp e0 e1) =
-  mkHsApp (fixExprToHsExpr env e0) (fixExprToHsExpr env e1)
-fixExprToHsExpr env (F.ENeg e) =
-  mkHsApp (nlHsVar (nameRdrName negateName)) (fixExprToHsExpr env e)
-
-fixExprToHsExpr env (F.EBin bop e0 e1) = mkHsApp
-  (mkHsApp (bopToHsExpr bop) (fixExprToHsExpr env e0))
-  (fixExprToHsExpr env e1)
-fixExprToHsExpr env (F.EIte p e0 e1) = nlHsIf (fixExprToHsExpr env p)
-                                              (fixExprToHsExpr env e0)
-                                              (fixExprToHsExpr env e1)
-
--- FIXME: convert sort to HsType
--- This is currently not doable because how do we know if FInt corresponds to
--- Int or Integer?
-fixExprToHsExpr env (F.ECst e0 _    ) = fixExprToHsExpr env e0
--- fixExprToHsExpr env (F.PAnd []      ) = nlHsVar true_RDR
-fixExprToHsExpr _ (F.PAnd []      ) = nlHsVar true_RDR
-fixExprToHsExpr env (F.PAnd (e : es)) = L.foldr f (fixExprToHsExpr env e) es
- where
-  f x acc = mkHsApp (mkHsApp (nlHsVar and_RDR) (fixExprToHsExpr env x)) acc
-
--- This would work in the latest commit
--- fixExprToHsExpr env (F.PAnd es  ) = mkHsApp
---   (nlHsVar (varQual_RDR dATA_FOLDABLE (fsLit "and")))
---   (nlList $ fixExprToHsExpr env <$> es)
-fixExprToHsExpr env (F.POr es) = mkHsApp
-  (nlHsVar (varQual_RDR foldableModule (fsLit "or")))
-  (nlList $ fixExprToHsExpr env <$> es)
-fixExprToHsExpr env (F.PIff e0 e1) = mkHsApp
-  (mkHsApp (nlHsVar (mkVarUnqual (mkFastString "<=>"))) (fixExprToHsExpr env e0)
-  )
-  (fixExprToHsExpr env e1)
-fixExprToHsExpr env (F.PNot e) =
-  mkHsApp (nlHsVar not_RDR) (fixExprToHsExpr env e)
-fixExprToHsExpr env (F.PAtom brel e0 e1) = mkHsApp
-  (mkHsApp (brelToHsExpr brel) (fixExprToHsExpr env e0))
-  (fixExprToHsExpr env e1)
-fixExprToHsExpr env (F.PImp e0 e1) = mkHsApp
-  (mkHsApp (nlHsVar (mkVarUnqual (mkFastString "==>"))) (fixExprToHsExpr env e0)
-  )
-  (fixExprToHsExpr env e1)
-
-fixExprToHsExpr _ e =
-  todo Nothing ("toGhcExpr: Don't know how to handle " ++ show e)
-
-constantToHsExpr :: F.Constant -> LHsExpr GhcPs
--- constantToHsExpr (F.I c) = noLoc (HsLit NoExt (HsInt NoExt (mkIntegralLit c)))
-constantToHsExpr (F.I i) =
-  noLocA $ mkHsOverLit (mkHsIntegral (mkIntegralLit i))
-constantToHsExpr (F.R d) =
-  noLocA $ mkHsOverLit (mkHsFractional (mkTHFractionalLit (toRational d)))
-constantToHsExpr _ =
-  todo Nothing "constantToHsExpr: Not sure how to handle constructor L"
-
--- This probably won't work because of the qualifiers
-bopToHsExpr :: F.Bop -> LHsExpr GhcPs
-bopToHsExpr bop = noLocA (HsVar Ghc.noExtField (noLocA (f bop)))
- where
-  f F.Plus   = plus_RDR
-  f F.Minus  = minus_RDR
-  f F.Times  = times_RDR
-  f F.Div    = mkVarUnqual (fsLit "/")
-  f F.Mod    = GM.prependGHCRealQual (fsLit "mod")
-  f F.RTimes = times_RDR
-  f F.RDiv   = GM.prependGHCRealQual (fsLit "/")
-
-brelToHsExpr :: F.Brel -> LHsExpr GhcPs
-brelToHsExpr brel = noLocA (HsVar Ghc.noExtField (noLocA (f brel)))
- where
-  f F.Eq = eq_RDR
-  f F.Gt = gt_RDR
-  f F.Lt = lt_RDR
-  f F.Ge = ge_RDR
-  f F.Le = le_RDR
-  f F.Ne = case Ghc.thRdrNameGuesses False '(/=) of
-    [] -> impossible Nothing "brelToExpr: Could not find (/=) in GHC"
-    [x] -> x
-    _ -> impossible Nothing "brelToExpr: Found multiple (/=) in GHC"
-  f _    = impossible Nothing "brelToExpr: Unsupported operation"
-
 symbolToRdrNameNs :: NameSpace -> F.Symbol -> RdrName
 symbolToRdrNameNs ns x
   | F.isNonSymbol modName = mkUnqual ns (mkFastString (F.symbolString s))
@@ -693,52 +1138,3 @@ symbolToRdrNameNs ns x
 
 varSymbolToRdrName :: F.Symbol -> RdrName
 varSymbolToRdrName = symbolToRdrNameNs varName
-
-
--- don't use this function...
-symbolToRdrName :: S.HashSet F.Symbol -> F.Symbol -> RdrName
-symbolToRdrName env x
-  | F.isNonSymbol modName = mkUnqual ns (mkFastString (F.symbolString s))
-  | otherwise = mkQual
-    ns
-    (mkFastString (F.symbolString modName), mkFastString (F.symbolString s))
- where
-  (modName, s) = GM.splitModuleName x
-  ns | not (S.member x env), Just (c, _) <- F.unconsSym s, isUpper c = dataName
-     | otherwise = varName
-
-
-specTypeToLHsType :: SpecType -> LHsType GhcPs
--- surprised that the type application is necessary
-specTypeToLHsType = \case
-    RVar (RTV tv) _ -> nlHsTyVar
-      NotPromoted
-      -- (GM.notracePpr ("varRdr" ++ F.showpp (F.symbol tv)) $ getRdrName tv)
-      (symbolToRdrNameNs tvName (F.symbol tv))
-    RFun _ _ tin tout _
-      | isClassType tin -> noLocA $ HsQualTy Ghc.noExtField (noLocA [specTypeToLHsType tin]) (specTypeToLHsType tout)
-      | otherwise       -> nlHsFunTy (specTypeToLHsType tin) (specTypeToLHsType tout)
-    RAllT (ty_var_value -> (RTV tv)) t _ -> noLocA $ HsForAllTy
-      Ghc.noExtField
-      (mkHsForAllInvisTele noAnn
-        [ noLocA $
-            Ghc.HsTvb
-              noAnn
-              Ghc.SpecifiedSpec
-              (Ghc.HsBndrVar Ghc.noExtField (noLocA $ symbolToRdrNameNs tvName (F.symbol tv)))
-              (Ghc.HsBndrNoKind Ghc.noExtField)
-        ]
-      )
-      (specTypeToLHsType t)
-    RAllP _ ty -> specTypeToLHsType ty
-    RApp RTyCon { rtc_tc = tc } ts _ _ -> mkHsTyConApp
-      (getRdrName tc)
-      [ specTypeToLHsType t | t <- ts, notExprArg t ]
-    REx _ tin tout -> nlHsFunTy (specTypeToLHsType tin) (specTypeToLHsType tout)
-    RAppTy _ (RExprArg _) _ ->
-      impossible Nothing "RExprArg should not appear here"
-    RAppTy t t' _ -> nlHsAppTy (specTypeToLHsType t) (specTypeToLHsType t')
-    RRTy _ _ _ t -> specTypeToLHsType t
-    RHole _ -> noLocA $ HsWildCardTy Ghc.noAnn
-    RExprArg _ ->
-      todo Nothing "Oops, specTypeToLHsType doesn't know how to handle RExprArg"

@@ -13,6 +13,7 @@ module Language.Haskell.Liquid.Bare.Measure
   , makeHaskellDataDecls
   , makeMeasureSelectors
   , makeMeasureSpec
+  , resolveMeasureSpec
   , makeMeasureSpec'
   , makeOpaqueReflMeasures
   , getReflDCs
@@ -44,6 +45,7 @@ import qualified Language.Haskell.Liquid.GHC.Misc      as GM
 import           Language.Haskell.Liquid.Types.DataDecl
 import           Language.Haskell.Liquid.Types.Errors
 import           Language.Haskell.Liquid.Types.Names
+import           Language.Haskell.Liquid.Types.PredType (dataConRuntimeFields)
 import qualified Language.Haskell.Liquid.Types.RefType as RT
 import           Language.Haskell.Liquid.Types.RType
 import           Language.Haskell.Liquid.Types.RTypeOp
@@ -65,37 +67,37 @@ import GHC.Base (Int(I#))
 
 --------------------------------------------------------------------------------
 makeHaskellMeasures :: Config -> GhcSrc -> Bare.TycEnv -> LogicMap -> Ms.BareSpec
-                    -> [Measure (Located BareType) (Located LHName)]
+                    -> ([Measure (Located BareType) (Located LHName)], LogicSupport)
 --------------------------------------------------------------------------------
 makeHaskellMeasures cfg src tycEnv lmap spec
-          = Bare.measureToBare <$> ms
+          = (Bare.measureToBare <$> ms, concat support)
   where
-    ms    = makeMeasureDefinition cfg tycEnv lmap cbs <$> mSyms
+    (ms, support) = unzip $ makeMeasureDefinition cfg tycEnv lmap cbs <$> mSyms
     cbs   = Ghc.flattenBinds (_giCbs src)
     mSyms = S.toList (Ms.hmeas spec)
 
 makeMeasureDefinition
   :: Config -> Bare.TycEnv -> LogicMap -> [(Ghc.Id, Ghc.CoreExpr)] -> Located LHName
-  -> Measure LocSpecType Ghc.DataCon
+  -> (Measure LocSpecType Ghc.DataCon, LogicSupport)
 makeMeasureDefinition cfg tycEnv lmap cbs x =
   case L.find ((x ==) . makeGHCLHNameLocatedFromId . fst) cbs of
     Nothing ->
       Ex.throw $
         errHMeas x "Cannot extract measure from haskell function"
-    Just (v, cexp) -> Ms.mkM vx vinfo mdef MsLifted (makeUnSorted allowTC (Ghc.varType v) mdef)
+    Just (v, cexp) -> (Ms.mkM vx vinfo mdef MsLifted (makeUnSorted allowTC (Ghc.varType v) mdef), support)
                      where
                        vx           = reflectLHName (Ghc.nameModule $ Ghc.getName v) <$> x
-                       mdef         = coreToDef' cfg tycEnv lmap vx v cexp
+                       (mdef, support) = coreToDef' cfg tycEnv lmap vx v cexp
                        vinfo        = GM.varLocInfo (logicType allowTC) v
 
     where allowTC = typeclass cfg
 
 makeUnSorted :: Bool -> Ghc.Type -> [Def LocSpecType Ghc.DataCon] -> UnSortedExprs
-makeUnSorted allowTC ty defs
-  | isMeasureType ta
-  = mempty
-  | otherwise
-  = map defToUnSortedExpr defs
+makeUnSorted _allowTC ty defs
+    | isMeasureType ta =
+        mempty
+    | otherwise =
+        map defToUnSortedExpr defs
   where
     ta = go $ Ghc.expandTypeSynonyms ty
 
@@ -112,38 +114,42 @@ makeUnSorted allowTC ty defs
        Ms.bodyPred (F.eApps (F.EVar $ lhNameToResolvedSymbol $ F.val $ measure defn) [F.expr xx]) (body defn))
 
     xx = F.vv $ Just 10000
-    isErasable = if allowTC then GM.isEmbeddedDictType else Ghc.isClassPred
+    isErasable = GM.isEmbeddedDictType
 
 coreToDef' :: Config -> Bare.TycEnv -> LogicMap -> Located LHName -> Ghc.Var -> Ghc.CoreExpr
-           -> [Def LocSpecType Ghc.DataCon]
+           -> ([Def LocSpecType Ghc.DataCon], LogicSupport)
 coreToDef' cfg tycEnv lmap vx v defn =
-  case runToLogic embs lmap dm cfg (errHMeas vx) (coreToDef vx v defn) of
-    Right l -> l
+  case runToLogic (Bare.tcConstructorBoxes tycEnv) embs lmap dm cfg (errHMeas vx) (coreToDef vx v defn) of
+    Right (definitions, support) -> (definitions, retainLogicSupport (S.unions $ map freeDefinition definitions) support)
     Left e  -> Ex.throw e
   where
     embs    = Bare.tcEmbs       tycEnv
     dm      = Bare.tcDataConMap tycEnv
+    freeDefinition definition =
+      (F.syms (body definition) `S.union` S.unions (map (F.syms . val) (Mb.catMaybes (dsort definition : map snd (binds definition)))))
+        `S.difference` S.fromList (map fst (binds definition))
 
 errHMeas :: Located LHName -> String -> Error
 errHMeas x str = ErrHMeas (GM.sourcePosSrcSpan $ loc x) (pprint $ val x) (text str)
 
 --------------------------------------------------------------------------------
-makeHaskellInlines :: Config -> GhcSrc -> F.TCEmb Ghc.TyCon -> LogicMap -> Ms.BareSpec
-                   -> [(LocSymbol, LMap)]
+makeHaskellInlines :: M.HashMap Ghc.DataCon ConstructorBox -> Config -> GhcSrc -> F.TCEmb Ghc.TyCon -> LogicMap -> Ms.BareSpec
+                   -> ([(LocSymbol, LMap)], LogicSupport)
 --------------------------------------------------------------------------------
-makeHaskellInlines cfg src embs lmap spec
-         = makeMeasureInline cfg embs lmap cbs <$> inls
+makeHaskellInlines boxes cfg src embs lmap spec
+         = (values, concat support)
   where
     cbs  = Ghc.flattenBinds (_giCbs src)
     inls = S.toList        (Ms.inlines spec)
+    (values, support) = unzip $ makeMeasureInline boxes cfg embs lmap cbs <$> inls
 
 makeMeasureInline
-  :: Config -> F.TCEmb Ghc.TyCon -> LogicMap -> [(Ghc.Id, Ghc.CoreExpr)] -> Located LHName
-  -> (LocSymbol, LMap)
-makeMeasureInline cfg embs lmap cbs x =
+  :: M.HashMap Ghc.DataCon ConstructorBox -> Config -> F.TCEmb Ghc.TyCon -> LogicMap -> [(Ghc.Id, Ghc.CoreExpr)] -> Located LHName
+  -> ((LocSymbol, LMap), LogicSupport)
+makeMeasureInline boxes cfg embs lmap cbs x =
   case L.find ((val x ==) . makeGHCLHNameFromId . fst) cbs of
     Nothing        -> Ex.throw $ errHMeas x "Cannot inline haskell function"
-    Just (v, defn) -> (vx, coreToFun' cfg embs Nothing lmap vx v defn ok)
+    Just (v, defn) -> let (meaning, support) = coreToFun' boxes cfg embs Nothing lmap vx v defn ok in ((vx, meaning), support)
                      where
                        vx         = F.atLoc x (F.symbol v)
                        ok (xs, e) = LMap vx (F.symbol <$> xs) (either id id e)
@@ -153,11 +159,13 @@ makeMeasureInline cfg embs lmap cbs x =
 --   but NOT when lifting inlines (which do not have case-of).
 --   For details, see [NOTE:Lifting-Stages]
 
-coreToFun' :: Config -> F.TCEmb Ghc.TyCon -> Maybe Bare.DataConMap -> LogicMap -> LocSymbol -> Ghc.Var -> Ghc.CoreExpr
-           -> (([Ghc.Var], Either F.Expr F.Expr) -> a) -> a
-coreToFun' cfg embs dmMb lmap x v defn ok = either Ex.throw ok act
+coreToFun' :: M.HashMap Ghc.DataCon ConstructorBox -> Config -> F.TCEmb Ghc.TyCon -> Maybe Bare.DataConMap -> LogicMap -> LocSymbol -> Ghc.Var -> Ghc.CoreExpr
+           -> (([Ghc.Var], Either F.Expr F.Expr) -> a) -> (a, LogicSupport)
+coreToFun' boxes cfg embs dmMb lmap x v defn ok = either Ex.throw complete act
   where
-    act  = runToLogic embs lmap dm cfg err xFun
+    complete (value@(owners, meaning), support) =
+      (ok value, retainLogicSupport (F.syms (either id id meaning) `S.difference` S.fromList (map F.symbol owners)) support)
+    act  = runToLogic boxes embs lmap dm cfg err xFun
     xFun = coreToFun x v defn
     err  str = ErrHMeas (GM.sourcePosSrcSpan $ loc x) (pprint $ val x) (text str)
     dm   = Mb.fromMaybe mempty dmMb
@@ -255,35 +263,38 @@ dataConDecl d     = {- F.notracepp msg $ -} DataCtor dx (F.symbol <$> as) [] xts
 --------------------------------------------------------------------------------
 
 makeMeasureSelectors :: Config -> Bare.DataConMap -> Located DataConP -> [Measure SpecType Ghc.DataCon]
-makeMeasureSelectors cfg dm (Loc l l' c)
-  = checker : Mb.mapMaybe go' fields --  internal measures, needed for reflection
- ++ Misc.condNull autofields (Mb.mapMaybe go fields) --  user-visible measures.
-  where
-    dc         = dcpCon    c
-    isGadt     = dcpIsGadt c
-    xts        = dcpTyArgs c
-    autofields = not isGadt
-    go ((x, t), i)
-      -- do not make selectors for functional fields
-      | isFunTy t && not (higherOrderFlag cfg)
-      = Nothing
-      | otherwise
+makeMeasureSelectors cfg dm (Loc l l' c) =
+  checker
+    : Mb.mapMaybe go' fields --  internal measures, needed for reflection
+    ++ Misc.condNull autofields (Mb.mapMaybe go userFields) --  user-visible measures.
+ where
+  dc = dcpCon c
+  isGadt = dcpIsGadt c
+  xts = dcpTyArgs c
+  autofields = not isGadt
+  go ((x, t), i)
+    -- do not make selectors for functional fields
+    | isFunTy t && not (higherOrderFlag cfg) =
+        Nothing
+    | otherwise =
         -- TODO: Use as origin module the module where the measure is created
-      = Just $ makeMeasureSelector (Loc l l' x) (projT i) dc n i
+        Just $ makeMeasureSelector (Loc l l' x) (projT i) dc n i
 
-    go' ((_,t), i)
-      -- do not make selectors for functional fields
-      | isFunTy t && not (higherOrderFlag cfg)
-      = Nothing
-      | otherwise
-      = Just $ makeMeasureSelector (Loc l l' (makeGeneratedLogicLHName $ Bare.makeDataConSelector (Just dm) dc i)) (projT i) dc n i
+  go' ((_, t), i)
+    -- do not make selectors for functional fields
+    | isFunTy t && not (higherOrderFlag cfg) =
+        Nothing
+    | otherwise =
+        Just $ makeMeasureSelector (Loc l l' (makeGeneratedLogicLHName $ Bare.makeDataConSelector (Just dm) dc i)) (projT i) dc n i
 
-    fields   = zip (reverse xts) [1..]
-    n        = length xts
-    checker  = makeMeasureChecker (Loc l l' (makeGeneratedLogicLHName $ Bare.makeDataConChecker dc)) checkT dc n
-    projT i  = dataConSel permitTC dc n (Proj i)
-    checkT   = dataConSel permitTC dc n Check
-    permitTC = typeclass cfg
+  runtimeFields = dataConRuntimeFields c
+  fields = zip runtimeFields [1 ..]
+  userFields = drop (n - length xts) fields
+  n = length runtimeFields
+  checker = makeMeasureChecker (Loc l l' (makeGeneratedLogicLHName $ Bare.makeDataConChecker dc)) checkT dc n
+  projT i = dataConSel permitTC dc n (Proj i)
+  checkT = dataConSel permitTC dc n Check
+  permitTC = typeclass cfg
 
 dataConSel :: Bool -> Ghc.DataCon -> Int -> DataConSel -> SpecType
 dataConSel permitTC dc n Check    = mkArrow (map (, mempty) as) [] [xt] bareBool
@@ -298,21 +309,14 @@ dataConSel permitTC dc n (Proj i) = mkArrow (map (, mempty) as) [] [xt] (mempty 
 
 -- bkDataCon :: DataCon -> Int -> ([SpecRTVar], [SpecType], (Symbol, SpecType, RReft))
 bkDataCon :: (PPrint r, IsReft r) => Bool -> Ghc.DataCon -> Int -> ([SpecRTVar], [RRType r], (F.Symbol, RFInfo, RRType r, r))
-bkDataCon permitTC dcn nFlds  = (as, ts, (F.dummySymbol, classRFInfo permitTC, t, trueReft))
+bkDataCon permitTC dcn nFlds = (as, ts, (F.dummySymbol, classRFInfo permitTC, t, trueReft))
   where
-    ts                = RT.ofType <$> Misc.takeLast nFlds _ts
-    _ts = if permitTC && Ghc.isClassTyCon (Ghc.dataConTyCon dcn) then dicts ++ ts1 else ts1
+    ts = RT.ofType <$> Misc.takeLast nFlds _ts
+    _ts = filter (not . GM.isEmbeddedDictType) dicts ++ ts1
     ts1 = map Ghc.irrelevantMult ts0
-    t                 = -- Misc.traceShow ("bkDataConResult" ++ GM.showPpr (dc, _t, _t0)) $
-                          RT.ofType  $ Ghc.mkTyConApp tc tArgs'
-    as                = makeRTVar . RT.rTyVar <$> (αs ++ αs')
-    ((αs,αs',_,dicts,ts0,_t), _t0) = hammer dcn
-    tArgs'            = take (nArgs - nVars) tArgs ++ (Ghc.mkTyVarTy <$> αs)
-    nVars             = length αs
-    nArgs             = length tArgs
-    (tc, tArgs)       = Mb.fromMaybe err (Ghc.splitTyConApp_maybe _t)
-    err               = GM.namedPanic dcn ("Cannot split result type of DataCon " ++ show dcn)
-    hammer dc         = (Ghc.dataConFullSig dc, Ghc.varType . Ghc.dataConWorkId $ dc)
+    t = RT.ofType $ Ghc.mkFamilyTyConApp (Ghc.dataConTyCon dcn) (Ghc.mkTyVarTy <$> αs)
+    as = makeRTVar . RT.rTyVar <$> (αs ++ αs')
+    (αs, αs', _, dicts, ts0, _) = Ghc.dataConFullSig dcn
 
 data DataConSel = Check | Proj Int
 
@@ -337,31 +341,31 @@ makeMeasureSelector x s dc n i = M { msName = x, msSort = s, msEqns = [eqn], msK
 
 makeMeasureChecker :: Located LHName -> SpecType -> Ghc.DataCon -> Int -> Measure SpecType Ghc.DataCon
 makeMeasureChecker x s0 dc n = M { msName = x, msSort = s, msEqns = eqn : (eqns <$> filter (/= dc) dcs), msKind = MsChecker, msUnSorted = mempty }
-  where
-    s       = F.notracepp ("makeMeasureChecker: " ++ show x) s0
-    eqn     = Def x dc Nothing ((, Nothing) . mkx <$> [1 .. n])       (P F.PTrue)
-    eqns d  = Def x d  Nothing ((, Nothing) . mkx <$> [1 .. nArgs d]) (P F.PFalse)
-    nArgs d = length (Ghc.dataConOrigArgTys d)
-    mkx j   = F.symbol ("xx" ++ show j)
-    dcs     = Ghc.tyConDataCons (Ghc.dataConTyCon dc)
-
+ where
+  s = F.notracepp ("makeMeasureChecker: " ++ show x) s0
+  eqn = Def x dc Nothing ((,Nothing) . mkx <$> [1 .. n]) (P F.PTrue)
+  eqns d = Def x d Nothing ((,Nothing) . mkx <$> [1 .. nArgs d]) (P F.PFalse)
+  nArgs d =
+    length (filter (not . GM.isEmbeddedDictType) (Ghc.dataConTheta d))
+      + length (Ghc.dataConOrigArgTys d)
+  mkx j = F.symbol ("xx" ++ show j)
+  dcs = Ghc.tyConDataCons (Ghc.dataConTyCon dc)
 
 ----------------------------------------------------------------------------------------------
-makeMeasureSpec' :: Bool -> MSpec SpecType Ghc.DataCon -> ([(Ghc.Var, SpecType)], [(Located LHName, RRType F.Reft)])
+makeMeasureSpec' :: (Ghc.CoreExpr -> (F.Expr, LogicSupport)) -> M.HashMap Ghc.DataCon Ms.ConstructorBox -> Bool -> MSpec SpecType Ghc.DataCon -> (([(Ghc.Var, SpecType)], [(Located LHName, RRType F.Reft)]), LogicSupport)
 ----------------------------------------------------------------------------------------------
-makeMeasureSpec' allowTC mspec0 = (ctorTys, measTys)
+makeMeasureSpec' interpret boxes allowTC mspec0 = ((ctorTys, measTys), support)
   where
-    ctorTys             = fmap RT.uRType <$> ctorTys0
-    (ctorTys0, measTys) = Ms.dataConTypes allowTC mspec
-    mspec               = first (mapReft ur_reft) mspec0
+    ctorTys = fmap RT.uRType <$> ctorTys0
+    ((ctorTys0, measTys), support) = Ms.dataConTypes interpret boxes allowTC mspec
+    mspec = first (mapReft ur_reft) (Ms.constructorEquationSchemas mspec0)
 
 ----------------------------------------------------------------------------------------------
 makeMeasureSpec :: Bare.Env -> Bare.SigEnv -> ModName -> (ModName, Ms.BareSpec) ->
-                   Bare.Lookup (Ms.MSpec SpecType Ghc.DataCon)
+                   Ms.MSpec SpecType (Located LHName)
 ----------------------------------------------------------------------------------------------
 makeMeasureSpec env sigEnv myName (name, spec)
-  = mkMeasureDCon env
-  . mkMeasureSort env
+  = mkMeasureSort env
   . first val
   . bareMSpec     env sigEnv myName name
   $ spec
@@ -423,9 +427,9 @@ getReflDCs measEnv vars = dcsUndefinedInLogic
 -- Returns the corresponding measures. Second part of the returned tuple is the information to save
 -- to the `meOpaqueRefl` field of the measure environment.
 makeOpaqueReflMeasures :: Bare.Env -> Bare.MeasEnv -> Bare.ModSpecs ->
-              [(Ghc.Var, LocSpecType, F.Equation)] ->
+              [(Ghc.Var, LocSpecType, F.Equation)] -> LogicSupport ->
               ([MSpec SpecType Ghc.DataCon], [(Ghc.Var, Measure LocBareType ctor)])
-makeOpaqueReflMeasures env measEnv specs eqs =
+makeOpaqueReflMeasures env measEnv specs eqs support =
   unzip $ createMeasureForVar <$> S.toList (varsUndefinedInLogic `S.union` requestedOpaqueRefl)
   where
     thisModule = Ghc.tcg_mod (Bare.reTcGblEnv env)
@@ -441,9 +445,7 @@ makeOpaqueReflMeasures env measEnv specs eqs =
         `S.union` S.fromList [F.eqName eq | (_, _, eq) <- eqs]
     undefinedInLogic v = not (S.member (F.symbol v) definedSymbols)
     -- Variables to consider
-    varsUndefinedInLogic = S.unions $
-      S.filter undefinedInLogic .
-      (\(v, _, eq) -> getFreeVarsOfReflectionOfVar v eq) <$> eqs
+    varsUndefinedInLogic = S.filter undefinedInLogic (S.fromList (map fst support))
     -- Main function: creates a (dummy) measure about a given variable
     createMeasureForVar :: Ghc.Var -> (MSpec SpecType Ghc.DataCon, (Ghc.Var, Measure LocBareType ctor))
     createMeasureForVar var =
@@ -461,20 +463,6 @@ getUnfoldingOfVar = getExpr . Ghc.realUnfoldingInfo . Ghc.idInfo
     getExpr :: Ghc.Unfolding -> Maybe Ghc.CoreExpr
     getExpr (Ghc.CoreUnfolding expr _ _ _ _) = Just expr
     getExpr _ = Nothing
-
--- Get the set of "free" symbols in the (reflection of the) unfolding of a given variable.
--- Free symbols are those that are not already in the logic and that appear in
--- the reflection of the unfolding.
--- For this purpose, you need to give the variable naming the definition to reflect
--- and its corresponding equation in the logic.
-getFreeVarsOfReflectionOfVar  :: Ghc.Var -> F.Equation -> S.HashSet Ghc.Var
-getFreeVarsOfReflectionOfVar var eq =
-    S.filter (\v -> F.symbol v `S.member` freeSymbolsInReflectedBody) freeVarsInCoreExpr
-  where
-    reflExpr = getUnfoldingOfVar var
-    getAllFreeVars = Ghc.exprSomeFreeVarsList (const True)
-    freeVarsInCoreExpr = maybe S.empty (S.fromList . getAllFreeVars) reflExpr
-    freeSymbolsInReflectedBody = F.exprSymbolsSet (F.eqBody eq)
 
 -- Collect all the DataCon that appear in the unfolding of a given variable.
 getDCsOfUnfoldingOfVars :: [Ghc.Var] -> S.HashSet Ghc.DataCon
@@ -515,8 +503,8 @@ bareMSpec env sigEnv myName name spec = Ms.mkMSpec ms cms ims oms
     inScope z = F.notracepp ("inScope1: " ++ F.showpp (msName z)) (force ||  okSort z)
     okSort     = Bare.knownGhcType env . msSort
 
-mkMeasureDCon :: Bare.Env -> Ms.MSpec t (F.Located LHName) -> Bare.Lookup (Ms.MSpec t Ghc.DataCon)
-mkMeasureDCon env m = do
+resolveMeasureSpec :: Bare.Env -> Ms.MSpec t (F.Located LHName) -> Bare.Lookup (Ms.MSpec t Ghc.DataCon)
+resolveMeasureSpec env m = do
   let ns = measureCtors m
   dcs   <- mapM (Bare.lookupGhcDataConLHName env) ns
   return $ mkMeasureDCon_ m (zip (val <$> ns) dcs)
@@ -526,9 +514,42 @@ mkMeasureDCon env m = do
 --     symDC                = Bare.lookupGhcDataCon env name "measure-datacon"
 
 mkMeasureDCon_ :: Ms.MSpec t (F.Located LHName) -> [(LHName, Ghc.DataCon)] -> Ms.MSpec t Ghc.DataCon
-mkMeasureDCon_ m ndcs = fmap (tx . val) m
-  where
-    tx                = Misc.mlookup (M.fromList ndcs)
+mkMeasureDCon_ m ndcs =
+  resolved
+    { Ms.ctorMap = map closeDef <$> Ms.ctorMap resolved
+    , Ms.measMap = closeMeasure <$> Ms.measMap resolved
+    , Ms.imeas = closeMeasure <$> Ms.imeas resolved
+    }
+ where
+  tx = Misc.mlookup (M.fromList ndcs)
+  resolved = fmap (tx . val) m
+  authored =
+    S.fromList
+      [ F.val (msName measure)
+      | measure <- M.elems (Ms.measMap resolved) ++ Ms.imeas resolved
+      , msKind measure == MsMeasure
+      ]
+  closeMeasure measure = measure{msEqns = closeDef <$> msEqns measure}
+
+  -- Authored constructor patterns bind explicit source fields. Unlike Core
+  -- equations and generated selectors, they cannot name implicit theta.
+  -- Elaborate those invisible value coordinates before the common pipeline.
+  closeDef :: Def t Ghc.DataCon -> Def t Ghc.DataCon
+  closeDef definition
+    | F.val (measure definition) `S.member` authored
+    , not (null context) =
+        if length (binds definition) == length (Ghc.dataConOrigArgTys dc)
+          then definition{binds = map (,Nothing) hidden ++ binds definition}
+          else
+            panic
+              (Just $ GM.fSrcSpan $ measure definition)
+              "Authored measure pattern disagrees with constructor source fields"
+    | otherwise = definition
+   where
+    dc = ctor definition
+    context = filter (not . GM.isEmbeddedDictType) (Ghc.dataConTheta dc)
+    candidates = [F.intSymbol (F.symbol dc) i | i <- [1 .. length context]]
+    (_, hidden) = F.freshInNSL candidates (F.syms definition)
 
 measureCtors ::  Ms.MSpec t (F.Located LHName) -> [F.Located LHName]
 measureCtors = Misc.sortNub . fmap ctor . concat . M.elems . Ms.ctorMap
@@ -645,4 +666,3 @@ capitalizeBound = fmap (symbol . toUpperHead . symbolString)
     toUpperHead (x:xs) = toUpper x:xs
 
 -}
-

@@ -23,13 +23,17 @@ module  Language.Haskell.Liquid.GHC.Misc where
 
 import           Data.String
 import qualified Data.List as L
-import           Data.Word (Word64)
+import           Data.Word (Word8, Word64)
+import qualified Data.Binary as B
 import           Debug.Trace
 
 import           Prelude                                    hiding (error)
 import           Liquid.GHC.API            as Ghc hiding
   (L, get, line, sourceName, showPpr, panic, showSDoc)
 import qualified Liquid.GHC.API            as Ghc (GenLocated (L))
+import           GHC.Tc.Gen.Expr                            (tcCheckPolyExpr)
+import           GHC.Tc.Solver                              (simplifyTop)
+import           GHC.Types.Literal                          (LitNumType(LitNumBigNat))
 
 
 import           Data.Char                                  (isDigit, isLower, isSpace, isUpper)
@@ -63,6 +67,24 @@ mkAlive x
   = setIdInfo x (setOccInfo (idInfo x) noOccInfo)
   | otherwise
   = x
+
+-- Inverse of GHC.Core.Make.mkIntegerExpr on its closed canonical forms.
+-- A BigNat literal is a ByteArray# payload, not itself an integer value.
+integerLiteral :: Maybe Int -> CoreExpr -> Maybe Integer
+integerLiteral (Just bits) (App (Var constructor) (Lit (LitNumber kind magnitude)))
+  | bits == 32 || bits == 64
+  , let half = (2 :: Integer) ^ (bits - 1)
+  = case kind of
+      LitNumInt
+        | constructor == dataConWorkId integerISDataCon
+        , negate half <= magnitude, magnitude < half -> Just magnitude
+      LitNumBigNat
+        | constructor == dataConWorkId integerIPDataCon
+        , half <= magnitude -> Just magnitude
+        | constructor == dataConWorkId integerINDataCon
+        , half < magnitude -> Just (negate magnitude)
+      _ -> Nothing
+integerLiteral _ _ = Nothing
 
 
 --------------------------------------------------------------------------------
@@ -122,6 +144,7 @@ isBaseType :: Type -> Bool
 isBaseType (ForAllTy _ _)  = False
 isBaseType (FunTy { ft_arg = t1, ft_res = t2}) = isBaseType t1 && isBaseType t2
 isBaseType (TyVarTy _)     = True
+isBaseType (LitTy _)       = True
 isBaseType (TyConApp _ ts) = all isBaseType ts
 isBaseType (AppTy t1 t2)   = isBaseType t1 && isBaseType t2
 isBaseType _               = False
@@ -427,6 +450,9 @@ instance Symbolic Name where
 
 instance Symbolic Var where   -- TODO:reflect-datacons varSymbol
   symbol v
+    | isId v, DataConWorkId dc <- idDetails v
+    , not (eqType (varType v) (varType (dataConWrapId dc)))
+    = suffixSymbol (exportedVarSymbol v) (symbol (showPpr (getUnique v)))
     | isExternalId v = exportedVarSymbol v
     | otherwise      = localVarSymbol    v
 
@@ -472,6 +498,30 @@ instance NFData TyCon where
 
 instance NFData Type where
   rnf t = seq t ()
+
+-- Type literals carry source identity, not an interned FastString unique.
+instance Show TyLit where
+  show = showPpr . LitTy
+
+instance NFData TyLit where
+  rnf t = seq t ()
+
+instance Hashable TyLit where
+  hashWithSalt salt (NumTyLit n) = hashWithSalt (hashWithSalt salt (0 :: Word8)) n
+  hashWithSalt salt (StrTyLit s) = hashWithSalt (hashWithSalt salt (1 :: Word8)) (bytesFS s)
+  hashWithSalt salt (CharTyLit c) = hashWithSalt (hashWithSalt salt (2 :: Word8)) c
+
+instance B.Binary TyLit where
+  put (NumTyLit n) = B.put (0 :: Word8) >> B.put n
+  put (StrTyLit s) = B.put (1 :: Word8) >> B.put (bytesFS s)
+  put (CharTyLit c) = B.put (2 :: Word8) >> B.put c
+  get = do
+    tag <- B.get
+    case tag :: Word8 of
+      0 -> NumTyLit <$> B.get
+      1 -> StrTyLit . mkFastStringByteString <$> B.get
+      2 -> CharTyLit <$> B.get
+      _ -> fail "Invalid GHC type literal tag"
 
 instance NFData Var where
   rnf t = seq t ()
@@ -564,7 +614,9 @@ isQualifiedSym :: Symbol -> Bool
 isQualifiedSym (symbolText -> x) = isQualified x
 
 isQualified :: T.Text -> Bool
-isQualified y = "." `T.isInfixOf` y
+isQualified y = case T.uncons (stripParens y) of
+    Just (first, rest) -> isUpper first && T.any (== '.') rest
+    Nothing -> False
 
 wrapParens :: (IsString a, Monoid a) => a -> a
 wrapParens x  = "(" `mappend` x `mappend` ")"
@@ -683,7 +735,8 @@ isEmbeddedDictVar v = F.notracepp msg . isEmbeddedDictType . varType $ v
     msg     =  "isGoodCaseBind v = " ++ show v
 
 isEmbeddedDictType :: Type -> Bool
-isEmbeddedDictType = anyF [isOrdPred, isNumericPred, isEqPred, isPrelEqPred]
+-- Equality/coercion proofs have no runtime method. Class dictionaries do.
+isEmbeddedDictType = isEqPred
 
 -- unlike isNumCls, isFracCls, these two don't check if the argument's
 -- superclass is Ord or Num. I believe this is the more predictable behavior
@@ -797,6 +850,32 @@ elabRnExpr rdr_expr = do
         -- be using `collectFunSimple` here, which also looks through casts and
         -- ticks. We use the more conservative `collectArgs` for now.
         return $ fst $ Ghc.collectArgs $ inlineEvidenceLets e
+
+{- | Check a generated predicate against its complete expected telescope.
+Unlike rho inference, this retains the quantified type variables and all
+evidence belonging to that scope in the resulting Core expression.
+-}
+elabRnExprWithType :: LHsExpr GhcPs -> Type -> TcRn CoreExpr
+elabRnExprWithType rdr_expr expected = do
+    (rn_expr, _fvs) <- rnLExpr rdr_expr
+    failIfErrsM
+    (tc_expr, wanted) <- captureTopConstraints $ tcCheckPolyExpr rn_expr expected
+    evbs <- simplifyTop wanted
+    failIfErrsM
+    full_expr <- zonkTopLExpr (mkHsDictLet (EvBinds evbs) tc_expr)
+    (ds_msgs, me) <- initDsTc $ dsLExpr full_expr
+    logger <- getLogger
+    diag_opts <- initDiagOpts <$> getDynFlags
+    print_config <- initDsMessageOpts <$> getDynFlags
+    liftIO $ printMessages logger print_config diag_opts ds_msgs
+    case me of
+        Nothing -> failM
+        Just e -> do
+            when (errorsOrFatalWarningsFound ds_msgs) failM
+            let result = inlineEvidenceLets e
+            if exprType result `eqType` expected
+                then pure result
+                else panic Nothing "Generated predicate elaboration changed its expected type"
 
 -- | inlineEvidenceLets will check traverse a Core expression and inline
 --   the definition of let bindings which serve as evidence variables.

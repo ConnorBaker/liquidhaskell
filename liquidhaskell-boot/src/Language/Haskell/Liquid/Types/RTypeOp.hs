@@ -337,6 +337,7 @@ instance ( F.Subable r
       go (REx x t1 t2) =
         -- x scopes over t2 only
         F.syms t1 `S.union` S.delete x (F.syms t2)
+      go (RLit _) = S.empty
       go (RExprArg e) = F.syms e
       go (RAppTy t1 t2 r) =
         deletev r (F.syms t1 `S.union` F.syms t2)
@@ -439,6 +440,7 @@ instance ( F.Subable r
         -- v0 (reft binder of r) scopes over t1 and t2.
         let (s', su', r') = substReft r s su
         in RAppTy (go s' su' t1) (go s' su' t2) r'
+      go _ _ (RLit l) = RLit l
       go s su (RExprArg e) = RExprArg (F.substr s su <$> e)
       go s su (RRTy env r o t) =
           let ((s', su'), env') = substEnv s su env
@@ -480,6 +482,7 @@ emapReft f γ (RAllP π t)       = RAllP π (emapReft f γ t)
 emapReft f γ (RFun x i t t' r) = RFun  x i (emapReft f γ t) (emapReft f (x:γ) t') (f (x:γ) r)
 emapReft f γ (RApp c ts rs r)  = RApp  c (emapReft f γ <$> ts) (emapRef f γ <$> rs) (f γ r)
 emapReft f γ (REx z t t')      = REx   z (emapReft f γ t) (emapReft f γ t')
+emapReft _ _ (RLit l)          = RLit l
 emapReft _ _ (RExprArg e)      = RExprArg e
 emapReft f γ (RAppTy t t' r)   = RAppTy (emapReft f γ t) (emapReft f γ t') (f γ r)
 emapReft f γ (RRTy e r o t)    = RRTy  (fmap (emapReft f γ) <$> e) (f γ r) o (emapReft f γ t)
@@ -502,6 +505,7 @@ mapRTypeV f (RApp c ts rs r)  = RApp c (mapRTypeV f <$> ts) (mapRefV <$> coerce 
   where
     mapRefV (RProp ss t) = RProp (map (fmap (mapRTypeV f)) ss) (mapRTypeV f t)
 mapRTypeV f (REx z t t')      = REx z (mapRTypeV f t) (mapRTypeV f t')
+mapRTypeV _ (RLit l)          = RLit l
 mapRTypeV f (RExprArg e)      = RExprArg (fmap (fmap f) e)
 mapRTypeV f (RAppTy t t' r)   = RAppTy (mapRTypeV f t) (mapRTypeV f t') r
 mapRTypeV f (RRTy e r o t)    = RRTy (fmap (mapRTypeV f) <$> e) r o (mapRTypeV f t)
@@ -522,6 +526,7 @@ mapRTypeVM f (RApp c ts rs r)  = RApp c <$> mapM (mapRTypeVM f) ts <*> mapM mapR
   where
     mapRefVM (RProp ss t) = RProp <$> mapM (traverse (mapRTypeVM f)) ss <*> mapRTypeVM f t
 mapRTypeVM f (REx z t t')      = REx z <$> mapRTypeVM f t <*> mapRTypeVM f t'
+mapRTypeVM _ (RLit l)          = pure (RLit l)
 mapRTypeVM f (RExprArg e)      = RExprArg <$> traverse (traverse f) e
 mapRTypeVM f (RAppTy t t' r)   = RAppTy <$> mapRTypeVM f t <*> mapRTypeVM f t' <*> pure r
 mapRTypeVM f (RRTy e r o t)    = RRTy <$> mapM (traverse (mapRTypeVM f)) e <*> pure r <*> pure o <*> mapRTypeVM f t
@@ -556,6 +561,7 @@ emapReftM bscp vf f = go
       let γ' = if bscp then F.reftBind (toReft r) : γ  else γ
        in RApp  c <$> mapM (go γ') ts <*> mapM (emapRefM bscp vf f γ) rs <*> f γ r
     go γ (REx z t t')      = REx   z <$> go γ t <*> go γ t'
+    go _ (RLit l)          = pure (RLit l)
     go γ (RExprArg e)      = RExprArg <$> traverse (emapExprVM (vf . (++γ))) e
     go γ (RAppTy t t' r)   = RAppTy <$> go γ t <*> go γ t' <*> f γ r
     go γ (RRTy e r o t)    =
@@ -638,6 +644,7 @@ foldRType f = go
     prep a (RProp _ t)      = step a t
     go a RVar{}             = a
     go a RHole{}            = a
+    go a RLit{}            = a
     go a RExprArg{}         = a
     go a (RAllT _ t _)      = step a t
     go a (RAllP _ t)        = step a t
@@ -660,6 +667,7 @@ isBase :: RType t t1 t2 -> Bool
 isBase (RAllT _ t _)    = isBase t
 isBase (RAllP _ t)      = isBase t
 isBase (RVar _ _)       = True
+isBase (RLit _)         = True
 isBase (RApp _ ts _ _)  = all isBase ts
 isBase RFun{}           = False
 isBase (RAppTy t1 t2 _) = isBase t1 && isBase t2
@@ -674,6 +682,7 @@ hasHoleTy (RAllP _ t)       = hasHoleTy t
 hasHoleTy (RFun _ _ t t' _) = hasHoleTy t || hasHoleTy t'
 hasHoleTy (RApp _ ts _ _)   = any hasHoleTy ts
 hasHoleTy (REx _ t t')      = hasHoleTy t || hasHoleTy t'
+hasHoleTy (RLit _)          = False
 hasHoleTy (RExprArg _)      = False
 hasHoleTy (RAppTy t t' _)   = hasHoleTy t || hasHoleTy t'
 hasHoleTy (RHole _)         = True
@@ -692,6 +701,7 @@ mapReftM f (RAllP π t)       = fmap   (RAllP π)  (mapReftM f t)
 mapReftM f (RFun x i t t' r) = liftM3 (RFun x i) (mapReftM f t)         (mapReftM f t')       (f r)
 mapReftM f (RApp c ts rs r)  = liftM3 (RApp  c)  (mapM (mapReftM f) ts) (mapM (mapRefM f) rs) (f r)
 mapReftM f (REx z t t')      = liftM2 (REx z)    (mapReftM f t)         (mapReftM f t')
+mapReftM _ (RLit l)          = pure (RLit l)
 mapReftM _ (RExprArg e)      = return $ RExprArg e
 mapReftM f (RAppTy t t' r)   = liftM3 RAppTy (mapReftM f t) (mapReftM f t') (f r)
 mapReftM f (RHole r)         = fmap   RHole      (f r)
@@ -707,6 +717,7 @@ mapPropM f (RAllP π t)       = fmap   (RAllP π)   (mapPropM f t)
 mapPropM f (RFun x i t t' r) = liftM3 (RFun x i)  (mapPropM f t)          (mapPropM f t') (return r)
 mapPropM f (RApp c ts rs r)  = liftM3 (RApp  c)   (mapM (mapPropM f) ts)  (mapM f rs)     (return r)
 mapPropM f (REx z t t')      = liftM2 (REx z)     (mapPropM f t)          (mapPropM f t')
+mapPropM _ (RLit l)          = pure (RLit l)
 mapPropM _ (RExprArg e)      = return $ RExprArg e
 mapPropM f (RAppTy t t' r)   = liftM3 RAppTy (mapPropM f t) (mapPropM f t') (return r)
 mapPropM _ (RHole r)         = return $ RHole r
@@ -760,9 +771,8 @@ efoldReft bsc cb dty g f fp = go
        | tyVarIsVal a                   = f γ (Just me) r (go (insertsSEnv γ (dty a)) z t)
        | otherwise                      = f γ (Just me) r (go γ z t)
     go γ z (RAllP p t)                  = go (fp p γ) z t
-    go γ z me@(RFun _ RFInfo{permitTC = permitTC} (RApp c ts _ _) t' r)
-       | (if permitTC == Just True then isEmbeddedDict else isClass)
-         c  = f γ (Just me) r (go (insertsSEnv γ (cb c ts)) (go' γ z ts) t')
+    go γ z me@(RFun _ _ (RApp c ts _ _) t' r)
+        | isEmbeddedDict c = f γ (Just me) r (go (insertsSEnv γ (cb c ts)) (go' γ z ts) t')
     go γ z me@(RFun x _ t t' r)         = f γ (Just me) r (go γ' (go γ z t) t')
        where
          γ'                             = insertSEnv x (g t) γ
@@ -773,6 +783,7 @@ efoldReft bsc cb dty g f fp = go
     go γ z me@(RRTy [] r _ t)           = f γ (Just me) r (go γ z t)
     go γ z me@(RRTy xts r _ t)          = f γ (Just me) r (go γ (go γ z (envtoType xts)) t)
     go γ z me@(RAppTy t t' r)           = f γ (Just me) r (go γ (go γ z t) t')
+    go _ z (RLit _) = z
     go _ z (RExprArg _)                 = z
     go γ z me@(RHole r)                 = f γ (Just me) r z
 
@@ -829,6 +840,7 @@ mapBind f = go
     go (RVar α r)         = RVar α r
     go (RHole r)          = RHole r
     go (RRTy e r o t)     = RRTy (bimap f go <$> e) r o (go t)
+    go (RLit l)           = RLit l
     go (RExprArg e)       = RExprArg (F.mapBindExpr f <$> e)
     go (RAppTy t t' r)    = RAppTy (go t) (go t') r
     mapT (RTVar tv i)     = RTVar tv (mapI i)

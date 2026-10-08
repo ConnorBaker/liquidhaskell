@@ -12,6 +12,9 @@ module Language.Haskell.Liquid.Constraint.Template (
 , topSpecType
 , derivedVar
 , extender
+, extenderWith
+, recursiveHypothesis
+, recursiveCallable
 ) where
 
 import           Prelude hiding (error)
@@ -29,6 +32,7 @@ import           Language.Haskell.Liquid.Types.RType
 import           Language.Haskell.Liquid.Types.RTypeOp
 import           Language.Haskell.Liquid.Types.Specs
 import           Language.Haskell.Liquid.Types.Types
+import           Language.Haskell.Liquid.Types.Fresh (refreshArgs)
 import           Language.Haskell.Liquid.Constraint.Types
 import           Language.Haskell.Liquid.Constraint.Env ( lookupREnv, (+=) )
 import           Language.Haskell.Liquid.Constraint.Monad (addPost, addW)
@@ -94,21 +98,51 @@ varTemplate' γ (x, eo)
                               Asserted <$> refreshArgsTop (x, t)
       (_,      _, _, _) -> return Unknown
 
--- | @topSpecType@ strips out the top-level refinement of "derived var"
+-- | Only trusted generated bodies may discard their top-level checking goal.
 topSpecType :: Var -> SpecType -> CG SpecType
 topSpecType x t = do
   info <- gets ghcI
-  return $ if derivedVar (giSrc info) x then topRTypeBase t else t
+  return $ if derivedVar (giSrc info) x && not (checkDerived (getConfig info)) then topRTypeBase t else t
 
 derivedVar :: TargetSrc -> Var -> Bool
 derivedVar src x = S.member x (giDerVars src)
 
 extender :: F.Symbolic a => CGEnv -> (a, Template SpecType) -> CG CGEnv
-extender γ (x, Asserted t)
+extender = extenderWith id
+
+-- Transform the selected assumption, including the reflected signature that
+-- takes precedence over an asserted template.
+extenderWith :: F.Symbolic a => (SpecType -> SpecType) -> CGEnv -> (a, Template SpecType) -> CG CGEnv
+extenderWith f γ (x, Asserted t)
   = case lookupREnv (F.symbol x) (assms γ) of
-      Just t' -> γ += ("extender", F.symbol x, t')
-      _       -> γ += ("extender", F.symbol x, t)
-extender γ (x, Assumed t)
-  = γ += ("extender", F.symbol x, t)
-extender γ _
+      Just t' -> γ += ("extender", F.symbol x, f t')
+      _       -> γ += ("extender", F.symbol x, f t)
+extenderWith f γ (x, Assumed t)
+  = γ += ("extender", F.symbol x, f t)
+extenderWith _ γ _
   = return γ
+
+-- Structurally checked recursion retains its result induction hypotheses;
+-- explicit no-termination mode uses the same interface interpretation.
+-- A predicate on the function value itself has no such call premise: prove it
+-- at the actual lambda before publishing it outside the recursive group.
+-- Logical termination instead guards the complete source-prefix result in
+-- Termination.addObligation before exposing any of its value predicates.
+recursiveHypothesis :: SpecType -> SpecType
+recursiveHypothesis (RAllT a t r) = topRTypeBase $ RAllT a (recursiveHypothesis t) r
+recursiveHypothesis (RAllP p t) = RAllP p (recursiveHypothesis t)
+recursiveHypothesis (REx x tx t) = REx x tx (recursiveHypothesis t)
+recursiveHypothesis (RRTy xts r o t) = RRTy xts r o (recursiveHypothesis t)
+recursiveHypothesis t@RFun{} = topRTypeBase t
+recursiveHypothesis t = t
+
+-- Expected-failure targets are goals, not induction hypotheses. Select their
+-- independently admitted callable before adding any decrease obligation.
+-- Other owners retain the existing recursive-contract interpretation.
+recursiveCallable :: (F.Symbolic a) => CGEnv -> a -> SpecType -> CG SpecType
+recursiveCallable γ owner target
+  | F.symbol owner `S.member` S.map (F.symbol . F.val) (gsFail (gsTerm (giSpec (cgInfo γ))))
+  , Just admitted <- lookupREnv (F.symbol owner) (assms γ) =
+      refreshArgs admitted
+  | otherwise =
+      pure target

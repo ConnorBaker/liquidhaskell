@@ -31,6 +31,7 @@ module Language.Haskell.Liquid.UX.DiffCheck (
    -- * CoreBinds defining given set of Var
    , filterBinds
    , coreDeps
+   , proofDependents
    , dependsOn
    , Def(..)
    , coreDefs
@@ -224,6 +225,32 @@ coreDeps bs = mkGraph $ calls ++ calls'
                       , S.member y defVars
               ]
     defVars = S.fromList (letVars bs)
+
+-- A rewrite theorem may not justify an owner on which its proof depends.
+-- Include potential rewrite uses as well as actual Core calls: otherwise two
+-- empty proofs can rewrite with each other, even without a Core call cycle.
+-- This conservatively excludes cyclic support; it does not track which rules
+-- the solver eventually uses. Sharing a callee alone is not a dependency.
+proofDependents :: [CoreBind] -> (Var -> S.HashSet Var) -> [Var] -> S.HashSet Var
+proofDependents bs rewrites = txClosure callers S.empty . S.fromList
+  where
+    callers =
+        mkGraph
+            [ (callee, caller)
+            | (caller, callee) <- calls ++ ruleUses
+            ]
+    calls =
+        [ (caller, callee)
+        | (caller, rhs) <- flattenBinds bs
+        , callee <- freeVars S.empty rhs
+        , callee `S.member` owners
+        ]
+    ruleUses =
+        [ (caller, rule)
+        | caller <- S.toList owners
+        , rule <- S.toList (rewrites caller)
+        ]
+    owners = S.fromList (concatMap bindersOf bs)
 
 -- | Given a call graph, and a list of vars, `dependsOn`
 --   checks all functions to see if they call any of the

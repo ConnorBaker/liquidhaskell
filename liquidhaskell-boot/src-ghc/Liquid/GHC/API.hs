@@ -407,36 +407,37 @@ import GHC.Core.TyCon                 as Ghc
     , tyConName
     , tyConSingleDataCon_maybe
     )
-import GHC.Core.Type                  as Ghc
-    ( Specificity(SpecifiedSpec)
-    , TyVarBinder
-    , isTYPEorCONSTRAINT
-    , dropForAlls
-    , emptyTvSubstEnv
-    , expandTypeSynonyms
-    , irrelevantMult
-    , isFunTy
-    , isTyVar
-    , isTyVarTy
-    , pattern ManyTy
-    , mkTvSubstPrs
-    , mkTyConApp
-    , newTyConInstRhs
-    , piResultTys
-    , splitAppTys
-    , splitForAllForAllTyBinders
-    , splitFunTy_maybe
-    , splitFunTys
-    , splitTyConApp
-    , splitTyConApp_maybe
-    , substTy
-    , substTyWith
-    , tyConAppArgs_maybe
-    , tyConAppTyCon_maybe
-    , tyVarKind
-    , varType
-    )
-import GHC.Core.Unify                 as Ghc
+import GHC.Core.Type as Ghc (
+    Specificity (SpecifiedSpec),
+    TyVarBinder,
+    dropForAlls,
+    emptyTvSubstEnv,
+    expandTypeSynonyms,
+    irrelevantMult,
+    isFunTy,
+    isTYPEorCONSTRAINT,
+    isTyVar,
+    isTyVarTy,
+    mkFamilyTyConApp,
+    mkTvSubstPrs,
+    mkTyConApp,
+    newTyConInstRhs,
+    piResultTys,
+    splitAppTys,
+    splitForAllForAllTyBinders,
+    splitFunTy_maybe,
+    splitFunTys,
+    splitTyConApp,
+    splitTyConApp_maybe,
+    substTy,
+    substTyWith,
+    tyConAppArgs_maybe,
+    tyConAppTyCon_maybe,
+    tyVarKind,
+    varType,
+    pattern ManyTy,
+ )
+import GHC.Core.Unify as Ghc
     ( ruleMatchTyKiX, tcUnifyTy, tcMatchTy )
 import GHC.Core.Utils                 as Ghc (exprType)
 import GHC.Data.Bag                   as Ghc

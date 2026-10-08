@@ -4,9 +4,20 @@ module Liquid.Prelude.Totality_LHAssumptions where
 
 import Control.Exception.Base
 import GHC.Prim
+-- The policy also loads without Prelude; primitive arguments need their own
+-- embeddings, including Addr# in generated pattern-match failures.
+import GHC.Types_LHAssumptions ()
+import GHC.Err (errorWithoutStackTrace)
+import Liquid.Prelude.Error_LHAssumptions ()
 
 {-@
 measure totalityError :: a -> Bool
+
+// Pure exceptions are not total values. This does not restrict throwIO.
+// Inherit the complete GHC context, including its implicit call stack.
+assume throw :: {v:e | false} -> a
+
+assume errorWithoutStackTrace :: {v:_ | false} -> a
 
 assume patError :: {v:Addr# | totalityError "Pattern match(es) are non-exhaustive"} -> a
 

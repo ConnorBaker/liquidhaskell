@@ -239,6 +239,8 @@ data CGInfo = CGInfo
   , hsHoles       :: !(M.HashMap (Var, SrcSpan) (HoleInfo (CGInfo, CGEnv) SpecType)) -- Information about holes in terms
   , hsANFHoles    :: !(M.HashMap Var  (Var, SrcSpan))
   , hsHolesExprs  :: !(M.HashMap (Var, SrcSpan)  [(Var, CoreExpr, SpecType)])
+  , refinementChecksByOwner :: !(M.HashMap Var [RefinementCheck])
+  , visitedRefinementOwners :: !(S.HashSet Var)
   }
 
 

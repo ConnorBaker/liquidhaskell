@@ -37,7 +37,6 @@ import qualified Data.List                                 as L
 import qualified Data.Text                                 as T
 import qualified Control.Exception                         as Ex
 import qualified Language.Haskell.Liquid.GHC.Misc          as GM
--- (dropModuleNames, showPpr, stringTyVar)
 import           Language.Fixpoint.Types                   hiding (Result, SrcSpan, Error)
 import           Language.Haskell.Liquid.Types.Errors
 import           Language.Haskell.Liquid.Types.RType
@@ -73,20 +72,17 @@ errorToUserError = fmap ppSpecTypeErr
 
 -- TODO: move to Types.hs
 cinfoError :: Cinfo -> Error
-cinfoError (Ci _ (Just e) _) = e
-cinfoError (Ci l _ _)        = ErrOther l (text $ "Cinfo: " ++ GM.showPpr l)
+cinfoError (Ci _ (Just e) _) = forceDelayed e
+cinfoError (Ci l _ _) = ErrOther l (text $ "Cinfo: " ++ GM.showPpr l)
 
 -------------------------------------------------------------------------
 tidySpecType :: Tidy -> SpecType -> SpecType
 -------------------------------------------------------------------------
-tidySpecType k
-  = tidyEqual
-  . tidyValueVars
-  . tidyDSymbols
-  . tidySymbols k
-  . tidyLocalRefas k
-  . tidyFunBinds
-  . tidyTyVars
+tidySpecType k =
+  tidyEqual
+    . tidyValueVars
+    . tidyLocalRefas k
+    . tidyTyVars
 
 tidyValueVars :: SpecType -> SpecType
 tidyValueVars = mapReft $ \u -> u { ur_reft = tidyVV $ ur_reft u }
@@ -100,16 +96,6 @@ tidyVV r@(Reft (va,_))
     v         = symbol ("v" :: T.Text)
     xs        = syms r
     isJunk    = isPrefixOfSym "x"
-
-tidySymbols :: Tidy -> SpecType -> SpecType
-tidySymbols k t = substa (shortSymbol k . tidySymbol) $ mapBind dropBind t
-  where
-    xs          = syms t
-    dropBind x  = if x `S.member` xs then tidySymbol x else nonSymbol
-
-shortSymbol :: Tidy -> Symbol -> Symbol
-shortSymbol Lossy = GM.dropModuleNames
-shortSymbol _     = id
 
 tidyLocalRefas   :: Tidy -> SpecType -> SpecType
 tidyLocalRefas k = mapReft (txReft' k)
@@ -126,17 +112,6 @@ tidyEqual = mapReft txReft
     txReft u                      = u { ur_reft = mapPredReft dropInternals $ ur_reft u }
     dropInternals                 = pAnd . L.nub . conjuncts
 
-tidyDSymbols :: SpecType -> SpecType
-tidyDSymbols t = mapBind tx $ substa tx t
-  where
-    tx         = bindersTx (S.toList $ S.filter isTmp $ syms t)
-    isTmp      = (tempPrefix `isPrefixOfSym`)
-
-tidyFunBinds :: SpecType -> SpecType
-tidyFunBinds t = mapBind tx $ substa tx t
-  where
-    tx         = bindersTx $ filter GM.isTmpSymbol $ funBinds t
-
 tidyTyVars :: SpecType -> SpecType
 tidyTyVars t = subsTyVarsAll αβs t
   where
@@ -144,13 +119,6 @@ tidyTyVars t = subsTyVarsAll αβs t
     αs   = L.nub (tyVars t)
     βs   = map (rVar . GM.stringTyVar) pool
     pool = [[c] | c <- ['a'..'z']] ++ [ "t" ++ show i | i <- [(1::Int)..]]
-
-
-bindersTx :: [Symbol] -> Symbol -> Symbol
-bindersTx ds   = \y -> M.lookupDefault y y m
-  where
-    m          = M.fromList $ zip ds $ var <$> [(1::Int)..]
-    var        = symbol . ('x' :) . show
 
 
 tyVars :: RType c tv r -> [tv]
@@ -161,6 +129,7 @@ tyVars (RAppTy t t' _)   = tyVars t ++ tyVars t'
 tyVars (RApp _ ts _ _)   = concatMap tyVars ts
 tyVars (RVar α _)        = [α]
 tyVars (REx _ _ t)       = tyVars t
+tyVars (RLit _)          = []
 tyVars (RExprArg _)      = []
 tyVars (RRTy _ _ _ t)    = tyVars t
 tyVars (RHole _)         = []
@@ -169,6 +138,7 @@ subsTyVarsAll
   :: (Eq k, Hashable k,
       IsReft r, Meet r, Eq (ReftVar r), TyConable c, SubsTy k (RType c k NoReft) c,
       SubsTy k (RType c k NoReft) r,
+      SubsTy k (RType c k NoReft) Sort,
       SubsTy k (RType c k NoReft) k,
       SubsTy k (RType c k NoReft) (RType c k NoReft),
       SubsTy k (RType c k NoReft) (RTVar Symbol Symbol c k),
@@ -179,19 +149,6 @@ subsTyVarsAll ats = go
     abm            = M.fromList [(a, b) | (a, _, RVar b _) <- ats]
     go (RAllT a t r) = RAllT (makeRTVar $ M.lookupDefault (ty_var_value a) (ty_var_value a) abm) (go t) r
     go t           = subsTyVarsMeet ats t
-
-
-funBinds :: RType t t1 t2 -> [Symbol]
-funBinds (RAllT _ t _)      = funBinds t
-funBinds (RAllP _ t)        = funBinds t
-funBinds (RFun b _ t1 t2 _) = b : funBinds t1 ++ funBinds t2
-funBinds (RApp _ ts _ _)    = concatMap funBinds ts
-funBinds (REx b t1 t2)      = b : funBinds t1 ++ funBinds t2
-funBinds (RVar _ _)         = []
-funBinds (RRTy _ _ _ t)     = funBinds t
-funBinds (RAppTy t1 t2 _)   = funBinds t1 ++ funBinds t2
-funBinds (RExprArg _)       = []
-funBinds (RHole _)          = []
 
 
 --------------------------------------------------------------------------------

@@ -256,6 +256,7 @@ buildTypeEdges table = Misc.ordNub . go
     go (RAllT _ t _)    = go t
     go (RAllP _ t)      = go t
     go (RVar _ _)       = []
+    go (RLit _)        = []
     go (RExprArg _)     = []
     go (RHole _)        = []
     go (RRTy env _ _ t) = concatMap (go . snd) env ++ go t
@@ -423,6 +424,7 @@ expandBareType rtEnv l = go
     go (RRTy e r o t)    = RRTy  e r o     (go t)
     go t@RHole{}         = t
     go t@RVar{}          = t
+    go t@RLit{}         = t
     go t@RExprArg{}      = t
     goRef (RProp ss t)   = RProp (map (expand rtEnv l <$>) ss) (go t)
 

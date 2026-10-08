@@ -18,6 +18,7 @@ import           Debug.Trace (trace)
 import           Control.Monad.Reader
 
 import           Language.Fixpoint.Types                  hiding (panic, mkQual)
+import qualified Language.Fixpoint.Types.Visitor as V
 import qualified Language.Fixpoint.Types.Config as FC
 import           Language.Fixpoint.Misc                  (fst3)
 import           Language.Fixpoint.SortCheck
@@ -25,30 +26,37 @@ import           Language.Haskell.Liquid.Types.RefType
 import           Language.Haskell.Liquid.GHC.Misc         (getSourcePos)
 import           Language.Haskell.Liquid.Misc             (condNull)
 import           Language.Haskell.Liquid.Types.PredType
-import           Liquid.GHC.API hiding (Expr, mkQual, panic)
+import           Liquid.GHC.API hiding (Expr, SrcSpan, mkQual, panic)
 
 import           Language.Haskell.Liquid.Types.Errors
+import           Language.Haskell.Liquid.Types.Names (selfSymbol)
 import           Language.Haskell.Liquid.Types.RType
 import           Language.Haskell.Liquid.Types.RTypeOp
 import           Language.Haskell.Liquid.Types.Specs
 import           Language.Haskell.Liquid.Types.Types
 import           Language.Haskell.Liquid.UX.Config
+import           Language.Haskell.Liquid.Constraint.ToFixpoint (sourceNativeEnv)
 import           Language.Fixpoint.Types.Config (ElabFlags)
 
 
 --------------------------------------------------------------------------------
 giQuals :: TargetInfo -> SEnv Sort -> [Qualifier]
 --------------------------------------------------------------------------------
-giQuals info lEnv
-  =  notracepp ("GI-QUALS: " ++ showpp lEnv)
-  $  currentSpec
-  ++ condNull (useSpcQuals info) otherSpecs
-  ++ condNull (useSigQuals info) (sigQualifiers  info lEnv)
-  ++ condNull (useAlsQuals info) (alsQualifiers  info lEnv)
+-- Declarations determine the ordered syntax inventory; the query determines
+-- native applicability and whether each free symbol is a parameter or global.
+giQuals info = interpret
   where
+    signatures = signatureAtoms info
+    aliases = aliasAtoms info
+    interpret lEnv =
+        notracepp ("GI-QUALS: " ++ showpp lEnv) $
+            currentSpec
+                ++ condNull (useSpcQuals info) otherSpecs
+                ++ condNull (useSigQuals info) (sigQualifiers info signatures lEnv)
+                ++ condNull (useAlsQuals info) (alsQualifiers info aliases lEnv)
     (currentSpec, otherSpecs) = partition isQualifierFromCurrentModule (gsQualifiers . gsQual . giSpec $ info)
     isQualifierFromCurrentModule qual =
-      fst3 (sourcePosElts (qPos qual)) == giTarget (giSrc info)
+        fst3 (sourcePosElts (qPos qual)) == giTarget (giSrc info)
 
 
 -- --------------------------------------------------------------------------------
@@ -83,18 +91,23 @@ needQuals :: (HasConfig t) => t -> Bool
 needQuals = (FC.None == ) . eliminate . getConfig
 
 --------------------------------------------------------------------------------
-alsQualifiers :: TargetInfo -> SEnv Sort -> [Qualifier]
---------------------------------------------------------------------------------
-alsQualifiers info lEnv
-  = [ q | a <- gsRTAliases . gsQual . giSpec $ info
-        , q <- refTypeQuals lEnv ef (loc a) tce (rtBody (val a))
-        , length (qParams q) <= k + 1
-        , validQual lEnv q
+type QualifierAtoms = [(SourcePos, SEnv Sort, Symbol, Sort, Either [Expr] [Expr])]
+
+aliasAtoms :: TargetInfo -> QualifierAtoms
+aliasAtoms info =
+    concat [refTypeAtoms tce emptySEnv (loc a) (rtBody (val a)) | a <- gsRTAliases (gsQual (giSpec info))]
+  where
+    tce = gsTcEmbeds (gsName (giSpec info))
+
+alsQualifiers :: TargetInfo -> QualifierAtoms -> SEnv Sort -> [Qualifier]
+alsQualifiers info atoms lEnv =
+    [ q
+    | q <- interpretAtoms native lEnv (elabFlag info) atoms
+    , length (qParams q) <= maxQualParams info + 1
+    , validQual native lEnv q
     ]
-    where
-      ef  = elabFlag info
-      k   = maxQualParams info
-      tce = gsTcEmbeds . gsName . giSpec $ info
+  where
+    native = sourceNativeEnv (getConfig info) (gsADTs (gsName (giSpec info)))
 
 elabFlag :: (HasConfig t) => t -> FC.ElabFlags
 elabFlag info = FC.ElabFlags setBag False
@@ -108,28 +121,35 @@ elabFlag info = FC.ElabFlags setBag False
 
 
 
-validQual :: SEnv Sort -> Qualifier -> Bool
-validQual lEnv q = isJust $ checkSortExpr (srcSpan q) env (qBody q)
+validQual :: Maybe SymEnv -> SEnv Sort -> Qualifier -> Bool
+validQual native lEnv q = isJust $ checkSortExpr native (srcSpan q) env (qBody q)
   where
     env          = unionSEnv lEnv qEnv
     qEnv         = M.fromList (qualBinds q)
 
 
 --------------------------------------------------------------------------------
-sigQualifiers :: TargetInfo -> SEnv Sort -> [Qualifier]
---------------------------------------------------------------------------------
-sigQualifiers info lEnv
-  = [ q | (x, t) <- specBinders info
-        , not (x `S.member` S.fromList (specAxiomVars info))
-        , q <- refTypeQuals lEnv ef (getSourcePos x) tce (val t)
-        -- NOTE: large qualifiers are VERY expensive, so we only mine
-        -- qualifiers up to a given size, controlled with --max-params
-        , length (qParams q) <= k + 1
+sigQualifiers :: TargetInfo -> QualifierAtoms -> SEnv Sort -> [Qualifier]
+sigQualifiers info atoms lEnv =
+    [q | q <- interpretAtoms native lEnv (elabFlag info) atoms, length (qParams q) <= maxQualParams info + 1]
+  where
+    native = sourceNativeEnv (getConfig info) (gsADTs (gsName (giSpec info)))
+
+signatureAtoms :: TargetInfo -> QualifierAtoms
+signatureAtoms info =
+    [ atom
+    | (x, t) <- specBinders info
+    , not (x `S.member` S.fromList (specAxiomVars info))
+    , atom <- refTypeAtoms tce (constructorScope x (val t)) (getSourcePos x) (val t)
     ]
-    where
-      ef  = elabFlag info
-      k   = maxQualParams info
-      tce = gsTcEmbeds . gsName . giSpec $ info
+  where
+    tce = gsTcEmbeds (gsName (giSpec info))
+    constructorOwners = S.fromList (map fst (gsCtors (gsData (giSpec info))))
+    constructorScope x t
+        | x `S.member` constructorOwners
+        , (_, _, _, _, result@RApp{}) <- bkArrowDeep t =
+            insertSEnv selfSymbol (rTypeSort tce result) emptySEnv
+        | otherwise = emptySEnv
 
 specBinders :: TargetInfo -> [(Var, LocSpecType)]
 specBinders info = mconcat
@@ -164,69 +184,59 @@ specAxiomVars =  gsReflects . gsRefl . giSpec
 
 -- TODO: rewrite using foldReft'
 --------------------------------------------------------------------------------
-refTypeQuals :: SEnv Sort -> ElabFlags -> SourcePos -> TCEmb TyCon -> SpecType -> [Qualifier]
+refTypeAtoms :: TCEmb TyCon -> SEnv Sort -> SourcePos -> SpecType -> QualifierAtoms
 --------------------------------------------------------------------------------
-refTypeQuals lEnv ef l tce t0    = go emptySEnv t0
+refTypeAtoms tce = scrapeType
   where
-    scrape                    = refTopQuals lEnv ef l tce t0
-    add x t γ                 = insertSEnv x (rTypeSort tce t) γ
-    goBind x t γ t'           = go (add x t γ) t'
-    go γ t@(RVar _ _)         = scrape γ t
-    go γ (RAllT _ t _)        = go γ t
-    go γ (RAllP p t)          = go (insertSEnv (pname p) (rTypeSort tce (pvarRType p :: RSort)) γ) t
-    go γ t@(RAppTy t1 t2 _)   = go γ t1 ++ go γ t2 ++ scrape γ t
-    go γ (RFun x _ t t' _)    = go γ t ++ goBind x t γ t'
-    go γ t@(RApp c ts rs _)   = scrape γ t ++ concatMap (go γ') ts ++ goRefs c γ' rs
-                                where γ' = add (rTypeValueVar t) t γ
-    go γ (REx x t t')         = go γ t ++ goBind x t γ t'
-    go _ _                    = []
-    goRefs c g rs             = concat $ zipWith (goRef g) rs (rTyConPVs c)
-    goRef _ (RProp _ (RHole _)) _ = []
-    goRef g (RProp s t)  _    = go (insertsSEnv' g s) t
-    insertsSEnv'              = foldr (\(x, t) γ -> insertSEnv x (rTypeSort tce t) γ)
+    scrapeType initialEnv l t0 = go initialEnv t0
+      where
+        scrape = refTopAtoms l tce t0
+        add x t γ = insertSEnv x (rTypeSort tce t) γ
+        goBind x t γ t' = go (add x t γ) t'
+        go γ t@(RVar _ _) = scrape γ t
+        go γ (RAllT _ t _) = go γ t
+        go γ (RAllP p t) = go (insertSEnv (pname p) (rTypeSort tce (pvarRType p :: RSort)) γ) t
+        go γ t@(RAppTy t1 t2 _) = go γ t1 ++ go γ t2 ++ scrape γ t
+        go γ (RFun x _ t t' _) = go γ t ++ goBind x t γ t'
+        go γ t@(RApp c ts rs _) = scrape γ t ++ concatMap (go γ') ts ++ goRefs c γ' rs
+          where
+            γ' = add (rTypeValueVar t) t γ
+        go γ (REx x t t') = go γ t ++ goBind x t γ t'
+        go _ _ = []
+        goRefs c g rs = concat $ zipWith (goRef g) rs (rTyConPVs c)
+        goRef _ (RProp _ (RHole _)) _ = []
+        goRef g (RProp s t) _ = go (insertsSEnv' g s) t
+        insertsSEnv' = foldr (\(x, t) γ -> insertSEnv x (rTypeSort tce t) γ)
 
-
-refTopQuals :: SEnv Sort
-            -> ElabFlags
-            -> SourcePos
-            -> TCEmb TyCon
-            -> RType RTyCon RTyVar r
-            -> SEnv Sort
-            -> SpecType
-            -> [Qualifier]
-refTopQuals lEnv ef l tce t0 γ rrt
-  = [ mkQ' v so pa  | let (RR so (Reft (v, ra))) = rTypeSortedReft tce rrt
-                   , pa                        <- conjuncts ra
-                   , not $ isHole    pa
-                   , notracepp ("refTopQuals: " ++ showpp pa)
-                     $ isNothing $ runReader (checkSorted (srcSpan l) (insertSEnv v so γ') pa) ef
-    ]
-    ++
-    [ mkP s e | let (MkUReft _ (Pr ps)) = fromMaybe (msg rrt) $ stripRTypeBase rrt
-              , p                      <- findPVar (ty_preds $ toRTypeRep t0) <$> ps
-              , (s, _, e)              <- pargs p
-    ]
-    where
-      mkQ'  = mkQual  lEnv l     t0 γ
-      mkP   = mkPQual lEnv l tce t0 γ
-      msg t = panic Nothing $ "Qualifier.refTopQuals: no typebase" ++ showpp t
-      γ'    = unionSEnv' γ lEnv
-
-mkPQual :: (PPrint r, IsReft r,  ReftBind r ~ Symbol, ReftVar r ~ Symbol, SubsTy RTyVar RSort r)
-        => SEnv Sort
-        -> SourcePos
-        -> TCEmb TyCon
-        -> t
-        -> SEnv Sort
-        -> RRType r
-        -> Expr
-        -> Qualifier
-mkPQual lEnv l tce t0 γ t e = mkQual lEnv l t0 γ' v so pa
+refTopAtoms :: SourcePos -> TCEmb TyCon -> SpecType -> SEnv Sort -> SpecType -> QualifierAtoms
+refTopAtoms l tce t0 γ rrt =
+    [(l, γ, v, so, Left [pa | pa <- conjuncts ra, V.isConc pa])]
+        ++ [ (l, insertSEnv v so γ, v, so, Right [PAtom Eq (EVar v) e])
+           | let MkUReft _ (Pr ps) = fromMaybe (msg rrt) (stripRTypeBase rrt)
+           , p <- findPVar (ty_preds (toRTypeRep t0)) <$> ps
+           , (s, _, e) <- pargs p
+           , V.isConc e
+           , let v = "vv"
+                 so = rTypeSort tce s
+           ]
   where
-    v                      = "vv"
-    so                     = rTypeSort tce t
-    γ'                     = insertSEnv v so γ
-    pa                     = PAtom Eq (EVar v) e
+    RR so (Reft (v, ra)) = rTypeSortedReft tce rrt
+    msg t = panic Nothing $ "Qualifier.refTopQuals: no typebase" ++ showpp t
+
+interpretAtoms :: Maybe SymEnv -> SEnv Sort -> ElabFlags -> QualifierAtoms -> [Qualifier]
+interpretAtoms native lEnv ef atoms =
+    [ mkQual lEnv l () γ v so pa
+    | (l, γ, v, so, observation) <- atoms
+    , let contextHere = extendSortCheck (insertSEnv v so γ) context
+    , pa <- either id id observation
+    , case observation of
+        Left _ ->
+            notracepp ("refTopQuals: " ++ showpp pa) $
+                isNothing (checkSortAt contextHere (srcSpan l) Nothing pa)
+        Right _ -> True
+    ]
+  where
+    context = runReader (prepareSortCheck native lEnv) ef
 
 mkQual :: SEnv Sort
        -> SourcePos

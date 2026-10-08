@@ -65,10 +65,17 @@ data MapTyVarST = MTVST
   }
 
 mapTyVars :: Bool -> Type -> SpecType -> StateT MapTyVarST (Either Error) ()
-mapTyVars allowTC (FunTy { ft_arg = τ, ft_res = τ'}) t
-  | isErasable τ
-  = mapTyVars allowTC τ' t
-  where isErasable = if allowTC then isEmbeddedDictType else isClassPred
+-- Explicit primitive evidence contributes the same variable correspondence as
+-- any other paired argument; only unpaired implicit evidence is erased below.
+mapTyVars allowTC (FunTy{ft_arg = τ, ft_res = τ'}) (RFun _ _ t t' _)
+  | isEmbeddedDictType τ
+  , isEmbeddedClass t =
+      mapTyVars allowTC τ t >> mapTyVars allowTC τ' t'
+mapTyVars allowTC (FunTy{ft_arg = τ, ft_res = τ'}) t
+    | isErasable τ =
+        mapTyVars allowTC τ' t
+  where
+    isErasable = isEmbeddedDictType
 mapTyVars allowTC (FunTy { ft_arg = τ, ft_res = τ'}) (RFun _ _ t t' _)
    = mapTyVars allowTC τ t >> mapTyVars allowTC τ' t'
 mapTyVars allowTC τ (RAllT _ t _)
@@ -85,6 +92,8 @@ mapTyVars allowTC τ (RRTy _ _ _ t)
   = mapTyVars allowTC τ t
 mapTyVars allowTC τ (REx _ _ t)
   = mapTyVars allowTC τ t
+mapTyVars _ (LitTy l) (RLit l') | l == l'
+  = return ()
 mapTyVars _ _ (RExprArg _)
   = return ()
 mapTyVars allowTC (AppTy τ τ') (RAppTy t t' _)

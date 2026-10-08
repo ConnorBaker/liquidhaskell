@@ -1,8 +1,8 @@
 {-# OPTIONS_GHC -fplugin=LiquidHaskellBoot #-}
 {-# OPTIONS_GHC -Wno-unused-imports #-}
-module GHC.Base_LHAssumptions where
+module GHC.Base_LHAssumptions (module GHC.Base_LHAssumptions, Semigroup (..)) where
 
-import GHC.Base (assert)
+import GHC.Base (NonEmpty, Semigroup (..), assert)
 import GHC.CString_LHAssumptions()
 import GHC.Exts_LHAssumptions()
 import GHC.Types_LHAssumptions()
@@ -16,6 +16,21 @@ comp f g x = f (g x)
 
 
 {-@
+
+// Only the stimes domain is narrowed here; append and sconcat retain their
+// existing plain interface requirements. This is not an audit or a proof of
+// arbitrary imported Semigroup implementations.
+//
+// GHC 9.14.1's default stimes (GHC.Internal.Base:635-647) uses the supplied
+// comparison, remainder and quotient fields. A positive-looking multiplier
+// alone proves neither that division by two is admitted nor that it decreases.
+// No nonempty common domain follows from the current Integral requirements.
+// Stronger explicit instance arrows remain subject to ordinary body checking.
+// This conservative boundary does not establish useful native default calls.
+class Semigroup a where
+  (<>) :: a -> a -> a
+  sconcat :: NonEmpty a -> a
+  stimes :: forall b. Integral b => {n:b | false} -> a -> a
 
 assume . :: forall <p :: b -> c -> Bool, q :: a -> b -> Bool, r :: a -> c -> Bool>.
                    {xcmp::a, wcmp::b<q xcmp> |- c<p wcmp> <: c<r xcmp>}

@@ -15,14 +15,12 @@ where
 
 import           Control.Monad                 ( forM, guard )
 import           Data.Bifunctor                (second)
-import           Data.Char                     (isDigit)
 import qualified Data.List                     as L
 import qualified Data.HashSet                  as S
 import           Data.Hashable                  ()
 import qualified Data.Maybe                    as Mb
 import qualified Language.Fixpoint.Types       as F
 import qualified Language.Fixpoint.Misc        as Misc
-import           Language.Haskell.Liquid.Bare.Elaborate
 import qualified Language.Haskell.Liquid.GHC.Misc
                                                as GM
 import qualified Liquid.GHC.API
@@ -37,7 +35,6 @@ import qualified Language.Haskell.Liquid.Types.RefType
                                                as RT
 import           Language.Haskell.Liquid.Types.Specs
 import           Language.Haskell.Liquid.Types.Types
-import           Language.Haskell.Liquid.Types.Visitors
 import qualified Language.Haskell.Liquid.Bare.Types
                                                as Bare
 import qualified Language.Haskell.Liquid.Bare.Resolve
@@ -45,6 +42,7 @@ import qualified Language.Haskell.Liquid.Bare.Resolve
 import qualified Language.Haskell.Liquid.Measure
                                                as Ms
 import qualified Data.HashMap.Strict           as M
+import Language.Haskell.Liquid.Bare.Class (instanceDictionaryOwners)
 
 
 
@@ -53,7 +51,7 @@ compileClasses
   -> Bare.Env
   -> (ModName, Ms.BareSpec)
   -> [(ModName, Ms.BareSpec)]
-  -> (Ms.BareSpec, [(Ghc.ClsInst, [Ghc.Var])])
+  -> (Ms.BareSpec, [(Ghc.ClsInst, [(Ghc.Var, Ghc.Var)])])
 compileClasses src env (name, spec) rest =
   (spec { sigs = sigsNew } <> clsSpec, instmethods)
  where
@@ -88,22 +86,19 @@ compileClasses src env (name, spec) rest =
     merge sig v = case v of
       Nothing -> Just [sig]
       Just vs -> Just (sig : vs)
-  methods = [ makeGHCLHNameLocatedFromId x | (_, xs) <- instmethods, x <- xs ]
-      -- instance methods
+  methods = [makeGHCLHNameLocatedFromId x | (_, xs) <- instmethods, (_, x) <- xs]
 
-  instmethods :: [(Ghc.ClsInst, [Ghc.Var])]
+  -- instance methods
+
+  instmethods :: [(Ghc.ClsInst, [(Ghc.Var, Ghc.Var)])]
   instmethods =
-    [ (inst, ms)
-    | (inst, cls) <- instClss
-    , let selIds = GM.dropModuleNames . F.symbol <$> Ghc.classAllSelIds cls
-    , (_, e) <- Mb.maybeToList
-      (GM.findVarDefMethod
-        (GM.dropModuleNames . F.symbol $ Ghc.instanceDFunId inst)
-        (_giCbs src)
-      )
-    , let ms = filter (\x -> GM.isMethod x && elem (mkSymbol x) selIds)
-                      (freeVars mempty e)
+    [ (inst, Mb.fromMaybe (unsupported inst) (instanceDictionaryOwners (_giCbs src) (Ghc.instanceDFunId inst)))
+    | (inst, _) <- instClss
     ]
+  unsupported inst =
+    panic
+      (Just (Ghc.getSrcSpan (Ghc.instanceDFunId inst)))
+      "Unsupported refined class dictionary: each field must retain its exact source owner and instance telescope"
   instClss :: [(Ghc.ClsInst, Ghc.Class)]
   instClss =
     [ (inst, cls)
@@ -120,6 +115,7 @@ compileClasses src env (name, spec) rest =
   resolveClassMaybe d =
     either (const Nothing) Just (Bare.lookupGhcTyConLHName (Bare.reTyLookupEnv env) $ dataNameSymbol $ tycName d)
       >>= Ghc.tyConClass_maybe
+
 
 -- a list of class with user defined refinements
 makeClassDataDecl :: [(Ghc.Class, [(Ghc.Id, LocBareType)])] -> [DataDecl]
@@ -178,13 +174,13 @@ classDeclToDataDecl cls refinedIds = DataDecl
 --    functions. Each method type contains the full forall quantifiers
 --    instead of having them chopped off
 elaborateClassDcp
-  :: (Ghc.CoreExpr -> F.Expr)
-  -> (Ghc.CoreExpr -> Ghc.TcRn Ghc.CoreExpr)
+  :: (SpecType -> Ghc.TcRn SpecType)
   -> DataConP
   -> Ghc.TcRn (DataConP, DataConP)
-elaborateClassDcp coreToLg simplifier dcp = do
-  t' <- flip (zipWith addCoherenceOblig) prefts
-    <$> forM fts (elaborateSpecType coreToLg simplifier)
+elaborateClassDcp elaborate dcp = do
+  t' <-
+    flip (zipWith addCoherenceOblig) prefts
+      <$> forM fts elaborate
   let ts' = elaborateMethod (F.symbol dc) (S.fromList $ map lhNameToResolvedSymbol xs) <$> t'
   pure
     ( dcp { dcpTyArgs = zip xs (stripPred <$> ts') }
@@ -299,6 +295,8 @@ renameTvs rename t
   = RApp tc (renameTvs rename <$> ts) tps r
   | REx b exarg ty <- t
   = REx b   (renameTvs rename exarg) (renameTvs rename ty)
+  | RLit _ <- t
+  = t
   | RExprArg _ <- t
   = t
   | RAppTy arg res r <- t
@@ -309,36 +307,38 @@ renameTvs rename t
   = t
 
 
-makeClassAuxTypes ::
-     (SpecType -> Ghc.TcRn SpecType)
+makeClassAuxTypes
+  :: F.TCEmb Ghc.TyCon
+  -> (Ghc.Var -> SpecType -> Ghc.TcRn SpecType)
   -> [F.Located DataConP]
-  -> [(Ghc.ClsInst, [Ghc.Var])]
+  -> [(Ghc.ClsInst, [(Ghc.Var, Ghc.Var)])]
   -> Ghc.TcRn [(Ghc.Var, LocSpecType)]
-makeClassAuxTypes elab dcps xs = Misc.concatMapM (makeClassAuxTypesOne elab) dcpInstMethods
+makeClassAuxTypes embs elab dcps xs = Misc.concatMapM (makeClassAuxTypesOne embs elab) dcpInstMethods
   where
     dcpInstMethods = do
       dcp <- dcps
       (inst, methods) <- xs
       let dc = dcpCon . F.val $ dcp
-              -- YL: only works for non-newtype class
+          -- YL: only works for non-newtype class
           dc' = Ghc.classDataCon $ Ghc.is_cls inst
       guard $ dc == dc'
       pure (dcp, inst, methods)
 
-makeClassAuxTypesOne ::
-     (SpecType -> Ghc.TcRn SpecType)
-  -> (F.Located DataConP, Ghc.ClsInst, [Ghc.Var])
+makeClassAuxTypesOne
+  :: F.TCEmb Ghc.TyCon
+  -> (Ghc.Var -> SpecType -> Ghc.TcRn SpecType)
+  -> (F.Located DataConP, Ghc.ClsInst, [(Ghc.Var, Ghc.Var)])
   -> Ghc.TcRn [(Ghc.Var, LocSpecType)]
-makeClassAuxTypesOne elab (ldcp, inst, methods) =
-  forM methods $ \method -> do
+makeClassAuxTypesOne embs elab (ldcp, inst, methods) =
+  forM methods $ \(selector, method) -> do
     let (headlessSig, preft) =
-          case L.lookup (mkSymbol method) yts' of
+          case L.lookup (Just (Ghc.getName selector)) yts' of
             Nothing ->
-              impossible Nothing ("makeClassAuxTypesOne : unreachable?" ++ F.showpp (mkSymbol method) ++ " " ++ F.showpp yts)
+              impossible Nothing ("makeClassAuxTypesOne: missing exact class field " ++ GM.showPpr selector)
             Just sig -> sig
         -- dict binder will never be changed because we optimized PAnd[]
         -- lq0 lq1 ...
-            --
+        --
         ptys    = [(F.vv (Just i), classRFInfo True, pty, mempty) | (i,pty) <- zip [0,1..] isPredSpecTys]
         fullSig =
           mkArrow
@@ -347,7 +347,7 @@ makeClassAuxTypesOne elab (ldcp, inst, methods) =
             ptys .
           subst (zip clsTvs isSpecTys) $
           headlessSig
-    elaboratedSig  <- flip addCoherenceOblig preft <$> elab fullSig
+    elaboratedSig <- flip addCoherenceOblig preft <$> elab method fullSig
 
     let retSig =  mapExprReft (\_ -> substAuxMethod dfunSym methodsSet) (F.notracepp ("elaborated" ++ GM.showPpr method) elaboratedSig)
     let tysub  = F.notracepp "tysub" $ M.fromList $ zip (F.notracepp "newtype-vars" $ RT.allTyVars' (F.notracepp "new-type" retSig)) (F.notracepp "ghc-type-vars" (RT.allTyVars' ((F.notracepp "ghc-type" $ RT.ofType (Ghc.varType method)) :: SpecType)))
@@ -357,9 +357,9 @@ makeClassAuxTypesOne elab (ldcp, inst, methods) =
 
     -- need to make the variable names consistent
     pure (method, F.dummyLoc (F.notracepp ("vars:" ++ F.showpp (F.symbol <$> RT.allTyVars' subbedTy)) subbedTy))
-
-  -- "is" is used as a shorthand for instance, following the convention of the Ghc api
   where
+    -- "is" is used as a shorthand for instance, following the convention of the Ghc api
+
     -- recsel = F.symbol ("lq$recsel" :: String)
     (_,predTys,_,_) = Ghc.instanceSig inst
     dfunApped = F.mkEApp dfunSymL [F.eVar $ F.vv (Just i) | (i,_) <- zip [0,1..] predTys]
@@ -374,7 +374,7 @@ makeClassAuxTypesOne elab (ldcp, inst, methods) =
             res  = ty_res rrep    -- (Monoid.mappend -> $cmappend##Int, ...)
     -- core rewriting mark2: do the same thing except they don't have to be symbols
     -- YL: poorly written. use a comprehension instead of assuming
-    methodsSet = F.notracepp "methodSet" $ M.fromList (zip (F.symbol <$> clsMethods) (F.symbol <$> methods))
+    methodsSet = F.notracepp "methodSet" $ M.fromList [(F.symbol selector, F.symbol method) | (selector, method) <- methods]
     -- core rewriting mark1: dfunId
     -- ()
     dfunSymL = GM.namedLocSymbol $ Ghc.instanceDFunId inst
@@ -385,13 +385,11 @@ makeClassAuxTypesOne elab (ldcp, inst, methods) =
     isRTvs = makeRTVar . RT.rTyVar <$> isTvs
     dcp = F.val ldcp
     -- Monoid.mappend, ...
-    clsMethods = filter (\x -> GM.dropModuleNames (F.symbol x) `elem` fmap mkSymbol methods) $
-      Ghc.classAllSelIds (Ghc.is_cls inst)
-    yts = [(lhNameToUnqualifiedSymbol y, t) | (y, t) <- dcpTyArgs dcp]
+    yts = [(getLHGHCName y, t) | (y, t) <- dcpTyArgs dcp]
     clsTvs = dcpFreeTyVars dcp
-        -- copy/pasted from Bare/Class.hs
+    -- copy/pasted from Bare/Class.hs
     subst [] t = t
-    subst ((a, ta):su) t = RT.subsTyVarMeet' (a, ta) (subst su t)
+    subst ((a, ta):su) t = RT.subsTyVarMeetWith embs (a, ta) (subst su t)
 
 substAuxMethod :: F.Symbol -> M.HashMap F.Symbol F.Symbol -> F.Expr -> F.Expr
 substAuxMethod dfun methods = F.notracepp "substAuxMethod" . go
@@ -418,19 +416,3 @@ substAuxMethod dfun methods = F.notracepp "substAuxMethod" . go
         go (F.PIff e0 e1) = F.PIff (go e0) (go e1)
         go (F.PAtom brel e0 e1) = F.PAtom brel (go e0) (go e1)
         go e = F.notracepp "LEAF" e
-
--- Normalise typeclass names for looking up class selector symbols.
--- Instance methods are named `$c(method)`. GHC 9 can also expose superclass
--- dictionary bindings named `$cp(n)(Class)`, where (n) is the index of the
--- superclass. These correspond to `$p(n)(Class)` selector symbols.
--- Since class methods are always identified by variables with the `$c`
--- prefix, we can ignore other cases.
--- The digit is what distinguishes a superclass binding from a method whose
--- name starts with 'p'.
-mkSymbol :: Ghc.Var -> F.Symbol
-mkSymbol x =
-  case Ghc.getOccString x of
-    '$' : 'c' : 'p' : rest@(d : _)
-      | isDigit d          -> F.symbol ('$' : 'p' : rest)
-    '$' : 'c' : rest       -> F.symbol rest
-    occ                    -> impossible Nothing $ "mkSymbol : should only be called with class methods, received " ++ F.showpp occ

@@ -5,6 +5,7 @@
 module Language.Haskell.Liquid.Constraint.ToFixpoint
   ( cgInfoFInfo
   , fixConfig
+  , sourceNativeEnv
   , refinementEQs
   , canRewrite
   ) where
@@ -17,14 +18,13 @@ import qualified Language.Fixpoint.Types        as F
 import           Language.Fixpoint.Solver.Rewrite (unify)
 import           Language.Haskell.Liquid.Constraint.Types
 import qualified Language.Haskell.Liquid.Types.RefType as RT
-import           Language.Haskell.Liquid.Constraint.Qualifier
 import           Control.Monad (guard)
 import qualified Data.Maybe as Mb
 
 -- AT: Move to own module?
 -- imports for AxiomEnv
 import           Language.Haskell.Liquid.UX.Config
-import           Language.Haskell.Liquid.UX.DiffCheck (coreDefs, coreDeps, dependsOn, Def(..))
+import           Language.Haskell.Liquid.UX.DiffCheck (coreDefs, proofDependents, Def(..))
 import qualified Language.Haskell.Liquid.GHC.Misc  as GM -- (simplesymbol)
 import qualified Data.HashMap.Strict               as M
 import qualified Data.HashSet                      as S
@@ -36,12 +36,23 @@ import           Language.Haskell.Liquid.Types.RTypeOp
 import           Language.Haskell.Liquid.Types.Specs
 import           Language.Haskell.Liquid.Types.Types hiding     ( binds )
 
+-- The compiler reuses typed predicates; presentation follows instantiation.
+-- Source formation knows the selected representation only when the solver is
+-- configured. Reuse the query's resolved datatype catalog and configuration;
+-- absent configuration is not an empty, supposedly complete native catalog.
+sourceNativeEnv :: Config -> [F.DataDecl] -> Maybe F.SymEnv
+sourceNativeEnv cfg declarations = do
+    _ <- smtsolver cfg
+    pure $ F.symEnv (fixConfig "" cfg) mempty mempty nativeDeclarations mempty []
+  where
+    nativeDeclarations = if adtFlag cfg then declarations else []
+
 fixConfig :: FilePath -> Config -> FC.Config
 fixConfig tgt cfg = FC.defConfig
   { FC.solver         = Mb.fromJust (smtsolver cfg)
+  , FC.sortedSolution = True
   , FC.linear         = linear            cfg
   , FC.eliminate      = eliminate         cfg
-  , FC.nonLinCuts     = not (higherOrderFlag cfg) -- eliminate cfg /= FC.All
   , FC.save           = saveQuery         cfg
   , FC.saveBfqOnError = saveBfqOnError    cfg
   , FC.srcFile        = tgt
@@ -68,11 +79,11 @@ fixConfig tgt cfg = FC.defConfig
   , FC.inlineANFBinds = inlineANFBindings cfg
   }
 
-cgInfoFInfo :: TargetInfo -> CGInfo -> IO (F.FInfo Cinfo)
-cgInfoFInfo info cgi = return (targetFInfo info cgi)
+cgInfoFInfo :: [(Var, LocSpecType)] -> TargetInfo -> CGInfo -> IO (F.FInfo Cinfo)
+cgInfoFInfo rewrites info cgi = return (targetFInfo rewrites info cgi)
 
-targetFInfo :: TargetInfo -> CGInfo -> F.FInfo Cinfo
-targetFInfo info cgi = mappend (mempty { F.ae = ax, F.lrws = localRewrites cgi }) fi
+targetFInfo :: [(Var, LocSpecType)] -> TargetInfo -> CGInfo -> F.FInfo Cinfo
+targetFInfo rewrites info cgi = mappend (mempty { F.ae = ax, F.lrws = localRewrites cgi }) fi
   where
     fi               = F.fi cs ws bs ls consts ks qs bi aHO aHOqs es mempty adts
     cs               = fixCs    cgi
@@ -84,63 +95,70 @@ targetFInfo info cgi = mappend (mempty { F.ae = ax, F.lrws = localRewrites cgi }
     cfg              = getConfig info
     makeDecls        = adtFlag cfg
     adts             = if makeDecls then cgADTs   cgi else mempty
-    qs               = giQuals info (fEnv cgi)
+    -- The source driver supplies the complete candidate set after scraping
+    -- these constraints; no alternate signature view contributes qualifiers.
+    qs               = []
     bi               = (\x -> Ci x Nothing Nothing) <$> bindSpans cgi
     aHO              = allowHO cgi
-    aHOqs            = higherOrderFlag info
+    -- Logical higher-order binders do not enable automatic qualifier enumeration.
+    aHOqs            = higherorderqs cfg
     es               = [] -- makeAxioms info
-    ax               = makeAxiomEnvironment info (dataConTys cgi) (F.cm fi)
+    ax               = makeAxiomEnvironment rewrites info (dataConTys cgi) (F.cm fi)
     -- msg              = show . map F.symbol . M.keys . tyConInfo
 
-makeAxiomEnvironment :: TargetInfo -> [(Var, SpecType)] -> M.HashMap F.SubcId (F.SubC Cinfo) -> F.AxiomEnv
-makeAxiomEnvironment info xts fcs
-  = F.AEnv eqs
-           (concatMap makeSimplify xts)
-           (doExpand sp cfg <$> fcs)
-           (makeRewrites info <$> fcs)
+makeAxiomEnvironment :: [(Var, LocSpecType)] -> TargetInfo -> [(Var, SpecType)] -> M.HashMap F.SubcId (F.SubC Cinfo) -> F.AxiomEnv
+makeAxiomEnvironment rewrites info xts fcs =
+    F.AEnv
+        eqs
+        (concatMap makeSimplify xts)
+        (doExpand sp cfg <$> fcs)
+        (makeRewrites rewrites info <$> fcs)
+        (Just mempty)
   where
-    eqs      = axioms
-    cfg      = getConfig  info
-    sp       = giSpec     info
-    axioms   = gsMyAxioms refl ++ gsImpAxioms refl
-    refl     = gsRefl sp
+    eqs = axioms ++ newtypeIdentities
+    cfg = getConfig info
+    sp = giSpec info
+    axioms = gsMyAxioms refl ++ gsImpAxioms refl
+    refl = gsRefl sp
+    -- The same generic identity law is used by the Core cast interpreter.
+    -- Register it here too so source constructor names have that meaning.
+    newtypeIdentities =
+        [ F.mkEquation (F.symbol dc) [(field, sort)] (F.EVar field) sort
+        | dc <- M.keys (gsConstructorBoxes (gsName sp))
+        , Just sort <- [RT.newtypeIdentitySort (gsTcEmbeds (gsName sp)) dc]
+        ]
+    field = F.symbol ("lq_newtype_field" :: String)
 
-
-makeRewrites :: TargetInfo -> F.SubC Cinfo -> [F.AutoRewrite]
-makeRewrites info sub = concatMap (makeRewriteOne tce) $ filter ((`S.member` rws) . fst) sigs
+makeRewrites :: [(Var, LocSpecType)] -> TargetInfo -> F.SubC Cinfo -> [F.AutoRewrite]
+makeRewrites sigs info sub = concatMap (makeRewriteOne tce) $ filter ((`S.member` rws) . fst) sigs
   where
-    tce        = gsTcEmbeds (gsName spec)
-    spec       = giSpec info
-    sig        = gsSig spec
-    sigs       = gsTySigs sig ++ gsAsmSigs sig
-    isGlobalRw = Mb.maybe False (`elem` globalRws) parentFunction
-
+    tce = gsTcEmbeds (gsName spec)
+    spec = giSpec info
     parentFunction :: Maybe Var
     parentFunction =
-      case subVar sub of
-        Just v -> Just v
-        Nothing ->
-          Mb.listToMaybe $ do
-            D s e v <- coreDefs $ giCbs $ giSrc info
-            let (Ghc.RealSrcSpan cc _) = ci_loc $ F.sinfo sub
-            guard $ s <= Ghc.srcSpanStartLine cc && e >= Ghc.srcSpanEndLine cc
-            return v
+        case subVar sub of
+            Just v -> Just v
+            Nothing ->
+                Mb.listToMaybe $ do
+                    D s e v <- coreDefs $ giCbs $ giSrc info
+                    let (Ghc.RealSrcSpan cc _) = ci_loc $ F.sinfo sub
+                    guard $ s <= Ghc.srcSpanStartLine cc && e >= Ghc.srcSpanEndLine cc
+                    return v
 
-    rws =
-      if isGlobalRw
-      then S.empty
-      else S.difference
-        (S.union localRws globalRws)
-        (Mb.maybe S.empty forbiddenRWs parentFunction)
+    rws = case parentFunction of
+        Nothing -> globalRws
+        Just owner
+            | S.null (rewrites owner) -> S.empty
+            | otherwise -> rewrites owner `S.difference` forbiddenRWs owner
 
-    allDeps         = coreDeps $ giCbs $ giSrc info
-    forbiddenRWs sv =
-      S.insert sv $ dependsOn allDeps [sv]
+    forbiddenRWs owner = proofDependents (giCbs (giSrc info)) rewrites [owner]
 
-    localRws = Mb.fromMaybe S.empty $ do
-      var    <- parentFunction
-      usable <- M.lookup var $ gsRewritesWith $ gsRefl spec
-      return $ S.fromList usable
+    rewrites owner
+        | owner `S.member` globalRws = S.empty
+        | otherwise =
+            S.union globalRws $
+                S.fromList $
+                    M.lookupDefault [] owner (gsRewritesWith (gsRefl spec))
 
     globalRws = S.map val $ gsRewrites $ gsRefl spec
 
@@ -221,24 +239,9 @@ doExpand sp cfg sub = allowGlobalPLE cfg
 -- *value* binders (@valBs@), so that the resulting rewrite has the right
 -- arity to fire on the worker applications that appear in constraints.
 --
--- Note [All rewrites keyed on the worker symbol]
--- ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
---
--- In LiquidHaskell, @F.Symbolic DataCon@ is defined as
--- @symbol = F.symbol . dataConWorkId@, so DataCon applications in fixpoint
--- constraints *always* carry the *worker* symbol (e.g. @$:>@, never @$W:>@).
---
--- User-written measures (e.g. @vlen@) are routed to the *wrapper* spec type
--- by 'isWorkerDef' in "Measure", so @makeSimplify@ receives a
--- @(DataConWrapId $W:>, wrRType)@ pair carrying the measure refinements.
--- To produce rewrites that PLE can actually fire, we must key them on the
--- *worker* symbol rather than the wrapper symbol.  We do this by using
--- @dcSym = worker symbol@ in both the application expression @eVal@ and the
--- guard inside @go@, so the emitted 'F.SMeasure' entries are already
--- worker-keyed.
-
--- | Given @(dc, t)@ where @dc@ is a data constructor and @t@ is its spec type,
--- generate PLE rewrite rules for measures keyed on the worker DataCon symbol.
+-- | Generate measure rewrites at the carrier owned by this constructor Id.
+-- Wrapper equations use the canonical source constructor; worker equations
+-- use its distinct physical symbol when GHC changes the representation.
 --
 -- The measures are generated from the refinement in the result type of @t@,
 -- which is expected to be of the form
@@ -260,10 +263,9 @@ makeSimplify (var, t)
   = go $ specTypeToResultRef eVal t
   where
     trep = toRTypeRep t
-    -- All rewrites are keyed on the *worker* symbol.
-    -- See note [All rewrites keyed on the worker symbol].
+    -- Source equations and physical worker equations retain their own carriers.
     dcSym = case Ghc.idDetails var of
-      Ghc.DataConWrapId dc -> F.symbol (Ghc.dataConWorkId dc)
+      Ghc.DataConWrapId dc -> F.symbol dc
       _                    -> F.symbol var
     -- Value-only binders: for GADT workers, drop the leading coercion binders
     -- that are present in the spec type but absent in the SMT encoding.

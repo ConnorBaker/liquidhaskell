@@ -266,17 +266,22 @@ data GhcSpecSig = SpSig
 -- predicates of refinement types requires translating them to Core.
 --
 -- For each refinement that can be translated to Haskell, elaboration produces
--- a synthetic function whose arguments are the values in scope at the point of
--- the refinement and whose result is the predicate as a 'Bool'.  For example,
+-- a synthetic function over the refinement telescope whose result is the
+-- predicate as a 'Bool'. Lexical captures remain free Core variables. For example,
 -- the refinement @x:Int -> {v:Int | v > x}@ generates @\x v -> v > x@.
--- Elaboration is implemented in 'Language.Haskell.Liquid.Bare.Elaborate.elaborateSpecTypeWith'.
+-- Elaboration is implemented in 'Language.Haskell.Liquid.Bare.Elaborate.elaborateSpecTypeWithPrimitives'.
 --
--- 'refinementCheckExpr' stores that function as GHC Core and
--- 'refinementCheckType' is the original Liquid signature.
+-- 'refinementCheckExpr' stores that open function as GHC Core,
+-- 'refinementCheckType' is its checking telescope, and 'refinementCheckOwner'
+-- identifies the source binding whose actual lexical environment checks it.
 
 data RefinementCheck = RefinementCheck
-  { refinementCheckExpr :: !CoreExpr
+  { refinementCheckOwner :: !Var
+  , refinementCheckExpr :: !CoreExpr
   , refinementCheckType :: !LocSpecType
+  -- Query-owned interpretations of opaque logical carriers. They are not
+  -- source datatypes and are never serialized in a lifted specification.
+  , refinementCheckEmbeds :: !(F.TCEmb TyCon)
   }
 
 instance Show RefinementCheck where
@@ -326,6 +331,7 @@ data GhcSpecNames = SpNames
   , gsADTs       :: ![F.DataDecl]                 -- ^ ADTs extracted from Haskell 'data' definitions
   , gsTyconEnv   :: !TyConMap
   , gsDataConIds :: [Var]
+  , gsConstructorBoxes :: !(M.HashMap DataCon ConstructorBox)
   }
   deriving Show
 
@@ -737,7 +743,8 @@ instance Monoid (Spec lname ty) where
 data LiftedSpec = LiftedSpec
   { -- | Measures (a.k.a.  user-defined properties for ADTs)
     --
-    -- The key of the HashMap is the unqualified name of the measure.
+    -- The key is the unqualified name of an ordinary measure, or the full
+    -- identity of a generated logic name (which is not source qualification).
     -- Constructing such a map discards preceding measures with the same name
     -- as later measures, which makes possible to predict which of a few
     -- conflicting measures will be exported.
@@ -984,7 +991,7 @@ toLiftedSpec :: BareSpecLHName -> LiftedSpec
 toLiftedSpec a = LiftedSpec
   { liftedMeasures   =
       M.fromList
-        [ (dropModuleNames $ lhNameToResolvedSymbol n, m)
+        [ (lhNameToUnqualifiedSymbol n, m)
         | m <- measures a
         , let n = val $ msName m
         ]

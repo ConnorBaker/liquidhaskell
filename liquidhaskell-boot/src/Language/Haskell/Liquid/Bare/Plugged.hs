@@ -21,11 +21,11 @@ import qualified Data.HashSet                      as S
 import qualified Data.Maybe                        as Mb
 import qualified Data.List                         as L
 import qualified Language.Fixpoint.Types           as F
-import qualified Language.Fixpoint.Types.Visitor   as F
 import qualified Language.Haskell.Liquid.GHC.Misc  as GM
 import qualified Liquid.GHC.API   as Ghc
 import           Language.Haskell.Liquid.GHC.Types (StableName, mkStableName)
 import           Language.Haskell.Liquid.Types.DataDecl
+import           Language.Haskell.Liquid.Types.PredType (dataConRuntimeFields)
 import           Language.Haskell.Liquid.Types.Errors
 import           Language.Haskell.Liquid.Types.Names
 import           Language.Haskell.Liquid.Types.RefType
@@ -97,7 +97,8 @@ makePluggedDataCon allowTC embs tyi ldcp
   | mismatchFlds      = Ex.throw (err "fields") -- (err $  "fields:" <+> F.pprint (length dts) <+> " vs " <+> F.pprint ( dcArgs))
   | mismatchTyVars    = Ex.throw (err "type variables")
   | otherwise         = F.atLoc ldcp $ F.notracepp "makePluggedDataCon" $ dcp
-                          { dcpFreeTyVars = dcVars
+                          { dcpFreeTyVars = actualVars
+                          , dcpFreePred  = subts ownerSorts <$> dcpFreePred dcp
                           , dcpTyConstrs  = constrs
                           , dcpTyArgs     = reverse tArgs
                           , dcpTyRes      = tRes
@@ -105,14 +106,18 @@ makePluggedDataCon allowTC embs tyi ldcp
   where
     (tArgs, tRes)     = plugMany allowTC  embs tyi ldcp (das, dts, dt) (dcVars, dcArgs, dcpTyRes dcp)
     (das, theta, originDts, dt) = {- F.notracepp ("makePluggedDC: " ++ F.showpp dc) $ -} Ghc.dataConSig dc
-    consClassArgs     = if allowTC && isClassDc then filter (not . GM.isEmbeddedDictType) theta else []
+    consClassArgs = if isClassDc then filter (not . GM.isEmbeddedDictType) theta else []
     dts               = consClassArgs ++ originDts
     isClassDc         = Ghc.isClassTyCon (Ghc.dataConTyCon dc)
     -- For class dictionary constructors, the dictionary arguments correspond to
     -- constructor fields and are included in `dts`, and not in `constrs`.
-    constrs           = if allowTC && isClassDc then [] else dcpTyConstrs dcp
+    constrs = if isClassDc then [] else subts ownerSorts <$> dcpTyConstrs dcp
+    actualVars        = rTyVar <$> das
+    ownerVars         = zip dcVars actualVars
+    ownerSorts        :: [(RTyVar, RSort)]
+    ownerSorts        = [(source, RVar target NoReft) | (source, target) <- ownerVars]
 
-    dcArgs            = reverse $ filter (not . (if allowTC then isEmbeddedClass else isClassType) . snd) (dcpTyArgs dcp)
+    dcArgs = if isClassDc then dataConRuntimeFields dcp else reverse $ filter (not . isEmbeddedClass . snd) (dcpTyArgs dcp)
     dcVars            = if isGADT
                           then padGADVars $ L.nub (dcpFreeTyVars dcp ++ concatMap (map ty_var_value . freeTyVars) (dcpTyRes dcp:(snd <$> dcArgs)))
                           else dcpFreeTyVars dcp
@@ -155,7 +160,7 @@ plugMany allowTC embs tyi ldcp (hsAs, hsArgs, hsRes) (lqAs, lqArgs, lqRes)
     lookupLHName s   = Mb.fromMaybe (panic (Just (GM.fSrcSpan ldcp)) $ "unexpected symbol: " ++ show s) $ lookup s lhNameMap
     lhNameMap        = [ (lhNameToUnqualifiedSymbol n, n) | n <- map fst lqArgs ]
     ((xs,_,ts,_), t) = bkArrow (val pT)
-    pT               = plugHoles allowTC (Bare.LqTV dcName) embs tyi (const killHoles) hsT (F.atLoc ldcp lqT)
+    pT               = plugHoles allowTC (Bare.HsTV dcName) embs tyi (const killHoles) hsT (F.atLoc ldcp lqT)
     hsT              = foldr (Ghc.mkFunTy Ghc.FTF_T_T Ghc.ManyTy) hsRes hsArgs'
     lqT              = foldr (uncurry (rFun' (classRFInfo allowTC))) lqRes' lqArgs'
     -- Substitute the GHC type variables (hsAs) in lqRes with the corresponding
@@ -165,7 +170,7 @@ plugMany allowTC embs tyi ldcp (hsAs, hsArgs, hsRes) (lqAs, lqArgs, lqRes)
     -- symbolRTyVar and therefore carries distinct synthetic RTyVars.
     -- Without this substitution, runMapTyVars sees the same GHC type variable
     -- mapped to two different Liquid RTyVars and throws an ErrMismatch.
-    lqRes'           = subts (zip (rTyVar <$> hsAs) lqAs) lqRes
+    lqRes'           = subts (zip (rTyVar <$> hsAs) [RVar variable NoReft :: RSort | variable <- lqAs]) lqRes
     hsArgs'          = [ Ghc.mkTyVarTy a               | a <- hsAs] ++ hsArgs
     lqArgs'          = [(F.dummySymbol, RVar a mempty) | a <- lqAs] ++ map (Bifunctor.first lhNameToUnqualifiedSymbol) lqArgs
     nTyVars          = length hsAs -- == length lqAs
@@ -184,31 +189,35 @@ plugHolesOld, plugHolesNew
   -> LocSpecType
 
 -- NOTE: this use of toType is safe as rt' is derived from t.
-plugHolesOld allowTC tce tyi xx f t0 zz@(Loc l l' st0)
-    = Loc l l'
-    . mkArrow (zip (updateRTVar <$> αs') rs) ps' []
-    . makeCls cs'
+-- Authored contexts are ordinary arrow telescopes for plugging. A wholly
+-- omitted context inherits the GHC rows after plugging the value type.
+plugHolesOld allowTC tce tyi xx f t0 zz@(Loc l l' st0) =
+  Loc l l'
+    . mkArrow (zip (updateRTVar <$> αs') rs) ps' (if null cs' then cs else [])
     -- Here `su` maps LH tyvars to GHC tyvars, so goPlug merges two types that
     -- both use GHC tyvars: binders inserted from the GHC side need no renaming,
     -- hence [].
-    . goPlug tce tyi [] err f (subts su rt)
-    . mapExprReft (\_ -> F.applyCoSub coSub)
-    . subts su
+    . goPlug True tce tyi [] err f (mkArrow [] [] (if null cs' then [] else cs) (subts su' rt))
+    . mkArrow [] [] cs'
+    . tx
     $ st
   where
-    tyvsmap      = case Bare.runMapTyVars allowTC (toType False rt) st err of
-                          Left e  -> Ex.throw e
-                          Right s -> Bare.vmap s
+    tyvsmap      = filter (\(variable, _) -> rTyVar variable `elem` owners) $ mapPlugTyVars allowTC cs0 rt cs0' st err
+    owners       = map ty_var_value $ freeTyVars $ mkArrow [] [] cs rt
     su           = [(y, rTyVar x)               | (x, y) <- tyvsmap]
     su'          = [(y, RVar (rTyVar x) NoReft) | (x, y) <- tyvsmap] :: [(RTyVar, RSort)]
-    coSub        = M.fromList [(F.symbol y, F.FObj (F.symbol x)) | (y, x) <- su]
+    tx t
+      | any (`capturesTypeBinder` t) su = Ex.throw (err (F.pprint t0) (F.pprint t) :: Error)
+      | otherwise = subts su' t
     ps'          = fmap (subts su') <$> ps
-    cs'          = [(F.dummySymbol, RApp c ts [] mempty) | (c, ts) <- cs2 ]
+    -- Dictionary labels own uses in the result. Transport the supplied rows
+    -- with the same type substitution as the body, rather than rebinding them.
+    cs  = [ (x, classRFInfo allowTC, t, r) | (x,t,r)<-cs0]
+    cs' = [(x, classRFInfo allowTC, tx t, subts su' r) | (x, t, r) <- cs0']
     (αs', rs)    = unzip αs
-    (αs,_,cs2,rt) = bkUnivClass (F.notracepp "hs-spec" $ ofType (Ghc.expandTypeSynonyms t0) :: SpecType)
-    (_,ps,_ ,st) = bkUnivClass (F.notracepp "lq-spec" st0)
+    (αs, _, cs0, rt) = bkUnivClass' (F.notracepp "hs-spec" $ ofType (Ghc.expandTypeSynonyms t0) :: SpecType)
+    (_, ps, cs0', st) = bkUnivClass' (F.notracepp "lq-spec" st0)
 
-    makeCls cs t = foldr (uncurry (rFun' (classRFInfo allowTC))) t cs
     err hsT lqT  = ErrMismatch (GM.fSrcSpan zz) (pprint xx)
                           (text "Plugged Init types old")
                           (pprint $ Ghc.expandTypeSynonyms t0)
@@ -218,67 +227,81 @@ plugHolesOld allowTC tce tyi xx f t0 zz@(Loc l l' st0)
 
 
 
-plugHolesNew allowTC@False tce tyi xx f t0 zz@(Loc l l' st0)
-    = Loc l l'
-    . mkArrow (zip (updateRTVar <$> as'') rs) ps []
-    . makeCls cs'
-    . goPlug tce tyi su err f rt'
+plugHolesNew allowTC tce tyi a f t0 zz@(Loc l l' st0) =
+  Loc l l'
+    . mkArrow (zip (updateRTVar <$> as'') rs) ps (if null cs' then cs else [])
+    . goPlug False tce tyi su err f (mkArrow [] [] (if null cs' then [] else cs) rt')
+    . mkArrow [] [] cs'
     $ st
   where
     rt'          = tx rt
     as''         = subRTVar su <$> as'
     (as',rs)     = unzip as
-    cs'          = [ (F.dummySymbol, ct) | (c, t) <- tyCons, let ct = tx (RApp c t [] mempty) ]
-    tx           = subts su
-    su           = case Bare.runMapTyVars allowTC (toType False rt) st err of
-                          Left e  -> Ex.throw e
-                          Right s -> [ (rTyVar x, y) | (x, y) <- Bare.vmap s]
-    (as,_,tyCons,rt) = bkUnivClass (ofType (Ghc.expandTypeSynonyms t0) :: SpecType)
-    (_,ps,_ ,st) = bkUnivClass st0
-
-    makeCls cs t = foldr (uncurry (rFun' (classRFInfo allowTC))) t cs
-    err hsT lqT  = ErrMismatch (GM.fSrcSpan zz) (pprint xx)
-                          (text "Plugged Init types new - TC disallowed")
-                          (pprint $ Ghc.expandTypeSynonyms t0)
-                          (pprint $ toRSort st0)
-                          (Just (hsT, lqT))
-                          (Ghc.getSrcSpan xx)
-
-
-plugHolesNew allowTC@True tce tyi a f t0 zz@(Loc l l' st0)
-    = Loc l l'
-    . mkArrow (zip (updateRTVar <$> as'') rs) ps (if length cs > length cs' then cs else cs')
-    -- . makeCls cs'
-    . goPlug tce tyi su err f rt'
-    $ st
-  where
-    rt'          = tx rt
-    as''         = subRTVar su <$> as'
-    (as',rs)     = unzip as
-    -- cs'          = [ (F.dummySymbol, ct) | (c, t) <- cs, let ct = tx (RApp c t [] mempty) ]
-    tx           = subts su
-    su           = case Bare.runMapTyVars allowTC (toType False rt) st err of
-                          Left e  -> Ex.throw e
-                          Right s -> [ (rTyVar x, y) | (x, y) <- Bare.vmap s]
+    tx = subts su'
+    su           = [(rTyVar x, y) | (x, y) <- mapPlugTyVars allowTC cs0 rt cs0' st err]
+    su'          = [(x, RVar y NoReft) | (x, y) <- su] :: [(RTyVar, RSort)]
     (as,_,cs0,rt) = bkUnivClass' (ofType (Ghc.expandTypeSynonyms t0) :: SpecType)
     (_,ps,cs0' ,st) = bkUnivClass' st0
-    cs  = [ (x, classRFInfo allowTC, t, r) | (x,t,r)<-cs0]
+    -- Here the supplied rows already use LH coordinates; only inferred GHC
+    -- rows need transport. Runtime binder ownership is independent of mode.
+    cs = [(x, classRFInfo allowTC, tx t, subts su' r) | (x, t, r) <- cs0]
     cs' = [ (x, classRFInfo allowTC, t, r) | (x,t,r)<-cs0']
 
-    err hsT lqT  = ErrMismatch (GM.fSrcSpan zz) (pprint a)
-                          (text "Plugged Init types new - TC allowed")
-                          (pprint $ Ghc.expandTypeSynonyms t0)
-                          (pprint $ toRSort st0)
-                          (Just (hsT, lqT))
-                          (Ghc.getSrcSpan a)
+    err hsT lqT =
+      ErrMismatch
+        (GM.fSrcSpan zz)
+        (pprint a)
+        (text "Plugged Init types new")
+        (pprint $ Ghc.expandTypeSynonyms t0)
+        (pprint $ toRSort st0)
+        (Just (hsT, lqT))
+        (Ghc.getSrcSpan a)
+
+-- Map variables through the authored context as well as the value type:
+-- an intermediate type may occur only in dictionary arguments.
+mapPlugTyVars ::
+  Bool ->
+  [(F.Symbol, SpecType, RReft)] ->
+  SpecType ->
+  [(F.Symbol, SpecType, RReft)] ->
+  SpecType ->
+  (Doc -> Doc -> Error) ->
+  [(Ghc.Var, RTyVar)]
+mapPlugTyVars allowTC actual actualBody authored authoredBody err =
+  case Bare.runMapTyVars allowTC (toType False actualType) (context authored authoredBody) err of
+    Left e -> Ex.throw e
+    Right s -> Bare.vmap s
+ where
+  actualType
+    | null authored = actualBody
+    | otherwise = context actual actualBody
+  context rows = mkArrow [] [] [(x, classRFInfo allowTC, ty, reft) | (x, ty, reft) <- rows]
 
 subRTVar :: [(RTyVar, RTyVar)] -> SpecRTVar -> SpecRTVar
 subRTVar su a@(RTVar v i) = Mb.maybe a (`RTVar` i) (lookup v su)
 
-goPlug :: F.TCEmb Ghc.TyCon -> Bare.TyConMap -> [(RTyVar, RTyVar)] -> (Doc -> Doc -> Error) -> (SpecType -> RReft -> RReft) -> SpecType -> SpecType
-       -> SpecType
-goPlug tce tyi su err f = go
+-- GHC-owned replacements must remain free under retained source binders.
+-- Ordinary authored coordinates are synthetic; already-aligned coordinates
+-- need no renaming. Refuse a mixed telescope that would capture a replacement.
+capturesTypeBinder :: (RTyVar, RTyVar) -> SpecType -> Bool
+capturesTypeBinder (old, new@(RTV replacement))
+    | old == new = const False
+    | otherwise = \ty -> foldRType observe (observe False ty) ty
   where
+    observe captured ty =
+        captured || case ty of
+            RAllT binder _ _ | RTV variable <- ty_var_value binder -> Ghc.getUnique variable == Ghc.getUnique replacement
+            _ -> False
+
+goPlug :: Bool -> F.TCEmb Ghc.TyCon -> Bare.TyConMap -> [(RTyVar, RTyVar)] -> (Doc -> Doc -> Error) -> (SpecType -> RReft -> RReft) -> SpecType -> SpecType
+       -> SpecType
+goPlug ghcOwned tce tyi su err f = go
+  where
+    go st@(RLit _) (RHole r)
+      | isTauto r = st
+      | otherwise = Ex.throw (err (F.pprint st) (F.pprint (RHole r :: SpecType)))
+    go (RLit l) t@(RLit l')
+      | l == l' = t
     go st (RHole r) = (addHoles t') { rt_reft = f st r }
       where
         t'         = everywhere (mkT $ addRefs tce tyi) st
@@ -291,7 +314,15 @@ goPlug tce tyi su err f = go
 
     go (RVar _ _)       v@(RVar _ _)       = v
     go (RFun _ _ i o _) (RFun x ii i' o' r)               = RFun x ii    (go i i')   (go o o') r
-    go (RAllT _ t _)    (RAllT a t' r)     = RAllT a    (go t t') r
+    go (RAllT actual t _) (RAllT authored t' r)
+      | ghcOwned
+      , capturesTypeBinder (ty_var_value authored, ty_var_value actual) t' = Ex.throw (err (F.pprint t) (F.pprint t'))
+      | ghcOwned =
+          let old = ty_var_value authored
+              new = ty_var_value actual
+              replacement = RVar new mempty
+          in RAllT actual (go t (subsTyVarMeet' (old, replacement) t')) r
+      | otherwise = RAllT authored (go t t') r
     -- Binder comes from the GHC type but the body uses LH tyvars. Rename it via
     -- `su` or it binds nothing (Issue #2727).
     go (RAllT a t r)    t'                 = RAllT (subRTVar su a) (go t t') r

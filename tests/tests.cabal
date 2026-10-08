@@ -2,6 +2,27 @@ cabal-version:      3.4
 name:               tests
 version:            0.1.0.0
 
+data-files:
+  import/client/ConstructorSourcePublication.hs
+  import/client/ConstructorSourcePublicationFalse.hs
+  import/lib/ConstructorSourcePublicationLib.hs
+  measure/pos/MeasureGadt.hs
+  neg/ConstructorAnonymousFields.hs
+  neg/ConstructorBoxedSource.hs
+  neg/ConstructorExistentialWorker.hs
+  neg/ConstructorPolymorphicReflection.hs
+  neg/ConstructorWholeSource.hs
+  neg/InterleavedMethodEvidence.hs
+  neg/MeasureUnrelatedScrutinee.hs
+  plugin-boundary-tests/fixtures/**/*.hs
+  pos/ConstructorAnonymousFields.hs
+  pos/ConstructorBoxedSource.hs
+  pos/ConstructorExistentialWorker.hs
+  pos/ConstructorPolymorphicReflection.hs
+  pos/ConstructorWholeSource.hs
+  pos/InterleavedMethodEvidence.hs
+  pos/MeasureArgumentScrutinee.hs
+
 -- A short (one-line) description of the package.
 -- synopsis:
 
@@ -660,6 +681,7 @@ executable errors
                     , ShadowFieldInline
                     , ShadowFieldReflect
                     , ShadowMeasure
+                    , ImportedMeasureAuthoredConflict
                     -- , ShadowMeasureVar
                     , SplitSubtype
                     , T1140
@@ -1059,13 +1081,26 @@ executable datacon-pos
                     , T1476
                     , T1477
                     , T1777
+                    , ImportedMeasureArrowLib
+                    , ImportedMeasureReexport
+                    , ImportedMeasureDomainLib
+                    , ImportedMeasureMapLib
+                    , ImportedMeasureArrow
+                    , ImportedMeasureDomain
+                    , ImportedMeasureMap
+                    , PolymorphicEmptyTwoSorts
+                    , PolymorphicEmptyAliases
+                    , PolymorphicMemptyArgument
+                    , PolymorphicNested
 
     build-depends:    base
                     , liquid-prelude
                     , liquidhaskell
+                    , containers
 
     hs-source-dirs:   app
                     , datacon/pos
+                    , datacon/lib
 
 flag datacon-neg
      default: False
@@ -1086,13 +1121,26 @@ executable datacon-neg
                     , Date
                     -- , NewTypes0
                     , NewTypes
+                    , ImportedMeasureArrowLib
+                    , ImportedMeasureReexport
+                    , ImportedMeasureDomainLib
+                    , ImportedMeasureMapLib
+                    , ImportedMeasureArrowWrong
+                    , ImportedMeasureDomainWrong
+                    , ImportedMeasureFieldWrong
+                    , ImportedMeasureMapWrong
+                    , PolymorphicEmptyFalseMember
+                    , PolymorphicMemptyWrongValue
+                    , PolymorphicNestedWrong
 
     build-depends:    base
                     , liquid-prelude
                     , liquidhaskell
+                    , containers
 
     hs-source-dirs:   app
                     , datacon/neg
+                    , datacon/lib
 
 flag Diff
      default: False
@@ -1229,6 +1277,8 @@ executable unit-neg
                     , Meas9
                     , MeasureContains
                     , MeasureDups
+                    , MeasurePatternDuplicate
+                    , MeasurePatternFreeWildcard
                     , MergeSort
                     , Monad3
                     , Monad4
@@ -1409,6 +1459,8 @@ executable unit-pos-1
                     , Meas12
                     , MeasureContains
                     , MeasureDups
+                    , MeasurePatternWildcards
+                    , SymbolLiteralSorts
                     , Measures1
                     , MeasureSets
                     , Measures
@@ -2833,3 +2885,38 @@ executable plugin-package-pos
     -- Hide liquidhaskell from regular imports and expose only as plugin package.
     -- This tests that LHAssumptions modules are found via findPluginModule.
     ghc-options:      -hide-package liquidhaskell -plugin-package liquidhaskell
+
+-- Actual installed-plugin tests. The gate supplies its matching compiler via
+-- LIQUID_TEST_GHC; a missing compiler or plugin unit is a failure, never a skip.
+test-suite plugin-boundary-tests
+  type: exitcode-stdio-1.0
+  main-is: Main.hs
+  hs-source-dirs: plugin-boundary-tests
+  other-modules:
+    CompilerFixture
+    ConstructorTests
+    ImportedBodyTests
+    OpaqueIdentityTests
+    Paths_tests
+    PublicationTests
+    QueryAssertions
+    SourceJudgmentTests
+
+  autogen-modules: Paths_tests
+  build-depends:
+    base,
+    bytestring,
+    directory,
+    filepath,
+    liquid-fixpoint,
+    process,
+    store,
+    tasty,
+    tasty-hunit,
+    temporary,
+
+  default-language: Haskell2010
+  ghc-options:
+    -threaded
+    -Wall
+    -Werror

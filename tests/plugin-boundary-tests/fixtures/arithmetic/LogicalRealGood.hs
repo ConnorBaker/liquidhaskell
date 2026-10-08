@@ -1,0 +1,5 @@
+module LogicalRealGood where
+
+{-@ witness :: {v:() | 1 + 2.5 = 3.5 && 2.5 - 0.5 = 2.0 && 2.0 * 1.5 = 3.0 && 3.0 / 1.5 = 2.0 && -1.5 + 1.5 = 0.0} @-}
+witness :: ()
+witness = ()

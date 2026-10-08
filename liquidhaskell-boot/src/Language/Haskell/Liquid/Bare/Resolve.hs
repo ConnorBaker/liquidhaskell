@@ -118,33 +118,46 @@ getGlobalSyms (_, spec)
   where
     mbName = lhNameToResolvedSymbol . F.val . msName
 
-makeLocalVars :: [Ghc.CoreBind] -> LocalVars
-makeLocalVars = localVarMap . localBinds
+makeLocalVars :: [(Ghc.Var, [(Ghc.Var, Ghc.Var)])] -> [Ghc.CoreBind] -> LocalVars
+makeLocalVars renamings = localVarMap . map transport . localBinds
+  where
+    transport details =
+        details
+            { lvdLclEnv = [(name, rename identifier) | (name, identifier) <- lvdLclEnv details]
+            }
+      where
+        scope = maybe [] id (lookup (lvdVar details) renamings)
+        rename identifier =
+            maybe identifier snd $
+                L.find
+                    (\(old, _) -> old == identifier && Ghc.stableNameCmp (Ghc.getName old) (Ghc.getName identifier) == EQ)
+                    scope
 
 localBinds :: [Ghc.CoreBind] -> [LocalVarDetails]
 localBinds                    = concatMap (bgoT [])
   where
     bgoT g (Ghc.NonRec x e) = pgo g True False (x, e)
-    bgoT g (Ghc.Rec xes)    = concatMap (pgo g True True) xes
+    bgoT g (Ghc.Rec xes) = concatMap (pgo (map fst xes ++ g) True True) xes
     pgo g isTopLevel isRec (x, e) = mkLocalVarDetails g isTopLevel isRec x : go g e
     bgo g (Ghc.NonRec x e)  = pgo g False False (x, e)
-    bgo g (Ghc.Rec xes)     = concatMap (pgo g False True) xes
+    bgo g (Ghc.Rec xes) = concatMap (pgo (map fst xes ++ g) False True) xes
     go g (Ghc.App e a)       = concatMap (go g) [e, a]
     go g (Ghc.Lam x e)       = go (x:g) e
     go g (Ghc.Let b e)       = bgo g b ++ go (Ghc.bindersOf b ++ g) e
     go g (Ghc.Tick _ e)      = go g e
     go g (Ghc.Cast e _)      = go g e
-    go g (Ghc.Case e _ _ cs) = go g e ++ concatMap (\(Ghc.Alt _ bs e') -> go (bs ++ g) e') cs
+    go g (Ghc.Case e x _ cs) = go g e ++ concatMap (\(Ghc.Alt _ bs e') -> go (bs ++ x : g) e') cs
     go _ (Ghc.Var _)         = []
     go _ _                   = []
 
-    mkLocalVarDetails g isTopLevel isRec v = LocalVarDetails
-      { lvdSourcePos = F.sp_start $ F.srcSpan v
-      , lvdVar = v
-      , lvdLclEnv = g
-      , lvdIsTopLevel = isTopLevel
-      , lvdIsRec = isRec
-      }
+    mkLocalVarDetails g isTopLevel isRec v =
+        LocalVarDetails
+            { lvdSourcePos = F.sp_start $ F.srcSpan v
+            , lvdVar = v
+            , lvdLclEnv = [(F.symbol (Ghc.occNameString (Ghc.nameOccName (Ghc.getName x))), x) | x <- g]
+            , lvdIsTopLevel = isTopLevel
+            , lvdIsRec = isRec
+            }
 
 localVarMap :: [LocalVarDetails] -> LocalVars
 localVarMap lvds =
@@ -247,7 +260,7 @@ lookupGhcDataConLHName env lname = do
 lookupGhcIdLHName :: HasCallStack => Env -> Located LHName -> Lookup Ghc.Id
 lookupGhcIdLHName env lname =
    case lookupTyThing (reTyLookupEnv env) lname of
-     Ghc.AConLike (Ghc.RealDataCon d) -> Right (Ghc.dataConWorkId d)
+     Ghc.AConLike (Ghc.RealDataCon d) -> Right (Ghc.dataConWrapId d)
      Ghc.AnId x -> Right x
      _ -> panic
            (Just $ GM.fSrcSpan lname) $ "not a variable or data constructor: " ++ show (val lname)
@@ -260,7 +273,7 @@ lookupGhcTyThingFromName env n =
 lookupGhcId :: Env -> Ghc.Name -> Maybe Ghc.Id
 lookupGhcId env n =
     case lookupGhcTyThingFromName env' n of
-      Just (Ghc.AConLike (Ghc.RealDataCon d)) -> Just (Ghc.dataConWorkId d)
+      Just (Ghc.AConLike (Ghc.RealDataCon d)) -> Just (Ghc.dataConWrapId d)
       Just (Ghc.AnId x) -> Just x
       _ -> Nothing
   where
@@ -419,6 +432,7 @@ ofBRType env rebindR f l = go []
     go bs (RRTy xts r o t)  = RRTy  <$> xts' <*> goReft bs r <*> pure o <*> go bs t
       where xts'            = mapM (traverse (go bs)) xts
     go bs (RHole r)         = RHole    <$> goReft bs r
+    go _ (RLit l)          = pure (RLit l)
     go _ (RExprArg le)      = return    $ RExprArg le
     goRef bs (RProp ss (RHole r)) = rPropP <$> mapM goSyms ss <*> goReft bs r
     goRef bs (RProp ss t)         = RProp  <$> mapM goSyms ss <*> go bs t
@@ -494,36 +508,15 @@ bareTCApp r (Loc l _ c) rs ts | Just rhs <- Ghc.synTyConRhs_maybe c
                                   , pprint (GM.realTcArity c)
                                   , PJ.text "arguments, but is given"
                                   , pprint (length ts) ] )
--- TODO expandTypeSynonyms here to
-bareTCApp r (Loc _ _ c) rs ts | Ghc.isFamilyTyCon c && isTrivial t
-  = expandRTypeSynonyms (t `RT.strengthen` r)
-  where t = RT.rApp c ts rs trueReft
-
 bareTCApp r (Loc _ _ c) rs ts
   = RT.rApp c ts rs r
 
 
-tyApp :: Meet r => RType c tv r -> [RType c tv r] -> [RTProp c tv r] -> r
+tyApp :: (Meet r, IsReft r, Eq (ReftVar r)) => RType c tv r -> [RType c tv r] -> [RTProp c tv r] -> r
       -> RType c tv r
 tyApp (RApp c ts rs r) ts' rs' r' = RApp c (ts ++ ts') (rs ++ rs') (r `meet` r')
 tyApp t                []  []  r  = t `RT.strengthen` r
 tyApp _                 _  _   _  = panic Nothing "Bare.Type.tyApp on invalid inputs"
-
-expandRTypeSynonyms :: (Expandable r) => RRType r -> RRType r
-expandRTypeSynonyms = RT.ofType . Ghc.expandTypeSynonyms . RT.toType False
-
-{-
-expandRTypeSynonyms :: (Expandable r) => RRType r -> RRType r
-expandRTypeSynonyms t
-  | rTypeHasHole t = t
-  | otherwise      = expandRTypeSynonyms' t
-
-rTypeHasHole :: RType c tv r -> Bool
-rTypeHasHole = foldRType f False
-  where
-    f _ (RHole _) = True
-    f b _         = b
--}
 
 ------------------------------------------------------------------------------------------
 -- | Is this the SAME as addTyConInfo? No. `txRefSort`
@@ -622,7 +615,20 @@ resolveLocalBinds :: Env -> [(Ghc.Var, LocBareType, Maybe [Located F.Expr])]
 resolveLocalBinds env xtes = [ (x,t,es) | (x, (t, es)) <- topTs ++ replace locTs ]
   where
     (locTs, topTs)         = partitionLocalBinds [ (x, (t, es)) | (x, t, es) <- xtes]
-    replace                = M.toList . replaceSigs . M.fromList
+    replace = M.toList . replaceSigs . M.fromList . map renameCaptures
+    -- ANF changes case-binder names as well as identities. Resolve authored
+    -- free names through the same owner-scoped transport used by query Core.
+    renameCaptures (owner, signature) = (owner, renameLocalSig captures signature)
+      where
+        captures =
+            M.fromList
+                [ (name, F.symbol identifier)
+                | (name, identifier) <-
+                    reverse $
+                        maybe [] lvdLclEnv $
+                            Ghc.lookupNameEnv (lvNames (reLocalVars env)) (Ghc.getName owner)
+                , Ghc.isId identifier
+                ]
     replaceSigs sigm       = coreVisitor replaceVisitor M.empty sigm cbs
     cbs                    = _giCbs (reSrc env)
 

@@ -13,6 +13,7 @@
 
 module Main where
 
+import qualified MeasurePatternBinderTests
 import           Control.Monad (unless)
 import           Data.Data
 import           Data.Char (isSpace)
@@ -47,6 +48,7 @@ tests =
     , testFails
     , testErrorReporting
     , testShellWords
+    , MeasurePatternBinderTests.tests
     ]
 
 -- | Tests for 'shellWords', which is used to parse LIQUIDHASKELL_OPTS.

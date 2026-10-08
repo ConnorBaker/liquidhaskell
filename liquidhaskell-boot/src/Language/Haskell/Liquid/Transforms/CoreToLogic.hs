@@ -12,6 +12,8 @@ module Language.Haskell.Liquid.Transforms.CoreToLogic
   ( coreToDef
   , coreToFun
   , coreToLogic
+  , coreToLogicWithDefinitions
+  , LogicM, castToLg
   , mkLit, mkI, mkS
   , runToLogic
   , runToLogicWithBoolBinds
@@ -20,6 +22,9 @@ module Language.Haskell.Liquid.Transforms.CoreToLogic
   , measureSpecType
   , weakenResult
   , normalizeCoreExpr
+  , preserveDemand
+  , NewtypeCoercion(..)
+  , newtypeCoercionDataCon
   ) where
 
 import           Data.Bifunctor (first)
@@ -36,12 +41,16 @@ import qualified Data.Char
 import qualified Text.Printf as Printf
 import           Data.Text.Encoding
 import           Data.Text.Encoding.Error
+import           Control.Monad (forM, unless, zipWithM)
 import           Control.Monad.Except
 import           Control.Monad.Identity
+import qualified Control.Monad.Writer.Lazy as Writer
 import qualified Language.Haskell.Liquid.Misc          as Misc
 import           Language.Fixpoint.Types               hiding (panic, Error, R, simplify, isBool)
 import qualified Language.Fixpoint.Types               as F
+import qualified Language.Fixpoint.Types.Visitor       as Vis
 import qualified Language.Haskell.Liquid.GHC.Misc      as GM
+import Language.Haskell.Liquid.GHC.PrimitiveContract (dataTagPrefix, dataTagInterpretation)
 
 
 import           Language.Haskell.Liquid.Bare.Types
@@ -55,18 +64,26 @@ import           Language.Haskell.Liquid.Types.RTypeOp
 import           Language.Haskell.Liquid.Types.Types
 
 import qualified Data.HashMap.Strict                   as M
+import qualified Data.HashSet                          as S
+import qualified Language.Haskell.Liquid.Measure       as Ms
+import qualified GHC.Core                             as Core
+import qualified GHC.Core.Coercion as Core
+import qualified GHC.Core.Utils as Core
+import qualified GHC.Core.Type as GhcType
+import qualified GHC.Core.TyCo.Rep as GhcType
+import GHC.Types.Var (isInvisibleFunArg)
+import GHC.Builtin.Types (doubleDataCon)
+import GHC.Types.Literal (LitNumType(LitNumBigNat))
 import Control.Monad.Reader
 import Language.Haskell.Liquid.UX.Config
 
-import Data.Ratio
-import GHC.Base ((+#), (-#), (*#))
 
 logicType :: (IsReft r) => Bool -> Type -> RRType r
-logicType allowTC τ      = fromRTypeRep $ t { ty_binds = bs, ty_info = is, ty_args = as, ty_refts = rs}
+logicType _allowTC τ = fromRTypeRep $ t{ty_binds = bs, ty_info = is, ty_args = as, ty_refts = rs}
   where
     t            = toRTypeRep $ ofType τ
     (bs, is, as, rs) = Misc.unzip4 $ dropWhile (isErasable' . Misc.thd4) $ Misc.zip4 (ty_binds t) (ty_info t) (ty_args t) (ty_refts t)
-    isErasable'  = if allowTC then isEmbeddedClass else isClassType
+    isErasable' = isEmbeddedClass
 
 {- | [NOTE:inlineSpecType type]: the refinement depends on whether the result type is a Bool or not:
       CASE1: measure f@logic :: X -> Bool <=> f@haskell :: x:X -> {v:Bool | v <=> (f@logic x)}
@@ -74,14 +91,14 @@ logicType allowTC τ      = fromRTypeRep $ t { ty_binds = bs, ty_info = is, ty_a
  -}
 -- formerly: strengthenResult
 inlineSpecType :: Bool -> Var -> SpecType
-inlineSpecType  allowTC v = fromRTypeRep $ rep {ty_res = res `strengthen` r , ty_binds = xs}
+inlineSpecType _allowTC v = fromRTypeRep $ rep{ty_res = res `strengthen` r, ty_binds = xs}
   where
     r              = MkUReft (mkReft (mkEApp f (mkA <$> vxs))) mempty
     rep            = toRTypeRep t
     res            = ty_res rep
-    xs             = intSymbol (symbol ("x" :: String)) <$> [1..length $ ty_binds rep]
+    xs = intSymbol (symbol ("x" :: String)) <$> [1 .. length $ ty_binds rep]
     vxs            = dropWhile (isErasable' . snd) $ zip xs (ty_args rep)
-    isErasable'    = if allowTC then isEmbeddedClass else isClassType
+    isErasable' = isEmbeddedClass
     f              = dummyLoc (symbol v)
     t              = ofType (GM.expandVarType v) :: SpecType
     mkA            = EVar . fst
@@ -97,7 +114,7 @@ inlineSpecType  allowTC v = fromRTypeRep $ rep {ty_res = res `strengthen` r , ty
 
 -- formerly: strengthenResult'
 measureSpecType :: Bool -> Var -> SpecType
-measureSpecType allowTC v = go mkT [] [(1::Int)..] st
+measureSpecType _allowTC v = go mkT [] [(1 :: Int) ..] st
   where
     mkReft :: Expr -> Reft
     mkReft | boolRes   = propReft
@@ -110,7 +127,7 @@ measureSpecType allowTC v = go mkT [] [(1::Int)..] st
     go f args i (RAllT a t r)    = RAllT a (go f args i t) r
     go f args i (RAllP p t)      = RAllP p $ go f args i t
     go f args i (RFun x ii t1 t2 r)
-     | (if allowTC then isEmbeddedClass else isClassType) t1           = RFun x ii t1 (go f args i t2) r
+        | isEmbeddedClass t1 = RFun x ii t1 (go f args i t2) r
     go f args i t@(RFun _ ii t1 t2 r)
      | hasRApps t               = RFun x' ii t1 (go f (x':args) (tail i) t2) r
                                        where x' = intSymbol (symbol ("x" :: String)) (head i)
@@ -126,18 +143,18 @@ measureSpecType allowTC v = go mkT [] [(1::Int)..] st
 --   This should only be used _when_ checking the body of 'foo'
 --   where the output, is, by definition, equal to the singleton.
 weakenResult :: Bool -> Var -> SpecType -> SpecType
-weakenResult allowTC v t = F.notracepp msg t'
+weakenResult _allowTC v t = F.notracepp msg t'
   where
-    msg          = "weakenResult v =" ++ GM.showPpr v ++ " t = " ++ showpp t
+    msg = "weakenResult v =" ++ GM.showPpr v ++ " t = " ++ showpp t
     t'           = fromRTypeRep $ rep { ty_res = mapExprReft weaken (ty_res rep) }
     rep          = toRTypeRep t
     weaken x     = pAnd . filter ((Just vE /=) . isSingletonExpr x) . conjuncts
     vE           = mkEApp vF xs
-    xs           = EVar . fst <$> dropWhile ((if allowTC then isEmbeddedClass else isClassType) . snd) xts
+    xs = EVar . fst <$> dropWhile (isEmbeddedClass . snd) xts
     xts          = zip (ty_binds rep) (ty_args rep)
     vF           = dummyLoc (symbol v)
 
-type LogicM = ExceptT Error (ReaderT LState Identity)
+type LogicM = ExceptT Error (Writer.WriterT LogicSupport (ReaderT LState Identity))
 
 data LState = LState
   { lsSymMap  :: LogicMap
@@ -146,6 +163,8 @@ data LState = LState
   , lsBools   :: [Var]
   , lsDCMap   :: DataConMap
   , lsConfig  :: Config
+  , lsConstructorBoxes :: M.HashMap DataCon ConstructorBox
+  , lsSourceFields :: [(CoreExpr, Expr)]
   }
 
 throw :: String -> LogicM a
@@ -157,21 +176,25 @@ getState :: LogicM LState
 getState = ask
 
 runToLogic
-  :: TCEmb TyCon -> LogicMap -> DataConMap -> Config -> (String -> Error)
-  -> LogicM t -> Either Error t
+  :: M.HashMap DataCon ConstructorBox -> TCEmb TyCon -> LogicMap -> DataConMap -> Config -> (String -> Error)
+  -> LogicM t -> Either Error (t, LogicSupport)
 runToLogic = runToLogicWithBoolBinds []
 
 runToLogicWithBoolBinds
-  :: [Var] -> TCEmb TyCon -> LogicMap -> DataConMap -> Config -> (String -> Error)
-  -> LogicM t -> Either Error t
-runToLogicWithBoolBinds xs tce lmap dm cfg ferror m
-  = runReader (runExceptT m) $ LState
+  :: [Var] -> M.HashMap DataCon ConstructorBox -> TCEmb TyCon -> LogicMap -> DataConMap -> Config -> (String -> Error)
+  -> LogicM t -> Either Error (t, LogicSupport)
+runToLogicWithBoolBinds xs boxes tce lmap dm cfg ferror m
+  = fmap (, support) result
+  where
+    (result, support) = runReader (Writer.runWriterT (runExceptT m)) $ LState
       { lsSymMap = lmap
       , lsError  = ferror
       , lsEmb    = tce
       , lsBools  = xs
       , lsDCMap  = dm
       , lsConfig = cfg
+      , lsConstructorBoxes = boxes
+      , lsSourceFields = []
       }
 
 coreAltToDef :: (IsReft r) => Located LHName -> Var -> [Var] -> Var -> Type -> [C.CoreAlt]
@@ -193,12 +216,17 @@ coreAltToDef locSym z zs y t alts
     -- mkAlt :: LocSymbol -> (Expr -> Body) -> [Var] -> Var -> (C.AltCon, [Var], C.CoreExpr)
     mkAlt x ctor _args dx (Alt (C.DataAlt d) xs e)
       = do
-          allowTC <- reader (typeclass . lsConfig)
-          let xs' = filter (not . if allowTC then GM.isEmbeddedDictVar else GM.isEvVar) xs
-          Def x {- (toArgs id args) -} d (Just $ varRType dx) (toArgs Just xs')
-               . ctor
-               . (`subst1` (F.symbol dx, F.mkEApp (GM.namedLocSymbol d) (F.eVar <$> xs')))
-              <$> coreToLg e
+          initial <- coreToLg e
+          fields <- sourceFields d (varType dx) (map Core.varToCoreExpr xs)
+          let (_, names) = F.freshInNSL (map (F.tempSymbol (lhNameToResolvedSymbol (val x))) [0 .. toInteger (length fields) - 1])
+                (F.syms initial `S.union` S.fromList (map F.symbol (dx:xs)))
+              images = map F.EVar names
+              annotations = [Just (F.atLoc x (ofType (exprType field))) | field <- fields]
+              whole = F.mkEApp (GM.namedLocSymbol d) images
+          su <- workerProjection xs fields images
+          expression <- withSourceFields fields images e
+          pure (Def x d (Just $ varRType dx) (zip names annotations)
+            (ctor (F.subst su expression `subst1` (F.symbol dx, whole))))
     mkAlt _ _ _ _ alt
       = throw $ "Bad alternative" ++ GM.showPpr alt
 
@@ -218,29 +246,56 @@ coreAltToDef locSym z zs y t alts
     mkDef _ _ _ _ _ _ =
       return []
 
-toArgs :: IsReft r => (Located (RRType r) -> b) -> [Var] -> [(Symbol, b)]
-toArgs f args = [(symbol x, f $ varRType x) | x <- args]
-
 defArgs :: IsReft r => Located LHName -> [Type] -> [(Symbol, Maybe (Located (RRType r)))]
 defArgs x     = zipWith (\i t -> (defArg i, defRTyp t)) [0..]
   where
     defArg    = tempSymbol (lhNameToResolvedSymbol $ val x)
     defRTyp   = Just . F.atLoc x . ofType
 
-coreToDef :: IsReft r => Located LHName -> Var -> C.CoreExpr
-          -> LogicM [Def (Located (RRType r)) DataCon]
-coreToDef locSym _ s              = do
+coreToDef ::
+    (IsReft r) =>
+    Located LHName ->
+    Var ->
+    C.CoreExpr ->
+    LogicM [Def (Located (RRType r)) DataCon]
+coreToDef locSym _ s = do
     allowTC <- reader $ typeclass . lsConfig
     go [] $ inlinePreds $ simplifyCoreExpr allowTC s
   where
-    go args   (C.Lam  x e)        = go (x:args) e
-    go args   (C.Tick _ e)        = go args e
-    go (z:zs) (C.Case _ y t alts) = coreAltToDef locSym z zs y t alts
-    go (z:zs) e
-      | Just t <- isMeasureArg z  = coreAltToDef locSym z zs z t [Alt C.DEFAULT [] e]
-    go _ _                        = measureFail locSym "Does not have a case-of at the top-level"
+    go args (C.Lam x e) = go (x : args) e
+    go args (C.Tick _ e) = go args e
+    go (z : zs) (C.Case scrutinee y t alts)
+        | ownsScrutinee z scrutinee =
+            owned (z : zs) $
+                coreAltToDef
+                    locSym
+                    z
+                    zs
+                    y
+                    t
+                    [Alt con xs (sub y (C.Var z) rhs) | Alt con xs rhs <- alts]
+        | otherwise =
+            measureFail locSym "Case scrutinee is not the selected measure argument"
+    go args (C.Let (C.NonRec x rhs) body)
+        | isId x = go args (sub x rhs body)
+    go (z : zs) e
+        | Just t <- isMeasureArg z = owned (z : zs) $ coreAltToDef locSym z zs z t [Alt C.DEFAULT [] e]
+    go _ _ = measureFail locSym "Does not have a case-of at the top-level"
 
-    inlinePreds   = inlineCoreExpr (eqType boolTy . GM.expandVarType)
+    inlinePreds = inlineCoreExpr (eqType boolTy . GM.expandVarType)
+    owned arguments = Writer.censor (filter (not . (`elem` arguments) . fst))
+
+    -- A constructor equation describes this argument, not an unrelated
+    -- value of the same type. Only source-preserving aliases may disappear.
+    ownsScrutinee z (C.Var x) = z == x
+    ownsScrutinee z (C.Tick _ expression) = ownsScrutinee z expression
+    ownsScrutinee z (C.Cast expression co)
+        | let (source, target) = coercionTypeEq co
+        , eqType (sourceFamily source) (sourceFamily target) =
+            ownsScrutinee z expression
+    ownsScrutinee _ _ = False
+
+    sourceFamily ty = maybe ty (uncurry Ghc.mkFamilyTyConApp) (Ghc.splitTyConApp_maybe ty)
 
 measureFail       :: Located LHName -> String -> a
 measureFail x msg = panic sp e
@@ -270,9 +325,8 @@ coreToFun _ _v s = do
   where
     go acc (C.Lam x e)  | isTyVar x = go acc e
     go acc (C.Lam x e)  = do
-      allowTC <- reader $ typeclass . lsConfig
-      let isE = if allowTC then GM.isEmbeddedDictVar else isErasable
-      if isE x then go acc e else go (x:acc) e
+        let isE = GM.isEmbeddedDictVar
+        if isE x then go acc e else go (x : acc) e
     go acc (C.Tick _ e) = go acc e
     go acc e            = (reverse acc,) . Right <$> coreToLg e
 
@@ -282,56 +336,129 @@ instance Show C.CoreExpr where
 
 coreToLogic :: C.CoreExpr -> LogicM Expr
 coreToLogic cb = do
-  allowTC <- reader $ typeclass . lsConfig
-  coreToLg $ normalizeCoreExpr allowTC cb
+    allowTC <- reader $ typeclass . lsConfig
+    coreToLg $ normalizeCoreExpr allowTC cb
 
+-- Interpret query-owned parameters and local implementations by their exact
+-- denotations. Their complete Core remains the input to ordinary checking;
+-- this environment changes only logical readback, not source assumptions.
+coreToLogicWithDefinitions :: [(Id, Expr)] -> CoreExpr -> LogicM Expr
+coreToLogicWithDefinitions definitions expression =
+    local
+        (\s -> s{lsSourceFields = [(C.Var identifier, meaning) | (identifier, meaning) <- definitions] ++ lsSourceFields s})
+        (coreToLogic expression)
+
+
+-- These local bindings name the actual typed source fields reconstructed by
+-- GHC. Preserve whole fields before projecting the remaining worker leaves.
+withSourceFields :: [CoreExpr] -> [Expr] -> CoreExpr -> LogicM Expr
+withSourceFields fields images expression = do
+    allowTC <- reader $ typeclass . lsConfig
+    local
+        (\s -> s{lsSourceFields = zip fields images ++ lsSourceFields s})
+        (coreToLg (normalizeCoreExpr allowTC expression))
 
 coreToLg :: C.CoreExpr -> LogicM Expr
-coreToLg (C.Let (C.NonRec x (C.Coercion c)) e)
-  = coreToLg (C.substExpr (C.extendCvSubst C.emptySubst x c) e)
-coreToLg (C.Let b e)
-  = subst1 <$> coreToLg e <*> makesub b
-coreToLg (C.Tick _ e)          = coreToLg e
-coreToLg (C.App (C.Var v) e)
-  | ignoreVar v                = coreToLg e
-coreToLg (C.Var x)
-  | x == falseDataConId        = return PFalse
-  | x == trueDataConId         = return PTrue
-  | otherwise                  = eVarWithMap x . lsSymMap <$> getState
-coreToLg e@(C.App _ _)         = toPredApp e
-coreToLg (C.Case e b _ alts)
-  | eqType (GM.expandVarType b) boolTy  = checkBoolAlts alts >>= coreToIte e
+coreToLg expression = do
+    config <- reader lsConfig
+    case GM.integerLiteral (targetIntBits config) expression of
+        Just magnitude -> do
+            embeddings <- reader lsEmb
+            unless (typeSort embeddings (exprType expression) == F.intSort) $
+                throw "A closed Integer literal requires the built-in integer logical sort"
+            pure (F.expr magnitude)
+        Nothing -> do
+            meaning <- coreMeaning expression
+            case meaning of
+                Just image -> pure image
+                Nothing -> coreToLg' expression
+
+coreMeaning :: CoreExpr -> LogicM (Maybe Expr)
+coreMeaning expression = do
+    fields <- reader lsSourceFields
+    pure (snd <$> L.find (\(field, _) -> Core.cheapEqExpr field expression && eqType (exprType field) (exprType expression)) fields)
+
+coreToLg' :: C.CoreExpr -> LogicM Expr
+coreToLg' expression
+    | Just (function, _, argument) <- dataTagPrefix expression = do
+        embeddings <- reader lsEmb
+        constructors <- reader lsDCMap
+        (result, _) <- either throw pure (dataTagInterpretation embeddings constructors argument)
+        let parameter = F.intSymbol (F.symbol function) 1
+        pure (F.ELam (parameter, typeSort embeddings argument) (result (F.EVar parameter)))
+coreToLg' (C.Let (C.NonRec x (C.Coercion c)) e) =
+    coreToLg (C.substExpr (C.extendCvSubst C.emptySubst x c) e)
+coreToLg' (C.Let (C.NonRec identifier rhs) body) = do
+    known <- coreMeaning (C.Var identifier)
+    case known of
+        Just _ -> coreToLg body
+        Nothing -> do
+            meaning <- coreToLg rhs
+            -- Interpret aliases before their uses. Substituting a lambda only
+            -- after interpreting applications loses their composition law.
+            local
+                (\s -> s{lsSourceFields = (C.Var identifier, meaning) : lsSourceFields s})
+                (coreToLg body)
+coreToLg' (C.Let C.Rec{} _) =
+    throw "Cannot make Logical Substitution of Recursive Definitions"
+coreToLg' (C.Tick _ e) = coreToLg e
+coreToLg' (C.Var x)
+    | x == falseDataConId = return PFalse
+    | x == trueDataConId = return PTrue
+    | ignoreVar x = do
+        embeddings <- reader lsEmb
+        case typeSort embeddings (varType x) of
+            F.FFunc domain result
+                | domain == result ->
+                    let parameter = F.intSymbol (F.symbol x) 1
+                     in pure (F.ELam (parameter, domain) (F.EVar parameter))
+            _ -> throw "Primitive numeric box requires identical logical field/result sorts"
+    | otherwise = do
+        state <- getState
+        definition <- declaredDefinition state (C.Var x)
+        case definition of
+            Just meaning -> pure meaning
+            Nothing -> do
+                Writer.tell [(x, rTypeSort (lsEmb state) (classRFInfoType True (ofType (varType x) :: SpecType)))]
+                pure (eVarWithMap x (lsSymMap state))
+coreToLg' e@(C.App _ _) = toPredApp e
+coreToLg' (C.Case e b _ alts)
+    | eqType (GM.expandVarType b) boolTy = checkBoolAlts alts >>= coreToIte b e
 -- coreToLg (C.Lam x e)           = do p     <- coreToLg e
 --                                     tce   <- lsEmb <$> getState
 --                                     return $ ELam (symbol x, typeSort tce (GM.expandVarType x)) p
-coreToLg (C.Case e b _ alts)   = do p <- coreToLg e
-                                    casesToLg b p alts
-coreToLg (C.Lit l)             = case mkLit l of
-                                          Nothing -> throw $ "Bad Literal in measure definition" ++ GM.showPpr l
-                                          Just i  -> return i
-coreToLg (C.Cast e c)
-  | Just (dc, ntCo) <- newtypeCoercionDataCon c
-  = do e'   <- coreToLg e
-       case ntCo of
-         -- @e |> (Rep ~ NT)@ is the newtype constructor applied to @e@.
-         WrapCoercion ->
-           return $ F.mkEApp (GM.namedLocSymbol dc) [e']
-         -- @e |> (NT ~ Rep)@ is the newtype field selector applied to @e@.
-         UnwrapCoercion -> do
-           dm <- reader lsDCMap
-           return $ EApp (EVar (makeDataConSelector (Just dm) dc 1)) e'
-coreToLg (C.Cast e c)          = do (s, t) <- coerceToLg c
-                                    e'     <- coreToLg e
-                                    return (ECoerc s t e')
+coreToLg' (C.Case e b _ alts) = do
+    p <- coreToLg e
+    casesToLg b p alts
+coreToLg' (C.Lit l) = case mkLit l of
+    Nothing -> throw $ "Bad Literal in measure definition" ++ GM.showPpr l
+    Just i -> return i
+coreToLg' (C.Cast e c) = coreToLg e >>= castToLg c
 -- elaboration reuses coretologic
 -- TODO: fix this
-coreToLg (C.Lam x e) = do p     <- coreToLg e
-                          tce   <- lsEmb <$> getState
-                          return $ ELam (symbol x, typeSort tce (GM.expandVarType x)) p
-coreToLg e                     = throw ("Cannot transform to Logic:\t" ++ GM.showPpr e)
+coreToLg' (C.Lam x e) = do
+    meaning <- coreMeaning (C.Var x)
+    p <- coreToLg e
+    case meaning of
+        Just _ -> pure p
+        Nothing -> do
+            tce <- lsEmb <$> getState
+            return $ ELam (symbol x, typeSort tce (GM.expandVarType x)) p
+coreToLg' e = throw ("Cannot transform to Logic:\t" ++ GM.showPpr e)
 
-
-
+castToLg :: Coercion -> Expr -> LogicM Expr
+castToLg co e = do
+    embeddings <- reader lsEmb
+    case newtypeCoercionDataCon co of
+        Just (dc, _) | Just _ <- newtypeIdentitySort embeddings dc -> pure e
+        Just (dc, WrapCoercion) ->
+            pure (F.mkEApp (GM.namedLocSymbol dc) [e])
+        Just (dc, UnwrapCoercion) -> do
+            dm <- reader lsDCMap
+            pure (EApp (EVar (makeDataConSelector (Just dm) dc 1)) e)
+        Nothing -> do
+            (s, t) <- coerceToLg co
+            pure (ECoerc s t e)
 
 coerceToLg :: Coercion -> LogicM (Sort, Sort)
 coerceToLg = typeEqToLg . coercionTypeEq
@@ -406,7 +533,7 @@ checkBoolAlts alts
 -- alternatives @alts@ into a logic expression. The variable @v@ is the binder
 -- for the scrutinee in the case alternatives.
 casesToLg :: Var -> Expr -> [C.CoreAlt] -> LogicM Expr
-casesToLg v e alts = mapM (altToLg e) normAlts >>= go
+casesToLg v e alts = mapM (altToLg (varType v) e) normAlts >>= go
   where
     normAlts       = normalizeAlts alts
     go :: [(C.AltCon, Expr)] -> LogicM Expr
@@ -414,7 +541,7 @@ casesToLg v e alts = mapM (altToLg e) normAlts >>= go
     go ((d,p):dps) = do c <- checkDataAlt d e
                         e' <- go dps
                         return (EIte c p e' `subst1` su)
-    go []          = panic (Just (getSrcSpan v)) $ "Unexpected empty cases in casesToLg: " ++ show e
+    go []          = throw $ "Unexpected empty cases in casesToLg: " ++ show e
     su             = (symbol v, e)
 
 checkDataAlt :: C.AltCon -> Expr -> LogicM Expr
@@ -431,32 +558,77 @@ normalizeAlts alts      = ctorAlts ++ defAlts
     (defAlts, ctorAlts) = L.partition isDefault alts
     isDefault (Alt c _ _)   = c == C.DEFAULT
 
-altToLg :: Expr -> C.CoreAlt -> LogicM (C.AltCon, Expr)
-altToLg de (Alt a@(C.DataAlt d) xs e) = do
-    p  <- coreToLg e
-    dm <- reader lsDCMap
-    allowTC <- reader (typeclass . lsConfig)
-    let su = mkSubst $ concat [ dataConProj dm de d x i | (x, i) <- zip (filter (not . if allowTC then GM.isEmbeddedDictVar else GM.isEvVar) xs) [1..]]
+altToLg :: Type -> Expr -> C.CoreAlt -> LogicM (C.AltCon, Expr)
+altToLg result de (Alt a@(C.DataAlt d) xs e) = do
+    fields <- sourceFields d result (map Core.varToCoreExpr xs)
+    images <- sourceProjections d de (length fields)
+    su <- workerProjection xs fields images
+    p <- withSourceFields fields images e
     return (a, subst su p)
 
-altToLg _ (Alt a _ e)
+altToLg _ _ (Alt a _ e)
   = (a, ) <$> coreToLg e
 
-dataConProj :: DataConMap -> Expr -> DataCon -> Var -> Int -> [(Symbol, Expr)]
-dataConProj dm de d x i = [(symbol x, t), (GM.simplesymbol x, t)]
+-- A case binds worker coordinates; logical projections select source fields.
+-- Invert only GHC's checked boxer expression, covering every value coordinate.
+sourceFields :: DataCon -> Type -> [CoreExpr] -> LogicM [CoreExpr]
+sourceFields dc result actual = do
+    boxes <- reader lsConstructorBoxes
+    fields <-
+        if eqType (varType (dataConWorkId dc)) (varType (dataConWrapId dc))
+            then pure (drop (length (Ghc.dataConExTyCoVars dc)) actual)
+            else
+                maybe
+                    (throw ("Missing GHC source reconstruction for " ++ GM.showPpr dc))
+                    pure
+                    (Ms.constructorSourceFields boxes dc result actual)
+    pure (filter (not . GM.isEmbeddedDictType . exprType) fields)
+
+sourceProjections :: DataCon -> Expr -> Int -> LogicM [Expr]
+sourceProjections dc image count = do
+    dm <- reader lsDCMap
+    pure [if primDataCon dc then image else EApp (EVar (makeDataConSelector (Just dm) dc i)) image | i <- [1 .. count]]
+
+workerProjection :: [Var] -> [CoreExpr] -> [Expr] -> LogicM F.Subst
+workerProjection worker fields images = do
+    unless (length fields == length images) (throw "GHC boxer source arity mismatch")
+    pairs <- concat <$> zipWithM invert fields images
+    let values = filter (\v -> isId v && not (GM.isEmbeddedDictVar v)) worker
+        candidates v = [image | (w, image) <- pairs, w == v]
+    assignments <- forM values $ \v -> case candidates v of
+        image : rest | all (== image) rest -> pure (v, image)
+        _ -> throw ("GHC boxer does not determine worker coordinate " ++ GM.showPpr v)
+    unless (all (\(v, _) -> v `elem` values) pairs) (throw "GHC boxer contains a foreign value coordinate")
+    pure (mkSubst (concat [[(symbol v, e), (GM.simplesymbol v, e)] | (v, e) <- assignments]))
   where
-    t | primDataCon  d  = de
-      | otherwise       = EApp (EVar $ makeDataConSelector (Just dm) d i) de
+    invert (C.Var v) image = pure [(v, image)]
+    invert (C.Cast e co) image = castToLg (Core.mkSymCo co) image >>= invert e
+    invert (C.Tick _ e) image = invert e image
+    invert expression image
+        | (C.Var v, args) <- C.collectArgs expression
+        , Just dc <- Ghc.isDataConId_maybe v = do
+            let actual = drop (length (Ghc.dataConUnivTyVars dc)) args
+            fields' <- case C.idDetails v of
+                C.DataConWorkId _ -> sourceFields dc (exprType expression) actual
+                _ ->
+                    pure
+                        ( filter
+                            (not . GM.isEmbeddedDictType . exprType)
+                            (drop (length (Ghc.dataConExTyCoVars dc)) actual)
+                        )
+            images' <- sourceProjections dc image (length fields')
+            concat <$> zipWithM invert fields' images'
+        | otherwise = throw ("Unsupported GHC boxer inversion: " ++ GM.showPpr expression)
 
 primDataCon :: DataCon -> Bool
-primDataCon d = d == intDataCon
+primDataCon = ignoreVar . dataConWorkId
 
-coreToIte :: C.CoreExpr -> (C.CoreExpr, C.CoreExpr) -> LogicM Expr
-coreToIte e (efalse, etrue)
+coreToIte :: Var -> C.CoreExpr -> (C.CoreExpr, C.CoreExpr) -> LogicM Expr
+coreToIte binder e (efalse, etrue)
   = do p  <- coreToLg e
        e1 <- coreToLg efalse
        e2 <- coreToLg etrue
-       return $ EIte p e2 e1
+       return $ EIte p e2 e1 `subst1` (symbol binder, p)
 
 toPredApp :: C.CoreExpr -> LogicM Expr
 toPredApp p = do
@@ -464,125 +636,163 @@ toPredApp p = do
   go . first opSym . splitArgs allowTC $ p
   where
     opSym = tomaybesymbol
-    go (Just f, [e1, e2])
-      | Just rel <- M.lookup f brels
-      = PAtom rel <$> coreToLg e1 <*> coreToLg e2
     go (Just f, [e])
       | f == symbol (show 'not)
       = PNot <$>  coreToLg e
     go (Just f, [e1, e2])
-      | f == symbol (show '(||))
-      = POr <$> mapM coreToLg [e1, e2]
-      | f == symbol (show '(&&))
-      = PAnd <$> mapM coreToLg [e1, e2]
-      | f == symbol ("Language.Haskell.Liquid.Prelude.==>" :: String)
-      = PImp <$> coreToLg e1 <*> coreToLg e2
-      | GM.dropModuleUnique f == symbol ("==>" :: String)
-      = PImp <$> coreToLg e1 <*> coreToLg e2
-      | f == symbol ("Language.Haskell.Liquid.Prelude.<=>" :: String)
-      = PIff <$> coreToLg e1 <*> coreToLg e2
-      | GM.dropModuleUnique f == symbol ("<=>" :: String)
-      = PIff <$> coreToLg e1 <*> coreToLg e2
-      | f == symbol (show 'const)
-      = coreToLg e1
+        | f == symbol (show '(||)) =
+            preserveDemand . POr <$> mapM coreToLg [e1, e2]
+        | f == symbol (show '(&&)) =
+            preserveDemand . PAnd <$> mapM coreToLg [e1, e2]
+        | f == symbol ("Language.Haskell.Liquid.Prelude.==>" :: String) =
+            preserveDemand <$> (PImp <$> coreToLg e1 <*> coreToLg e2)
+        | f == symbol ("Language.Haskell.Liquid.Prelude.<=>" :: String) =
+            PIff <$> coreToLg e1 <*> coreToLg e2
+        | f == symbol (show 'const) =
+            coreToLg e1
     go (Just f, [es])
-      | f == symbol (show 'or)
-      = POr  . deList <$> coreToLg es
-      | f == symbol (show 'and)
-      = PAnd . deList <$> coreToLg es
-    go (_, _)
-      = toLogicApp p
+        | f == symbol (show 'or) =
+            preserveDemand . POr . deList <$> coreToLg es
+        | f == symbol (show 'and) =
+            preserveDemand . PAnd . deList <$> coreToLg es
+    go (_, _) =
+        toLogicApp p
 
     deList :: Expr -> [Expr]
     deList (EApp (EApp (EVar cons) e) es)
       | cons == symbol (show '(:))
       = e:deList es
     deList (EVar nil)
-      | nil == symbol (show '[])
-      = []
-    deList e
-      = [e]
+        | nil == symbol (show '[]) =
+            []
+    deList e =
+        [e]
+
+-- The logical value is unchanged, but source short-circuit order is retained
+-- for formation and PLE equation demand. Do not use pIte: it emits implications.
+preserveDemand :: Expr -> Expr
+preserveDemand = Vis.mapExprOnExpr go
+  where
+    go (PAnd es) = foldr (\e rest -> EIte e rest PFalse) PTrue es
+    go (POr es)  = foldr (\e rest -> EIte e PTrue rest) PFalse es
+    go (PImp p q) = EIte p q PTrue
+    go e = e
 
 toLogicApp :: C.CoreExpr -> LogicM Expr
-toLogicApp e = do
-  allowTC <- reader (typeclass . lsConfig)
-  let (f, es) = splitArgs allowTC e
-  case f of
-    C.Var _ -> do args <- mapM coreToLg es
-                  lmap <- lsSymMap <$> getState
-                  def  <- (`mkEApp` args) <$> tosymbol f
-                  (\x -> makeApp def lmap x args) <$> tosymbol' f
-    _       -> do fe   <- coreToLg f
-                  args <- mapM coreToLg es
-                  return $ foldl EApp fe args
+toLogicApp expression
+    | (C.Var constructor, _) <- C.collectArgs expression
+    , ignoreVar constructor =
+        ordinaryLogicApp expression
+toLogicApp expression
+    | (C.Var constructor, arguments) <- C.collectArgs expression
+    , C.DataConWorkId dc <- C.idDetails constructor
+    , Just (resultConstructor, _) <- splitTyConApp_maybe (exprType expression)
+    , resultConstructor == Ghc.dataConTyCon dc = do
+        let actual = drop (length (Ghc.dataConUnivTyVars dc)) arguments
+        fields <- sourceFields dc (exprType expression) actual
+        logicalFields <- mapM coreToLg fields
+        pure (F.mkEApp (GM.namedLocSymbol dc) logicalFields)
+toLogicApp expression
+    | (C.Var constructor, arguments) <- C.collectArgs expression
+    , C.DataConWrapId dc <- C.idDetails constructor
+    , Just (resultConstructor, _) <- splitTyConApp_maybe (exprType expression)
+    , let representation = Ghc.dataConTyCon dc
+    , resultConstructor == maybe representation fst (Ghc.tyConFamInst_maybe representation) = do
+        logicalFields <- mapM coreToLg (filter sourceArgument arguments)
+        pure (F.mkEApp (GM.namedLocSymbol dc) logicalFields)
+  where
+    sourceArgument (C.Type _) = False
+    sourceArgument (C.Coercion _) = False
+    sourceArgument argument = not (GM.isEmbeddedDictType (exprType argument))
+toLogicApp expression = ordinaryLogicApp expression
 
-makeApp :: Expr -> LogicMap -> Located Symbol-> [Expr] -> Expr
-makeApp _ _ f [e]
-  | val f == symbol (show 'negate)
-  = ENeg e
-  | val f == symbol (show 'fromInteger)
-  , ECon c <- e
-  = ECon c
-  | (modName, sym) <- GM.splitModuleName (val f)
-  , symbol ("Ghci" :: String) `isPrefixOfSym` modName
-  , sym == "len"
-  = EApp (EVar sym) e
+ordinaryLogicApp :: C.CoreExpr -> LogicM Expr
+ordinaryLogicApp e = do
+    state <- getState
+    let (f, es) = splitArgs (typeclass (lsConfig state)) e
+    known <- coreMeaning f
+    definition <- case known of
+        Just meaning -> Just . foldl applyMeaning meaning <$> mapM coreToLg es
+        Nothing -> declaredDefinition state e
+    case definition of
+        Just meaning -> pure meaning
+        Nothing -> do
+            fe <- coreToLg f
+            args <- mapM coreToLg es
+            pure (foldl applyMeaning fe args)
 
-makeApp _ _ f [e1, e2]
-  | Just op <- M.lookup (val f) bops
-  = EBin op e1 e2
-  -- Hack for typeclass support. (overriden == without Eq constraint defined at Ghci)
-  | (modName, sym) <- GM.splitModuleName (val f)
-  , symbol ("Ghci" :: String) `isPrefixOfSym` modName
-  , Just op <- M.lookup (mappendSym (symbol ("GHC.Internal.Num." :: String)) sym) bops
-  = EBin op e1 e2
+-- An explicit define owns the interpretation of this exact source function,
+-- not a law of its class. Its parameters name visible source arguments; actual
+-- GHC constraint binders remain coordinates of the whole function, unused in
+-- the declared body. Build that whole meaning before substituting any supplied
+-- values, so partial applications and aliases obey capture-avoiding beta.
+-- Type applications are consumed at their actual telescope positions, before
+-- splitArgs erases them. Ordinary source checking still sees the complete Core.
+declaredDefinition :: LState -> CoreExpr -> LogicM (Maybe Expr)
+declaredDefinition state expression
+    | (C.Var function, arguments) <- C.collectArgs expression
+    , not (ignoreVar function)
+    , Just (LMap _ parameters _) <- M.lookup (symbol function) (lmSymDefs definitions) = do
+        let body = eAppWithMap definitions (symbol function) (map EVar parameters) (EVar (symbol function))
+            namespace = F.syms body `S.union` S.fromList parameters
+        (meaning, actuals) <- build body namespace (varType function) parameters arguments
+        values <- mapM coreToLg actuals
+        pure (Just (foldl applyMeaning meaning values))
+    | otherwise = pure Nothing
+  where
+    definitions = lsSymMap state
+    bad :: LogicM a
+    bad = throw ("Cannot align declared logical alias with typed source application: " ++ GM.showPpr expression)
 
-makeApp def lmap f es =
-    eAppWithMap lmap (val f) es def
-  -- where msg = "makeApp f = " ++ show f ++ " es = " ++ show es ++ " def = " ++ show def
+    build body namespace ty parameters arguments
+        | GhcType.isForAllTy ty = case arguments of
+            C.Type argument : rest ->
+                build body namespace (GhcType.piResultTy ty argument) parameters rest
+            C.Coercion argument : rest ->
+                build body namespace (GhcType.piResultTy ty (GhcType.CoercionTy argument)) parameters rest
+            _ -> bad
+        | Just (visibility, _, domain, result) <- GhcType.splitFunTy_maybe ty
+        , isInvisibleFunArg visibility = do
+            let (namespace', binder) = F.freshInNS (symbol ("$defineEvidence" :: String)) namespace
+            (actual, rest) <- argument arguments
+            (body', actuals) <- build body namespace' result parameters rest
+            if GM.isEmbeddedDictType domain
+                then pure (body', actuals)
+                else pure (ELam (binder, typeSort (lsEmb state) domain) body', maybe actuals (: actuals) actual)
+        | null parameters = pure (body, arguments)
+        | Just (_, _, domain, result) <- GhcType.splitFunTy_maybe ty
+        , parameter : parameters' <- parameters = do
+            (actual, rest) <- argument arguments
+            (body', actuals) <- build body namespace result parameters' rest
+            pure (ELam (parameter, typeSort (lsEmb state) domain) body', maybe actuals (: actuals) actual)
+        | otherwise = bad
+
+    argument [] = pure (Nothing, [])
+    argument (C.Type{} : _) = bad
+    argument (actual : rest) = pure (Just actual, rest)
+
+applyMeaning :: Expr -> Expr -> Expr
+-- Equal-sort coercions denote identity (also the existing PLE rule). Expose
+-- the same function before beta; unequal coercions retain their interpretation.
+applyMeaning (ECoerc source target function) argument
+    | source == target = applyMeaning function argument
+applyMeaning (ELam (parameter, _) body) argument =
+    F.subst1 body (parameter, argument)
+applyMeaning function argument = EApp function argument
 
 eVarWithMap :: Id -> LogicMap -> Expr
 eVarWithMap x lmap = do
     eAppWithMap lmap (symbol x) [] (EVar $ symbol x)
 
-brels :: M.HashMap Symbol Brel
-brels = M.fromList [ (symbol (show '(==)), Eq)
-                   , (symbol (show '(/=)), Ne)
-                   , (symbol (show '(>=)), Ge)
-                   , (symbol (show '(>)) , Gt)
-                   , (symbol (show '(<=)), Le)
-                   , (symbol (show '(<)) , Lt)
-                   ]
-
--- bops is a map between GHC function names/symbols and binary operators
--- from the logic. We want GHC functions like +, -, etc. to map to the
--- corresponding operators. There are actually multiple sources for +, -,
--- they can come from GHC.Prim, GHC.Internal.Num, GHC.Internal.Real or
--- be an instance of Num for Int.
-bops :: M.HashMap Symbol Bop
-bops = M.fromList [ (symbol (show '(+)), Plus)
-                  , (numIntSymbol "+", Plus)
-                  , (symbol (show '(+#)), Plus)
-                  , (symbol (show '(-)), Minus)
-                  , (numIntSymbol "-", Minus)
-                  , (symbol (show '(-#)), Minus)
-                  , (symbol (show '(*)), Times)
-                  , (numIntSymbol "*", Times)
-                  , (symbol (show '(*#)), Times)
-                  , (symbol (show '(/)), Div)
-                  , (symbol (show '(%)), Mod)
-                  ]
+splitArgs :: Bool -> C.CoreExpr -> (C.CoreExpr, [C.CoreExpr])
+splitArgs _allowTC exprt = (exprt', reverse args)
   where
-    numIntSymbol :: String -> Symbol
-    numIntSymbol = symbol . (++) "GHC.Internal.Num.$fNumInt_$c"
-
-splitArgs :: Bool -> C.Expr t -> (C.Expr t, [C.Arg t])
-splitArgs allowTC exprt = (exprt', reverse args)
- where
     (exprt', args) = go exprt
 
-    go (C.App (C.Var i) e) | ignoreVar i       = go e
-    go (C.App f (C.Var v)) | if allowTC then GM.isEmbeddedDictVar v else isErasable v   = go f
+    go expression | Just _ <- dataTagPrefix expression = (expression, [])
+    go (C.App f (C.Type _)) = go f
+    go (C.App f C.Coercion{}) = go f
+    go (C.App f (C.Var v)) | GM.isEmbeddedDictVar v = go f
     go (C.App f e) = (f', e:es) where (f', es) = go f
     go f           = (f, [])
 
@@ -590,21 +800,9 @@ tomaybesymbol :: C.CoreExpr -> Maybe Symbol
 tomaybesymbol (C.Var x) = Just $ symbol x
 tomaybesymbol _         = Nothing
 
-tosymbol :: C.CoreExpr -> LogicM (Located Symbol)
-tosymbol e
- = case tomaybesymbol e of
-    Just x -> return $ dummyLoc x
-    _      -> throw ("Bad Measure Definition:\n" ++ GM.showPpr e ++ "\t cannot be applied")
-
-tosymbol' :: C.CoreExpr -> LogicM (Located Symbol)
-tosymbol' (C.Var x) = return $ dummyLoc $ symbol x
-tosymbol' e        = throw ("Bad Measure Definition:\n" ++ GM.showPpr e ++ "\t cannot be applied")
-
-makesub :: C.CoreBind -> LogicM (Symbol, Expr)
-makesub (C.NonRec x e) = (symbol x,) <$> coreToLg e
-makesub _              = throw "Cannot make Logical Substitution of Recursive Definitions"
 
 mkLit :: Literal -> Maybe Expr
+mkLit (LitNumber LitNumBigNat _) = Nothing
 mkLit (LitNumber _ n) = mkI n
 -- mkLit (MachInt64  n)    = mkI n
 -- mkLit (MachWord   n)    = mkI n
@@ -632,7 +830,9 @@ mkC                    = Just . ECon . (`F.L` F.charSort)  . repr
     repr               = T.pack . show . Data.Char.ord
 
 ignoreVar :: Id -> Bool
-ignoreVar i = simpleSymbolVar i `elem` ["I#", "D#"]
+ignoreVar i = case Ghc.isDataConId_maybe i of
+    Just dc -> dc `elem` [Ghc.intDataCon, doubleDataCon, Ghc.integerISDataCon]
+    Nothing -> False
 
 -- | Tries to determine if a 'CoreAlt' maps to one of the 'Integer' type constructors.
 isBangInteger :: [C.CoreAlt] -> Bool
@@ -641,20 +841,6 @@ isBangInteger [Alt (C.DataAlt s) _ _, Alt (C.DataAlt jp) _ _, Alt (C.DataAlt jn)
   && jp == Ghc.integerIPDataCon
   && jn == Ghc.integerINDataCon
 isBangInteger _ = False
-
-isErasable :: Id -> Bool
-isErasable v = F.notracepp msg $ isGhcSplId v && not (isDCId v)
-  where
-    msg      = "isErasable: " ++ GM.showPpr (v, Ghc.idDetails v)
-
-isGhcSplId :: Id -> Bool
-isGhcSplId v = isPrefixOfSym (symbol ("$" :: String)) (simpleSymbolVar v)
-
-isDCId :: Id -> Bool
-isDCId v = case Ghc.idDetails v of
-  DataConWorkId _ -> True
-  DataConWrapId _ -> True
-  _               -> False
 
 isANF :: Id -> Bool
 isANF      v = isPrefixOfSym (symbol ("lq_anf" :: String)) (simpleSymbolVar v)
@@ -668,8 +854,8 @@ isDead     = isDeadOcc . occInfo . Ghc.idInfo
 --   3. simplifying the expression by removing dead binders and applications of
 --      type arguments and dictionaries.
 --
--- The 'allowTC' flag controls whether type class dictionaries are considered erasable
--- and will be removed from the expression.
+-- Runtime dictionaries are retained independently of the optional class
+-- elaboration mode; only primitive equality evidence is erased.
 --
 normalizeCoreExpr :: Bool -> CoreExpr -> CoreExpr
 normalizeCoreExpr allowTC = inline_preds . inline_anf . simplifyCoreExpr allowTC
@@ -677,25 +863,20 @@ normalizeCoreExpr allowTC = inline_preds . inline_anf . simplifyCoreExpr allowTC
     inline_preds = inlineCoreExpr (eqType boolTy . GM.expandVarType)
     inline_anf   = inlineCoreExpr isANF
 
--- | 'simplifyCoreExpr allowTC e' simplifies the Core expression 'e' by removing
--- applications of type arguments and dictionaries, and by removing dead
--- binders.
+-- | 'simplifyCoreExpr allowTC e' removes dead binders while retaining typed
+-- application spines. Constructor reconstruction needs the actual type and
+-- evidence arguments; 'splitArgs' erases them at logical interpretation.
 --
--- The 'allowTC' flag controls whether type class dictionaries are considered
--- erasable.
---
--- If 'allowTC' is 'True', then type class dictionaries are considered erasable
--- and will be removed from the expression. If 'allowTC' is 'False', then type
--- class dictionaries are not considered erasable and will not be removed.
+-- The optional class elaboration mode does not change runtime meaning.
+-- Only primitive equality evidence has no logical value coordinate.
 --
 -- This function is used in 'normalizeCoreExpr' to simplify the Core expression
 -- before inlining predicates and ANF variables.
 --
 -- The 'simplifyCoreExpr' function recursively traverses the Core expression and
 -- applies the following simplifications:
---   1. It removes applications of type arguments (i.e. 'C.App e1 (C.Type _)').
---   2. It removes applications of variables that are considered erasable
---      (i.e. 'C.App e1 (C.Var v)' where 'v' is erasable).
+--   1. It retains applications of type arguments (i.e. 'C.App e1 (C.Type _)').
+--   2. It retains applications of evidence variables for typed reconstruction.
 --   3. It removes applications of lambda expressions where the binder is dead
 --      (i.e. 'C.App (C.Lam x e) _' where 'x' is dead).
 --   4. It removes lambda expressions where the binder is a type variable
@@ -716,20 +897,17 @@ normalizeCoreExpr allowTC = inline_preds . inline_anf . simplifyCoreExpr allowTC
 --       type expressions.
 --
 simplifyCoreExpr :: Bool -> CoreExpr -> CoreExpr
-simplifyCoreExpr allowTC = go
+simplifyCoreExpr _allowTC = go
   where
-    isDictOrErasable = if allowTC then GM.isEmbeddedDictVar else isErasable
+    isDictOrErasable = GM.isEmbeddedDictVar
 
     go :: CoreExpr -> CoreExpr
     go e@(C.Var _)
       = e
     go e@(C.Lit _)
       = e
-    go (C.App e1 (C.Type _))
-      = go e1
-    go (C.App e1 (C.Var v))
-      | isDictOrErasable v
-      = go e1
+    go (C.App e1 arg@(C.Type _)) =
+        C.App (go e1) arg
     go (C.App (C.Lam x e) _)
       | isDead x
       = go e

@@ -21,7 +21,11 @@ import           Control.Exception.Backtrace
 import           Control.Exception.Context
 import           Data.Generics (ext0, gmapAccumT)
 import qualified Data.HashMap.Strict                     as M
-import           Data.Maybe                               ( listToMaybe, mapMaybe )
+import           Data.Typeable                            ( typeOf )
+import           GHC.Data.Maybe (MaybeErr (..))
+import           GHC.Iface.Load (findAndReadIface)
+import           GHC.Iface.Syntax (ifAnnotatedTarget)
+import           GHC.Unit.Module (getModuleInstantiation)
 import           Data.IORef
 import           Data.Unique
 import           GHC.Stack (HasCallStack)
@@ -32,6 +36,7 @@ import qualified Liquid.GHC.API as GHC
 import           Language.Haskell.Liquid.GHC.Plugin.Types (LiquidLib, SpecReference(..), libDeps)
 import qualified Language.Haskell.Liquid.GHC.Plugin.Iface as Iface
 import qualified Language.Haskell.Liquid.GHC.Plugin.Cache as Cache
+import qualified Language.Haskell.Liquid.GHC.Plugin.AnnotationIdentity as Identity
 import           Language.Haskell.Liquid.Types.Names
 
 
@@ -118,14 +123,27 @@ deserialiseLiquidLib
 deserialiseLiquidLib env thisModule = do
     eps <- readIORef $ GHC.euc_eps $ GHC.ue_eps $ GHC.hsc_unit_env env
     home <- GHC.lookupHugByModule thisModule (GHC.hsc_HUG env)
-    let homeAnnotations = case home of
-          Just info | GHC.mi_module (GHC.hm_iface info) == thisModule ->
-            GHC.ifAnnotatedValue <$> GHC.mi_anns (GHC.hm_iface info)
-          _ -> []
-        annotations decoder =
-          mapMaybe (GHC.fromSerialized decoder) homeAnnotations ++
-          GHC.findAnns decoder (GHC.eps_ann_env eps) (GHC.ModuleTarget thisModule)
-    case listToMaybe $ annotations Iface.PayloadMarker of
+    marker <- case home of
+      Just info
+        | GHC.mi_module (GHC.hm_iface info) == thisModule ->
+            interfaceMarker (GHC.hm_iface info)
+      _ -> case GHC.findAnns Iface.PayloadMarker (GHC.eps_ann_env eps) (GHC.ModuleTarget thisModule) of
+        [current] -> pure $ Just current
+        [] -> do
+          -- EPS retains typed annotations but drops raw interface annotations.
+          -- A typed miss must not hide a marker from an obsolete plugin unit.
+          result <-
+            findAndReadIface
+              env
+              (GHC.text "LiquidHaskell annotation identity")
+              (fst $ getModuleInstantiation thisModule)
+              thisModule
+              GHC.NotBoot
+          case result of
+            Succeeded (iface, _) -> interfaceMarker iface
+            Failed _ -> ioError $ userError $ "LiquidHaskell cannot audit annotations for " ++ GHC.renderModule thisModule
+        _ -> identityFailure Identity.DuplicateAnnotations
+    case marker of
       Nothing -> do
         iface <- GHC.lookupIfaceByModuleHsc env thisModule
         -- A compact payload requires its marker for identification and validation.
@@ -151,6 +169,19 @@ deserialiseLiquidLib env thisModule = do
   where
     missingPayload = ioError $ userError $ "LiquidHaskell: missing compact specification for " ++
       GHC.renderModule thisModule ++ ". Rebuild this dependency with the current LiquidHaskell plugin."
+
+    interfaceMarker iface =
+      case Identity.selectAnnotationPayload
+        (typeOf $ Iface.PayloadMarker [])
+        [ GHC.ifAnnotatedValue ann
+        | ann <- GHC.mi_anns iface
+        , GHC.ModuleTarget target <- [ifAnnotatedTarget ann]
+        , target == thisModule
+        ] of
+        Left err -> identityFailure err
+        Right bytes -> pure $ Iface.PayloadMarker <$> bytes
+
+    identityFailure = ioError . userError . Identity.annotationIdentityError
 
 encodeLiquidLib :: LiquidLib -> IO B.ByteString
 encodeLiquidLib lib0 = rethrowWithCallStackIO $ do

@@ -9,7 +9,7 @@
 {-# LANGUAGE OverloadedStrings          #-}
 {-# LANGUAGE ViewPatterns               #-}
 
-module Language.Haskell.Liquid.Transforms.ANF (anormalize, anormalizeExprBinds) where
+module Language.Haskell.Liquid.Transforms.ANF (anormalize, anormalizeExprBinds, AnfRenamings) where
 
 import           Debug.Trace (trace)
 import           Prelude                          hiding (error)
@@ -23,9 +23,9 @@ import           Control.Monad.State.Lazy
 import qualified Language.Fixpoint.Types    as F
 
 import           Language.Haskell.Liquid.UX.Config  as UX
-import qualified Language.Haskell.Liquid.Misc       as Misc
 import           Language.Haskell.Liquid.GHC.Misc   as GM
 import           Language.Haskell.Liquid.Types.Errors
+import           Language.Haskell.Liquid.Transforms.Rewrite (unfoldFromIntegral)
 
 import qualified Language.Haskell.Liquid.GHC.SpanStack as Sp
 import qualified Language.Haskell.Liquid.GHC.Resugar   as Rs
@@ -35,19 +35,30 @@ import qualified Text.Printf as Printf
 import           Data.Hashable
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HM
+import GHC.Core.Coercion (mkCoVarCo)
+import qualified GHC.Core.Opt.Arity as Arity
+import qualified GHC.Core.Subst as Subst
 import GHC.Core.Type (ForAllTyBinder)
-import GHC.Types.Id (mkSysLocalM)
+import qualified GHC.Core.Type as Type
+import qualified GHC.Core.Utils as Core
+import GHC.Types.Id (mkSysLocalM, setIdMult)
 
 --------------------------------------------------------------------------------
 -- | A-Normalize a module ------------------------------------------------------
 --------------------------------------------------------------------------------
-anormalize :: UX.Config -> HscEnv -> ModGuts -> IO [CoreBind]
+-- Renamings are scoped by the source binding whose RHS sees them. Dead case
+-- binders can share GHC Uniques, so a module-wide VarEnv would lose identity.
+type AnfRenamings = [(Var, [(Var, Var)])]
+
+anormalize :: UX.Config -> HscEnv -> ModGuts -> IO ([CoreBind], AnfRenamings)
 --------------------------------------------------------------------------------
 anormalize cfg hscEnv modGuts = do
   fromMaybe err . snd <$> initDsWithModGuts hscEnv modGuts act -- hscEnv m grEnv tEnv emptyFamInstEnv act
     where
       err      = panic Nothing "Oops, cannot A-Normalize GHC Core!"
-      act      = Misc.concatMapM (normalizeTopBind γ0) (mg_binds modGuts)
+      act      = do
+        results <- mapM (normalizeTopBind γ0) (mg_binds modGuts)
+        pure (concatMap fst results, concatMap snd results)
       γ0       = emptyAnfEnv cfg False
 
 -- | Put elaborated refinement predicates through the same normalization used
@@ -58,9 +69,11 @@ anormalizeExprBinds cfg hscEnv modGuts exprs = do
   fromMaybe err . snd <$> initDsWithModGuts hscEnv modGuts act
   where
     err = panic Nothing "Oops, cannot A-Normalize refinement predicates!"
-    act = concat <$> forM exprs (\e -> do
-      x <- mkSysLocalM (fsLit "lq_refinement") ManyTy (exprType e)
-      normalizeTopBind γ0 (NonRec x e))
+    act = do
+      binds <- forM exprs $ \e -> do
+        x <- mkSysLocalM (fsLit "lq_refinement") ManyTy (exprType e)
+        pure (NonRec x e)
+      concatMap fst <$> mapM (normalizeTopBind γ0) binds
     -- Refinement checks need to retain @I# n#@ so constraint generation can
     -- recover the boxed integer's singleton refinement. Ordinary program ANF
     -- keeps its established invariant that application arguments are names.
@@ -73,14 +86,17 @@ anormalizeExprBinds cfg hscEnv modGuts exprs = do
 -- Can't make the below default for normalizeBind as it
 -- fails tests/pos/lets.hs due to GHCs odd let-bindings
 
-normalizeTopBind :: AnfEnv -> Bind CoreBndr -> Ghc.DsM [CoreBind]
-normalizeTopBind γ (NonRec x e)
-  = do e' <- runDsM $ evalStateT (stitch γ e) (DsST [])
-       return [normalizeTyVars $ NonRec x e']
+normalizeTopBind :: AnfEnv -> Bind CoreBndr -> Ghc.DsM ([CoreBind], AnfRenamings)
+normalizeTopBind γ = normalizeTopBind' γ . unfoldFromIntegral
 
-normalizeTopBind γ (Rec xes)
-  = do xes' <- runDsM $ execStateT (normalizeBind γ (Rec xes)) (DsST [])
-       return $ map normalizeTyVars (st_binds xes')
+normalizeTopBind' :: AnfEnv -> Bind CoreBndr -> Ghc.DsM ([CoreBind], AnfRenamings)
+normalizeTopBind' γ (NonRec x e)
+  = do (e', state) <- runDsM $ runStateT (rememberScope γ x >> stitch γ e) (DsST [] [])
+       return ([normalizeTyVars $ NonRec x e'], st_scopes state)
+
+normalizeTopBind' γ (Rec xes)
+  = do xes' <- runDsM $ execStateT (normalizeBind γ (Rec xes)) (DsST [] [])
+       return (map normalizeTyVars (st_binds xes'), st_scopes xes')
 
 normalizeTyVars :: Bind Id -> Bind Id
 normalizeTyVars (NonRec x e) = NonRec (setVarType x t') $ normalizeForAllTys e
@@ -115,7 +131,7 @@ normalizeForAllTys e = case e of
 newtype DsM a = DsM {runDsM :: Ghc.DsM a}
    deriving (Functor, Monad, MonadUnique, Applicative)
 
-newtype DsST = DsST { st_binds :: [CoreBind] }
+data DsST = DsST { st_binds :: [CoreBind], st_scopes :: AnfRenamings }
 
 type DsMW = StateT DsST DsM
 
@@ -123,11 +139,13 @@ type DsMW = StateT DsST DsM
 normalizeBind :: AnfEnv -> CoreBind -> DsMW ()
 ------------------------------------------------------------------
 normalizeBind γ (NonRec x e)
-  = do e' <- normalize γ e
+  = do rememberScope γ x
+       e' <- normalize γ e
        add [NonRec x e']
 
 normalizeBind γ (Rec xes)
-  = do es' <- mapM (stitch γ) es
+  = do mapM_ (rememberScope γ) xs
+       es' <- mapM (stitch γ) es
        add [Rec (zip xs es')]
     where
        (xs, es) = unzip xes
@@ -174,6 +192,12 @@ shouldNormalize _               = False
 add :: [CoreBind] -> DsMW ()
 add w = modify $ \s -> s { st_binds = st_binds s ++ w}
 
+rememberScope :: AnfEnv -> Var -> DsMW ()
+rememberScope γ owner = modify $ \s ->
+    s
+        { st_scopes = (owner, [(old, new) | (StableId old, new) <- HM.toList (aeVarEnv γ)]) : st_scopes s
+        }
+
 --------------------------------------------------------------------------------
 normalizeLiteral :: AnfEnv -> CoreExpr -> DsMW CoreExpr
 --------------------------------------------------------------------------------
@@ -186,14 +210,15 @@ normalizeLiteral γ e =
 normalize :: AnfEnv -> CoreExpr -> DsMW CoreExpr
 --------------------------------------------------------------------------------
 normalize γ e
+  | Just _ <- GM.integerLiteral (targetIntBits (getConfig γ)) e
+  = return e
+normalize γ e
   | UX.patternFlag γ
   , Just p <- Rs.lift e
   = normalizePattern γ p
 
-normalize γ (Lam x e) | isTyVar x
-  = do e' <- normalize γ e
-       return $ Lam x e'
-
+-- Type lambdas scope local bindings just as value lambdas do: a helper's
+-- type may mention the bound variable even when its body has no value use.
 normalize γ (Lam x e)
   = do e' <- stitch γ e
        return $ Lam x e'
@@ -204,14 +229,29 @@ normalize γ (Let b e)
        -- Need to float bindings all the way up to the top
        -- Due to GHCs odd let-bindings (see tests/pos/lets.hs)
 
-normalize γ (Case e x t as)
-  = do n     <- normalizeName γ e
-       x'    <- lift $ freshNormalVar γ τx -- rename "wild" to avoid shadowing
-       let γ' = extendAnfEnv γ x x'
-       as'   <- forM as $ \(Alt c xs e') -> fmap (Alt c xs) (stitch (incrCaseDepth c γ') e')
-       as''  <- lift $ expandDefaultCase γ τx as'
-       return $ Case n x' t as''
-    where τx = GM.expandVarType x
+normalize γ (Case e x t as) =
+  do
+    n <- normalizeName γ e
+    x' <- lift $ freshNormalVar γ τx -- rename "wild" to avoid shadowing
+    let γ' = extendAnfEnv γ x x'
+    as' <- forM (map (renameEvidence x') as) $ \(Alt c xs e') -> fmap (Alt c xs) (stitch (incrCaseDepth c γ') e')
+    as'' <- lift $ expandDefaultCase γ τx as'
+    return $ Case n x' t as''
+ where
+  τx = GM.expandVarType x
+  -- Substitute before ANF introduces its Var-shaped coercion references.
+  -- GHC also transports casts, type arguments, and dependent binder types;
+  -- the term-variable lookup alone cannot rename those evidence uses.
+  renameEvidence x' alternative@(Alt constructor binders body)
+    | isCoVar x =
+        let scope =
+              mkInScopeSet $
+                exprFreeVars (mkLams binders body)
+                  `unionVarSet` exprFreeVars (Coercion (mkCoVarCo x'))
+            substitution = Subst.extendSubstWithVar (Subst.mkEmptySubst scope) x x'
+            (substitution', binders') = Subst.substBndrs substitution binders
+         in Alt constructor binders' (Subst.substExpr substitution' body)
+    | otherwise = alternative
 
 normalize γ (Var x)
   = return $ Var (lookupAnfEnv γ x x)
@@ -221,6 +261,24 @@ normalize _ e@(Lit _)
 
 normalize _ e@(Type _)
   = return e
+
+-- Expose the actual argument/result coercions to ordinary application checking.
+-- The case preserves demand on the source closure before the new argument is
+-- in scope; a lazy let or bare eta expansion would hide bottom and move the
+-- recursive checking boundary under that argument's refinement.
+normalize γ (Cast e co)
+  | Pair source target <- coercionKind co
+  , Type.isFunTy source
+  , Just (_, multiplicity, argumentType, _) <- Type.splitFunTy_maybe target
+  , not (source `eqType` target)
+  , Type.typeHasFixedRuntimeRep argumentType
+  , Just (argumentCoercion, resultCoercion) <- Arity.pushCoValArg co =
+      do
+        function <- lift $ freshNormalVar γ source
+        argument <- (`setIdMult` multiplicity) <$> lift (freshNormalVar γ argumentType)
+        let converted = Core.mkCastMCo (Var argument) argumentCoercion
+        let body = Core.mkCastMCo (App (Var function) converted) resultCoercion
+        normalize γ $ Case e function target [Alt DEFAULT [] (Lam argument body)]
 
 normalize γ (Cast e τ)
   = do e' <- normalizeName γ e
@@ -264,7 +322,7 @@ stitch γ e
        modify $ \s -> s { st_binds = [] }
        e'    <- normalize γ e
        bs    <- st_binds <$> get
-       put bs'
+       modify $ \s -> s { st_binds = st_binds bs' }
        -- See Note [Shape of normalized terms]
        let (tvs, e'') = collectTyBinders e'
        return $ mkLams tvs (mkCoreLets bs e'')

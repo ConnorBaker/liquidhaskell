@@ -116,6 +116,9 @@ splitW (WfC γ (REx x tx t))
 splitW (WfC γ (RRTy _ _ _ t))
   = splitW (WfC γ t)
 
+splitW (WfC _ (RLit _))
+  = return []
+
 splitW (WfC _ t)
   = panic Nothing $ "splitW cannot handle: " ++ showpp t
 
@@ -237,8 +240,10 @@ splitC allowTC (SubC γ t1'@(RAllT α1 t1 _) t2'@(RAllT α2 t2 _))
           (Just (x1, _), Just (x2, _)) -> F.mkSubst [(x1, F.EVar x2)]
           _                            -> F.mkSubst []
 
-splitC allowTC (SubC _ (RApp c1 _ _ _) (RApp c2 _ _ _)) | (if allowTC then isEmbeddedDict else isClass) c1 && c1 == c2
-  = return []
+-- Primitive equality keeps its kind arguments, but its endpoints are invariant.
+splitC _ (SubC γ (RApp c1 [_, _, l1, r1] _ _) (RApp c2 [_, _, l2, r2] _ _))
+  | isEmbeddedDict c1 && c1 == c2 =
+      splitsCWithVariance γ [l1, r1] [l2, r2] [Invariant, Invariant]
 
 splitC _ (SubC γ t1@RApp{} t2@RApp{})
   = do (t1',t2') <- unifyVV t1 t2
@@ -256,25 +261,30 @@ splitC _ (SubC γ t1@(RVar a1 _) t2@(RVar a2 _))
   | a1 == a2
   = bsplitC γ t1 t2
 
+splitC _ (SubC _ (RLit l) (RLit l'))
+  | l == l'
+  = return []
+
 splitC _ (SubC γ t1 t2)
   = panic (Just $ getLocation γ) $ "(Another Broken Test!!!) splitc unexpected:\n" ++ traceTy t1 ++ "\n  <:\n" ++ traceTy t2
 
-splitC _ (SubR γ o r)
-  = do ts     <- getTemplates
-       let r1' = pruneUnsortedReft γ'' ts r1
-       return $ F.subC γ' r1' r2 Nothing tag ci
+splitC _ (SubR γ o r) =
+    do
+        ts <- getTemplates
+        let r1' = pruneUnsortedReft γ'' ts r1
+        return $ F.subC γ' r1' r2 Nothing tag ci
   where
     γ'' = feEnv $ fenv γ
-    γ'  = feBinds $ fenv γ
-    r1  = F.RR F.boolSort rr
-    r2  = F.RR F.boolSort $ F.Reft (vv, F.EVar vv)
-    vv  = "vvRec"
-    ci  = Ci src err (cgVar γ)
+    γ' = feBinds $ fenv γ
+    r1 = F.RR F.boolSort rr
+    r2 = F.RR F.boolSort $ F.Reft (vv, F.EVar vv)
+    vv = "vvRec"
+    ci = Ci src (F.Delayed <$> err) (cgVar γ)
     err = Just $ ErrAssType src o (text $ show o ++ "type error") Nothing g (rHole rr)
-    rr  = toReft r
+    rr = toReft r
     tag = getTag γ
     src = getLocation γ
-    g   = reLocal $ renv γ
+    g = reLocal $ renv γ
 
 traceTy :: SpecType -> String
 traceTy (RVar v _)      = parens ("RVar " ++ showpp v)
@@ -283,6 +293,7 @@ traceTy (RAllP _ t)     = parens ("RAllP " ++ traceTy t)
 traceTy (RAllT _ t _)   = parens ("RAllT " ++ traceTy t)
 traceTy (RFun _ _ t t' _) = parens ("RFun " ++ parens (traceTy t) ++ parens (traceTy t'))
 traceTy (REx _ tx t)    = parens ("REx " ++ parens (traceTy tx) ++ parens (traceTy t))
+traceTy (RLit l)        = "RLit " ++ show l
 traceTy (RExprArg _)    = "RExprArg"
 traceTy (RAppTy t t' _) = parens ("RAppTy " ++ parens (traceTy t) ++ parens (traceTy t'))
 traceTy (RHole _)       = "rHole"
@@ -336,23 +347,25 @@ addLhsInv γ t = addRTyConInv (invs γ) t `strengthen` r
 
 bsplitC' :: CGEnv -> SpecType -> SpecType -> F.Templates -> Bool -> [F.SubC Cinfo]
 bsplitC' γ t1 t2 tem isHO
- | isHO
- = mkSubC γ' r1'  r2' tag ci
- | F.isFunctionSortedReft r1' && F.isNonTrivial r2'
- = mkSubC γ' (r1' {F.sr_reft = mempty}) r2' tag ci
- | F.isNonTrivial r2'
- = mkSubC γ' r1'  r2' tag ci
- | otherwise
- = []
+    | isHO =
+        mkSubC γ' r1' r2' tag ci
+    | F.isFunctionSortedReft r1' && F.isNonTrivial r2' =
+        mkSubC γ' (r1'{F.sr_reft = mempty}) r2' tag ci
+    | F.isNonTrivial r2' =
+        mkSubC γ' r1' r2' tag ci
+    | otherwise =
+        []
   where
-    γ'  = feBinds $ fenv γ
+    γ' = feBinds $ fenv γ
     r1' = rTypeSortedReft' γ tem t1
-    r2' = rTypeSortedReft' γ tem t2
+    -- Inherited equation-deferral templates may weaken premises, but must
+    -- never change the expected conclusion of the authored judgment.
+    r2' = rTypeSortedReft (emb γ) t2
     tag = getTag γ
     src = getLocation γ
-    g   = reLocal $ renv γ
+    g = reLocal $ renv γ
 
-    ci sr  = Ci src (err sr) (cgVar γ)
+    ci sr = Ci src (F.Delayed <$> err sr) (cgVar γ)
     err sr = Just $ fromMaybe (ErrSubType src (text "subtype") Nothing g t1 (replaceTop t2 sr)) (cerr γ)
 
 mkSubC :: F.IBindEnv -> F.SortedReft -> F.SortedReft -> F.Tag -> (F.SortedReft -> a) -> [F.SubC a]

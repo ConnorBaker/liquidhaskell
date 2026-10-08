@@ -561,27 +561,26 @@ isEmbeddedClass _              = False
 
 
 class (Eq c) => TyConable c where
-  isFun    :: c -> Bool
-  isList   :: c -> Bool
-  isTuple  :: c -> Bool
-  ppTycon  :: c -> Doc
-  isClass  :: c -> Bool
-  isEmbeddedDict :: c -> Bool
-  isEqual  :: c -> Bool
-  isOrdCls  :: c -> Bool
-  isEqCls   :: c -> Bool
+    isFun :: c -> Bool
+    isList :: c -> Bool
+    isTuple :: c -> Bool
+    ppTycon :: c -> Doc
+    isClass :: c -> Bool
+    isEmbeddedDict :: c -> Bool
+    isEqual :: c -> Bool
+    isOrdCls :: c -> Bool
+    isEqCls :: c -> Bool
 
-  isNumCls  :: c -> Bool
-  isFracCls :: c -> Bool
+    isNumCls :: c -> Bool
+    isFracCls :: c -> Bool
 
-  isClass   = const False
-  isEmbeddedDict c = isNumCls c || isEqual c || isOrdCls c || isEqCls c
-  isOrdCls  = const False
-  isEqCls   = const False
-  isEqual   = const False
-  isNumCls  = const False
-  isFracCls = const False
-
+    isClass = const False
+    isEmbeddedDict = isEqual
+    isOrdCls = const False
+    isEqCls = const False
+    isEqual = const False
+    isNumCls = const False
+    isFracCls = const False
 
 -------------------------------------------------------------------------------
 -- | TyConable Instances -------------------------------------------------------
@@ -1076,6 +1075,11 @@ data RTypeBV b v c tv r
     -- See: tests/pos/Holes.hs
     --
   | RHole r
+
+    -- | A GHC type-level literal. Its constructor fixes its kind (Nat,
+    -- Symbol or Char); it is not a value type and has no value refinement.
+    -- Unlike RExprArg, this is a proper type argument, retained by toType.
+  | RLit !TyLit
   deriving (Eq, Generic, Data, Functor, Foldable, Show, Traversable)
   deriving (B.Binary, Hashable) via Generically (RTypeBV b v c tv r)
 

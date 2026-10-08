@@ -11,7 +11,10 @@
 
 module Language.Haskell.Liquid.Constraint.Init (
     initEnv ,
+    DefaultTypes,
+    prepareDefaultTypes,
     initCGI,
+    defaultTopVars,
     ) where
 
 import           Prelude                                       hiding (error, undefined)
@@ -49,19 +52,28 @@ import           Language.Haskell.Liquid.Types.Visitors
 import           Language.Haskell.Liquid.UX.Config
 
 --------------------------------------------------------------------------------
-initEnv :: TargetInfo -> CG CGEnv
+-- Ordered source declarations before query-local freshening. Duplicate rows
+-- remain distinct; this product contains no query state or checking result.
+type DefaultTypes = ([(Var, SpecType)], [(Var, SpecType)], [(Var, SpecType)])
+
+prepareDefaultTypes :: TyConMap -> F.TCEmb TyCon -> [Var] -> [Var] -> DefaultTypes
+prepareDefaultTypes tyi tce imports constructors =
+    (schemas imports, schemas constructors, schemas (filter isConLikeId imports))
+  where
+    schemas :: [Var] -> [(Var, SpecType)]
+    schemas owners = [(owner, addTyConInfo tce tyi (ofType (varType owner))) | owner <- owners]
+
+initEnv :: DefaultTypes -> [(Var, SpecType)] -> TargetInfo -> CG CGEnv
 --------------------------------------------------------------------------------
-initEnv info
+initEnv ~(defaultSchemas, constructorSchemas, importedConstructorSchemas) callables info
   = do let tce   = gsTcEmbeds (gsName sp)
-       let fVars = giImpVars (giSrc info)
-       let dcs   = gsDataConIds (gsName sp)
-       let dcs'  = filter isConLikeId fVars
-       defaults <- forM fVars $ \x -> fmap (x,) (trueTy allowTC $ varType x)
-       dcsty    <- forM dcs   (makeDataConTypes allowTC)
-       dcsty'   <- forM dcs'  (makeDataConTypes allowTC)
+       let dcs   = map fst constructorSchemas
+       let dcs'  = map fst importedConstructorSchemas
+       defaults <- mapM (traverse (true allowTC)) defaultSchemas
+       dcsty    <- mapM (traverse (true allowTC)) constructorSchemas
+       dcsty'   <- mapM (traverse (true allowTC)) importedConstructorSchemas
        (hs,f0)  <- refreshHoles allowTC $ grty info                           -- asserted refinements     (for defined vars)
-       f0''     <- refreshArgs' =<< grtyTop info                      -- default TOP reftype      (for exported vars without spec)
-       let f0'   = if notruetypes $ getConfig sp then [] else f0''
+       f0' <- refreshArgs' =<< grtyTop info -- default TOP reftype      (for exported vars without spec)
        f1       <- refreshArgs'   defaults                            -- default TOP reftype      (for all vars)
        f1'      <- refreshArgs' $ strengthenDc dcsty                  -- data constructors
        f2       <- refreshArgs' $ assm info                           -- assumed refinements      (for imported vars)
@@ -75,25 +87,52 @@ initEnv info
        let f4    = mergeDataConTypes tce (mergeDataConTypes tce f40 (f41 ++ f42)) (filter (isDataConId . fst) (f2 ++ f3))
        let tx    = first F.symbol . addRInv ialias . predsUnify sp
        f6       <- map tx . addPolyInfo' <$> refreshArgs' (vals gsRefSigs (gsSig sp))
+       admitted <- map (first F.symbol) <$> refreshArgs' callables
        let bs    = (tx <$> ) <$> [f0 ++ f0' ++ fi, f1 ++ f1', f2, f3 ++ f3', f4, f5]
        modify $ \s -> s { dataConTys = f4 }
        lt1s     <- gets (F.toListSEnv . cgLits)
-       let lt2s  = [ (F.symbol x, rTypeSort tce t) | (x, t) <- f1' ]
+       let lt2s =
+             sortNub $
+               [(F.symbol x, rTypeSort tce t) | (x, t) <- f1']
+                 ++ [ (F.symbol dc, typeSort tce (expandTypeSynonyms (varType (dataConWrapId dc))))
+                    | dc <- M.keys (gsConstructorBoxes (gsName sp))
+                    ]
        let tcb   = fmap (rTypeSort tce) <$> concat bs
        let cbs   = giCbs . giSrc $ info
-       rTrue   <- mapM (traverse (true allowTC)) f6
+       let (sourceReflections, externalReflections) = L.partition ((`S.member` sourceSymbols) . fst) f6
+       rTrue <- mapM (traverse (true allowTC)) sourceReflections
        -- Issue #2537: reflected sigs (f6) must come AFTER assumed sigs (bs!!3) so that
        -- when both exist for the same symbol (e.g., assume-reflect actual functions),
        -- the strengthened reflected sig wins in M.fromList (which keeps the last entry).
-       let γ0    = measEnv sp (head bs) cbs tcb lt1s lt2s (bs!!3 ++ f6) (bs!!5) hs info
-       γ  <- globalize <$> foldM (+=) γ0 ( [("initEnv", x, y) | (x, y) <- concat (rTrue:tail bs)])
+       -- Checked predecessors and independently admitted expected-failure owners
+       -- take precedence as callables; authored checking goals remain in grtys.
+       let γ0 = measEnv sp (head bs) cbs tcb lt1s lt2s (bs !! 3 ++ f6 ++ admitted) (bs !! 5) hs info
+       -- Imported/explicitly ignored identities have no local checking body.
+       -- Keep their strengthened contracts after ordinary assumptions. A local
+       -- claim must never enter fenv early: a later overwrite retains its BindId.
+       γ <- globalize <$> foldM (+=) γ0 ([("initEnv", x, y) | (x, y) <- concat (rTrue : tail bs) ++ externalReflections ++ admitted])
        return γ {invs = is (invs1 ++ invs2)}
   where
     allowTC      = typeclass (getConfig info)
     sp           = giSpec info
     ialias       = mkRTyConIAl (gsIaliases (gsData sp))
     vals f       = map (fmap val) . f
-    is autoinv   = mkRTyConInv    (gsInvariants (gsData sp) ++ ((Nothing,) <$> autoinv))
+    -- A locally claimed measure result becomes an invariant only after its
+    -- defining Core group has been checked, like an ordinary postcondition.
+    is autoinv =
+      mkRTyConInv
+        ( filter available (gsInvariants (gsData sp))
+            ++ ((Nothing,) <$> autoinv)
+        )
+    available (owner, _) =
+      maybe
+        True
+        (\x -> x `notElem` giDefVars (giSrc info) || x `S.member` checkedOwners || x `S.member` gsIgnoreVars (gsVars sp))
+        owner
+    checkedOwners = S.fromList (map fst callables)
+    sourceSymbols = S.map F.symbol $
+      S.fromList (giDefVars (giSrc info) ++ letVars (giCbs (giSrc info)))
+        `S.difference` gsIgnoreVars (gsVars sp)
     addPolyInfo' = if reflection (getConfig info) then map (fmap addPolyInfo) else id
 
     strengthenDc = map strengthenDataConType
@@ -106,9 +145,6 @@ addPolyInfo t = mkUnivs (go <$> as) ps t'
     go (a,r) = if {- ty_var_value a `elem` ppos pos && -}  ty_var_value a `notElem` pneg pos
                then (setRtvPol a False,r)
                else (a,r)
-
-makeDataConTypes :: Bool -> Var -> CG (Var, SpecType)
-makeDataConTypes allowTC x = (x,) <$> trueTy allowTC (varType x)
 
 -- | Refines the data constructors of every autosized type with an equation for
 --   the @autolen@ measure, and returns one invariant per refined type stating
@@ -203,16 +239,21 @@ measEnv :: TargetSpec
 --------------------------------------------------------------------------------
 measEnv sp xts cbs _tcb lt1s lt2s asms itys hs info = CGE
   { cgLoc    = Sp.empty
-  , renv     = fromListREnv (second val <$> gsMeas (gsData sp)) []
+  -- A source measure's logical sort erases its declared input refinements.
+  -- Keep that sort in fenv, but obtain its callable from source checking,
+  -- never from the logical declaration (including forward predicate calls).
+  , renv     = fromListREnv
+      [(name, val ty) | (name, ty) <- gsMeas (gsData sp), not (name `S.member` sourceSymbols)] []
   , litEnv   = F.fromListSEnv lts
   , constEnv = F.fromListSEnv lt2s
   , fenv     =
-      initFEnv $ filterHO $ concat
-        [ tcb'
-        , lts
-        , second (rTypeSort tce . val) <$> gsMeas (gsData sp)
-        , [(F.eqName e, eqSort e) | e <- gsImpAxioms (gsRefl sp)]
-        ]
+      initFEnv $
+        filterHO (tcb' ++ lts)
+          -- Declared logical interfaces travel with their equations and
+          -- constructor contracts. A client's optional higher-order setting
+          -- must not erase the declarations while retaining those uses.
+          ++ (second (rTypeSort tce . val) <$> gsMeas (gsData sp))
+          ++ [(F.eqName e, eqSort e) | e <- gsImpAxioms (gsRefl sp)]
   , denv     = dmapty val $ gsDicts (gsSig sp)
   , recs     = S.empty
   , invs     = mempty
@@ -234,6 +275,8 @@ measEnv sp xts cbs _tcb lt1s lt2s asms itys hs info = CGE
   , cgVar    = Nothing
   }
   where
+      sourceSymbols = S.map F.symbol $
+          S.fromList (giDefVars (giSrc info)) `S.difference` gsIgnoreVars (gsVars sp)
       tce         = gsTcEmbeds (gsName sp)
       filterHO xs = if higherOrderFlag sp then xs else filter (F.isFirstOrder . snd) xs
       lts         = lt1s ++ lt2s
@@ -267,25 +310,35 @@ recSelectorsTy info = forM topVs $ \v -> (v,) <$> trueTy (typeclass (getConfig i
 
 
 grtyTop :: TargetInfo -> CG [(Var, SpecType)]
-grtyTop info     = forM topVs $ \v -> (v,) <$> trueTy (typeclass (getConfig info)) (varType v)
-  where
-    topVs        = filter isTop $ giDefVars (giSrc info)
-    isTop v      = isExportedVar (giSrc info) v && not (v `S.member` sigVs) && not (isRecordSelector v)
-    sigVs        = S.fromList [v | (v,_) <- gsTySigs sp ++ gsAsmSigs sp ++ gsRefSigs sp ++ gsInSigs sp]
-    sp           = gsSig . giSpec $ info
+grtyTop info = forM (defaultTopVars info) $ \v -> (v,) <$> trueTy (typeclass (getConfig info)) (varType v)
+
+-- Default interfaces are checking targets, not inferred private signatures.
+-- Use the same selection when deciding which definitions share inference.
+defaultTopVars :: TargetInfo -> [Var]
+defaultTopVars info
+  | notruetypes (getConfig info) = []
+  | otherwise = filter isTop $ giDefVars (giSrc info)
+ where
+  isTop v = (isExportedVar (giSrc info) v || (isId v && isDFunId v)) && not (v `S.member` sigVs) && not (isRecordSelector v)
+  sigVs = S.fromList ([v | (v, _) <- gsTySigs sp ++ gsAsmSigs sp ++ gsRefSigs sp ++ gsInSigs sp] ++ [v | (v, method) <- gsMethods sp, Just _ <- [getMethodType method]])
+  sp = gsSig . giSpec $ info
 
 
 infoLits :: (TargetSpec -> [(F.Symbol, LocSpecType)]) -> (F.Sort -> Bool) -> TargetInfo -> F.SEnv F.Sort
-infoLits litF selF info = F.fromListSEnv $ cbLits ++ measLits
+infoLits litF selF info = F.fromListSEnv $ importedLits ++ cbLits ++ measLits
   where
+    importedLits = filter (selF . snd) (gsImps spc)
     cbLits    = filter (selF . snd) $ coreBindLits tce info
     measLits  = filter (selF . snd) $ mkSort <$> litF spc
     spc       = giSpec info
     tce       = gsTcEmbeds (gsName spc)
     mkSort    = fmap (F.sr_sort . rTypeSortedReft tce . val)
 
-initCGI :: Config -> TargetInfo -> CGInfo
-initCGI cfg info = CGInfo {
+-- Share only the immutable declaration interpretation. Construct each query's
+-- strict record with its own obligations; updating a prebuilt record would
+-- demand the base target's unselected obligations before replacing them.
+initCGI :: Config -> TargetInfo -> TargetInfo -> CGInfo
+initCGI cfg base = \info -> CGInfo {
     fEnv          = F.emptySEnv
   , hsCs          = []
   , hsWfs         = []
@@ -297,17 +350,17 @@ initCGI cfg info = CGInfo {
   , localRewrites = mempty
   , ebinds        = []
   , annotMap      = AI M.empty
-  , newTyEnv      = M.fromList (fmap val <$> gsNewTypes (gsSig spc))
+  , newTyEnv      = newTypes
   , tyConInfo     = tyi
   , tyConEmbed    = tce
   , kuts          = mempty
   , kvPacks       = mempty
-  , cgLits        = infoLits (gsMeas . gsData) (const True) info
-  , cgConsts      = infoLits (gsMeas . gsData) notFn        info
+  , cgLits        = literals
+  , cgConsts      = constants
   , cgADTs        = gsADTs nspc
-  , termExprs     = M.fromList [(v, es) | (v, _, es) <- gsTexprs (gsSig spc) ]
+  , termExprs     = metrics
   , specLVars     = gsLvars (gsVars spc)
-  , specLazy      = dictionaryVar `S.insert` gsLazy tspc
+  , specLazy      = lazyOwners
   , specTmVars    = gsNonStTerm tspc
   , tcheck        = terminationCheck cfg
   , cgiTypeclass  = typeclass cfg
@@ -319,18 +372,26 @@ initCGI cfg info = CGInfo {
   , autoSize      = gsAutosize tspc
   , allowHO       = higherOrderFlag cfg
   , ghcI          = info
-  , unsorted      = F.notracepp "UNSORTED" $ F.makeTemplates $ gsUnsorted $ gsData spc
+  , unsorted      = F.notracepp "UNSORTED" $ F.makeTemplates $ gsUnsorted $ gsData (giSpec info)
   , hsHoles      = M.empty
   , hsANFHoles   = M.empty
   , hsHolesExprs = M.empty
+  , refinementChecksByOwner = M.fromListWith (++)
+      [(refinementCheckOwner check, [check]) | check <- gsReftChecks (gsSig (giSpec info))]
+  , visitedRefinementOwners = S.empty
   }
   where
     tce        = gsTcEmbeds nspc
     tspc       = gsTerm spc
-    spc        = giSpec info
+    spc        = giSpec base
     tyi        = gsTyconEnv nspc
     nspc       = gsName spc
     notFn      = isNothing . F.functionSort
+    newTypes = M.fromList (fmap val <$> gsNewTypes (gsSig spc))
+    literals = infoLits (gsMeas . gsData) (const True) base
+    constants = infoLits (gsMeas . gsData) notFn base
+    metrics = M.fromList [(v, es) | (v, _, es) <- gsTexprs (gsSig spc)]
+    lazyOwners = dictionaryVar `S.insert` gsLazy tspc
 
 coreBindLits :: F.TCEmb TyCon -> TargetInfo -> [(F.Symbol, F.Sort)]
 coreBindLits tce info
@@ -339,7 +400,7 @@ coreBindLits tce info
   where
     src         = giSrc info
     lconsts      = literalConst tce <$> literals (giCbs src)
-    dcons        = filter isDCon $ gsDataConIds $ gsName $ giSpec info
-    dconToSort   = typeSort tce . expandTypeSynonyms . varType
+    dcons        = filter isDCon $ map dataConWorkId $ M.keys $ gsConstructorBoxes $ gsName $ giSpec info
+    dconToSort   = typeSort tce . expandTypeSynonyms . varType . dataConWrapId . idDataCon
     dconToSym    = F.symbol . idDataCon
     isDCon x     = isDataConId x && not (hasBaseTypeVar x)

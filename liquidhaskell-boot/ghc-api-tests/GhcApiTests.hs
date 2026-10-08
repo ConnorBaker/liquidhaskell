@@ -11,6 +11,7 @@ import           Liquid.GHC.API
     , AltCon(..)
     , LitNumType(..)
     , Literal(..)
+    , dataConWorkId
     , apiCommentsParsedSource
     , InstDecl(ClsInstD)
     , hsGroupInstDecls
@@ -19,9 +20,28 @@ import           Liquid.GHC.API
     , showPprQualified
     , splitDollarApp
     , tcg_rn_decls
+    , tcg_mod
+    , tcg_imports
+    , imp_mods
+    , tcg_rdr_env
     , untick
+    , exprFreeVars
+    , eqType
+    , isTyVar
     )
 import           Liquid.GHC.API.Extra (addNoInlinePragmasToBinds)
+import qualified Language.Fixpoint.Types as F
+import qualified Language.Haskell.Liquid.Types.RefType as RefType
+import           Language.Haskell.Liquid.Types.RType (SpecType)
+import           Language.Haskell.Liquid.Bare.Resolve (makeLocalVars)
+import Language.Haskell.Liquid.GHC.Misc (integerLiteral)
+import           Language.Haskell.Liquid.LHNameResolution (resolveLHNames)
+import qualified Language.Haskell.Liquid.Parse as LH
+import           Language.Haskell.Liquid.Types.Names (getLHGHCName)
+import           Language.Haskell.Liquid.Types.Specs (Spec(asmSigs))
+import           Language.Haskell.Liquid.Transforms.ANF (anormalize)
+import           Language.Haskell.Liquid.UX.CmdLine (defConfig)
+import           GHC.Types.Unique.Set (nonDetEltsUniqSet)
 import           GHC.Hs (cid_binds)
 import           Test.Tasty
 import           Test.Tasty.HUnit
@@ -31,20 +51,38 @@ import qualified GHC as GHC
 import qualified GHC.Builtin.Names as GHC
 import qualified GHC.Builtin.Types as GHC
 import qualified GHC.Core as GHC
+import qualified GHC.Core.Make as GHC (mkIntegerExpr)
+import qualified GHC.Core.Type as GHC
+import qualified GHC.Core.Utils as Core
 import qualified GHC.Data.EnumSet as EnumSet
 import qualified GHC.Data.FastString as GHC
 import qualified GHC.Data.StringBuffer as GHC
 import qualified GHC.Driver.Main as GHC (hscDesugar)
+import qualified GHC.Driver.Session as GHC (targetPlatform)
+import qualified GHC.Platform as GHC (Platform (platformWordSize), PlatformWordSize (..))
 import qualified GHC.Parser as Parser
 import qualified GHC.Parser.Lexer as GHC
 import qualified GHC.Types.Id as GHC
+import GHC.Types.Literal (LitNumType (LitNumBigNat))
 import qualified GHC.Types.Name as GHC
+import qualified GHC.Types.Name.Occurrence as GHC
 import qualified GHC.Types.SrcLoc as GHC
 import qualified GHC.Unit.Module.ModGuts as GHC
 import qualified GHC.Unit.Types as GHC
 import qualified GHC.Utils.Error as GHC
 
 import GHC.Paths (libdir)
+import qualified ConstraintGenerationTests
+import qualified QualifierDecompositionTests
+import qualified FamilyPredicateTests
+import qualified MethodTelescopeTests
+import qualified MeasureApplicabilityTests
+import qualified LogicSupportTests
+import qualified QueryTelescopeTests
+import qualified RewriteDependencyTests
+import qualified TypeLiteralIdentityTests
+import qualified SpecClosureTests
+import qualified WiredInTests
 
 
 main :: IO ()
@@ -53,15 +91,116 @@ main =
 
 testTree :: TestTree
 testTree =
-    testGroup "GHC API"
-      [ testCase "apiComments" testApiComments
-      , testCase "caseDesugaring" testCaseDesugaring
-      , testCase "numericLiteralDesugaring" testNumLitDesugaring
-      , testCase "dollarDesugaring" testDollarDesugaring
-      , testCase "deadBindingPreservation" testDeadBindingPreservation
-      , testCase "exportedBindingNotInlined" testExportedBindingNotInlined
-      , testCase "derivingCheck" testDerivingCheck
+    testGroup
+        "GHC API"
+        [ MeasureApplicabilityTests.tests compileToCore
+        , MethodTelescopeTests.tests compileToCore
+        , LogicSupportTests.tests compileToCore
+        , QueryTelescopeTests.tests compileToCore
+        , FamilyPredicateTests.tests compileToCore
+        , RewriteDependencyTests.tests compileToCore
+        , ConstraintGenerationTests.tests compileToCore
+        , QualifierDecompositionTests.tests
+        , TypeLiteralIdentityTests.tests compileToCore
+        , SpecClosureTests.tests
+        , WiredInTests.tests
+        , testCase "stringLiteralSortCorrespondence" testStringLiteralSortCorrespondence
+        , testCase "stringLiteralDomainsRemainDistinct" testStringLiteralDomainsRemainDistinct
+        , testCase "apiComments" testApiComments
+        , testCase "operator occurrence determines its namespace, not its last dotted suffix" testOperatorNameResolution
+        , testCase "caseDesugaring" testCaseDesugaring
+        , testCase "numericLiteralDesugaring" testNumLitDesugaring
+        , integerLiteralTests
+        , testCase "dollarDesugaring" testDollarDesugaring
+        , testCase "deadBindingPreservation" testDeadBindingPreservation
+        , testCase "exportedBindingNotInlined" testExportedBindingNotInlined
+        , testCase "derivingCheck" testDerivingCheck
+        , testCase "ANF retains local polymorphic helper scope" testAnfTypeLambdaScope
+        ]
+
+-- Core lambdas retain GHC type literals, whereas refinement types pass through
+-- ofType. Both paths must produce the same logical sort, including embeddings.
+testStringLiteralSortCorrespondence :: IO ()
+testStringLiteralSortCorrespondence = do
+    binds <- compileToCore "LiteralSorts" $ unlines
+      [ "{-# LANGUAGE DataKinds, KindSignatures #-}"
+      , "module LiteralSorts where"
+      , "import GHC.TypeLits (Symbol)"
+      , "newtype Tagged (label :: Symbol) = Tagged Int"
+      , "nested :: Maybe (Tagged \"component id\") -> Maybe (Tagged \"component id\")"
+      , "nested x = x"
       ]
+    case findExpr "nested" binds of
+      Nothing -> assertFailure "missing nested literal control"
+      Just nested -> do
+        let literal = GHC.mkStrLitTy (GHC.fsLit "component id")
+            formerHole = GHC.mkStrLitTy (GHC.fsLit "$LH_RHOLE")
+            custom = F.tceFromList
+              [ (GHC.listTyCon, (F.FObj (F.symbol "CustomList"), F.NoArgs))
+              , (GHC.charTyCon, (F.FObj (F.symbol "CustomChar"), F.NoArgs))
+              ]
+            collapsed = F.tceFromList
+              [(GHC.listTyCon, (F.FObj (F.symbol "EmbeddedString"), F.WithArgs))]
+            types = [literal, Core.exprType nested]
+            agrees embeddings ty =
+              RefType.typeSort embeddings ty @?=
+                RefType.rTypeSort embeddings (RefType.ofType ty :: SpecType)
+        forM_ [mempty, custom, collapsed] $ \embeddings -> do
+          forM_ types (agrees embeddings)
+          RefType.typeSort embeddings (GHC.mkNumLitTy 7) @?= F.FInt
+          agrees embeddings formerHole
+          RefType.typeSort embeddings formerHole @?= RefType.typeSort embeddings literal
+          assertBool "distinct Symbol literals lost GHC identity"
+            (not (eqType formerHole literal))
+
+-- Logical sort normalization does not change GHC's type-level label equality.
+-- This is a type-equality control, not a claim about visible newtype coercions.
+testStringLiteralDomainsRemainDistinct :: IO ()
+testStringLiteralDomainsRemainDistinct = do
+    _ <- GHC.runGhc (Just libdir) $
+      typecheckSourceCode "DistinctLabels" (source "component id")
+    rejected <- GHC.runGhc (Just libdir) $
+      GHC.handleSourceError (\_ -> return True) $ do
+        _ <- typecheckSourceCode "DistinctLabels" (source "platform name")
+        return False
+    assertBool "GHC identified distinct type-level labels" rejected
+  where
+    source label = unlines
+      [ "{-# LANGUAGE DataKinds, KindSignatures #-}"
+      , "module DistinctLabels where"
+      , "import GHC.TypeLits (Symbol)"
+      , "newtype Tagged (label :: Symbol) = Tagged Int"
+      , "identity :: Tagged \"component id\" -> Tagged " ++ show label
+      , "identity x = x"
+      ]
+
+testOperatorNameResolution :: IO ()
+testOperatorNameResolution = GHC.runGhc (Just libdir) $ do
+    (_, checked) <-
+        typecheckSourceCode "OperatorNames" $
+            unlines
+                [ "module OperatorNames where"
+                , "(.:), (.:?) :: Int -> Int -> Int"
+                , "(.:) x _ = x"
+                , "(.:?) _ y = y"
+                , "data Pair = Int :. Int"
+                ]
+    let (tcg, _) = GHC.tm_internals_ checked
+    liftIO $ forM_ ["", "OperatorNames."] $ \prefix ->
+        forM_ [(".:", False), (".:?", False), (":.", True)] $ \(operator, constructor) -> do
+            let annotation = "assume (" ++ prefix ++ operator ++ ") :: Int -> Int -> " ++ if constructor then "Pair" else "Int"
+            assumption <- case LH.singleSpecP (F.dummyPos "operator assumption") annotation of
+                Right (LH.Assm signature) -> pure signature
+                Left err -> assertFailure (show err) >> fail "operator assumption did not parse"
+                Right other -> assertFailure ("unexpected annotation: " ++ F.showpp other) >> fail "expected an assumption"
+            case resolveLHNames defConfig (tcg_mod tcg) (makeLocalVars [] []) (imp_mods (tcg_imports tcg)) (tcg_rdr_env tcg) mempty{asmSigs = [assumption]} mempty of
+                Left errors -> assertFailure (annotation ++ ": " ++ F.showpp errors)
+                Right (spec, _, _) -> case map (getLHGHCName . F.val . fst) (asmSigs spec) of
+                    [Just name] -> do
+                        GHC.occNameString (GHC.nameOccName name) @?= operator
+                        assertBool ("wrong namespace: " ++ annotation) (GHC.occNameSpace (GHC.nameOccName name) == if constructor then GHC.dataName else GHC.varName)
+                        assertBool ("wrong module: " ++ annotation) (GHC.nameModule name == tcg_mod tcg)
+                    _ -> assertFailure "operator assumption did not resolve to one GHC name"
 
 -- Tests that Liquid.GHC.API.Extra.apiComments can retrieve the comments in
 -- the right order from an AST
@@ -174,6 +313,40 @@ testNumLitDesugaring = do
       fail $ unlines $
         "Unexpected desugaring:" : map showPprQualified coreProgram
 
+-- The constructor boundary is asymmetric: the negative minimum still uses IS.
+-- Native source tests separately cover magnitudes beyond a machine word.
+integerLiteralTests :: TestTree
+integerLiteralTests =
+    testGroup "Integer literal interpretation" $
+        [ testGroup
+            (show bits ++ "-bit")
+            [ testCase "canonical constructor boundaries agree with GHC" $ do
+                platform <- GHC.runGhc (Just libdir) (GHC.targetPlatform <$> GHC.getSessionDynFlags)
+                let target = platform{GHC.platformWordSize = wordSize}
+                forM_ [-half - 1, -half, half - 1, half] $ \value ->
+                    assertEqual (show value) (Just value) (integerLiteral (Just bits) (GHC.mkIntegerExpr target value))
+            , testCase "noncanonical constructors and raw payloads are rejected"
+                $ forM_
+                    [ ("IS above its range", raw GHC.integerISDataCon LitNumInt half)
+                    , ("IS below its range", raw GHC.integerISDataCon LitNumInt (-half - 1))
+                    , ("IP below its range", raw GHC.integerIPDataCon LitNumBigNat (half - 1))
+                    , ("IN at the IS minimum magnitude", raw GHC.integerINDataCon LitNumBigNat half)
+                    , ("IP with an Int payload", raw GHC.integerIPDataCon LitNumInt 1)
+                    , ("IS with a BigNat payload", raw GHC.integerISDataCon LitNumBigNat (half + 1))
+                    , ("bare BigNat payload", Lit (LitNumber LitNumBigNat half))
+                    ]
+                $ \(label, expression) -> assertEqual label Nothing (integerLiteral (Just bits) expression)
+            ]
+        | (bits, wordSize) <- [(32, GHC.PW4), (64, GHC.PW8)]
+        , let half = (2 :: Integer) ^ (bits - 1)
+        ]
+            ++ [ testCase "missing or unsupported target width is rejected" $
+                    forM_ [Nothing, Just 16] $ \bits ->
+                        assertEqual (show bits) Nothing (integerLiteral bits (raw GHC.integerISDataCon LitNumInt 0))
+               ]
+  where
+    raw constructor kind value = App (Var (dataConWorkId constructor)) (Lit (LitNumber kind value))
+
 dropLets :: GHC.CoreExpr -> GHC.CoreExpr
 dropLets (Let _ e) = dropLets e
 dropLets e         = e
@@ -218,6 +391,36 @@ compileToCore modName inputSource = do
       (_, tcMod) <- typecheckSourceCode modName inputSource
       dsMod <- GHC.desugarModule tcMod
       return $ GHC.mg_binds $ GHC.dm_core_module dsMod
+
+-- GHC's local polymorphic function has an inner monomorphic owner under its
+-- type lambda. ANF must not float that owner into the enclosing value scope.
+testAnfTypeLambdaScope :: IO ()
+testAnfTypeLambdaScope = do
+    let source =
+            unlines
+                [ "{-# LANGUAGE RankNTypes, ScopedTypeVariables #-}"
+                , "module AnfTypeScope where"
+                , "data Choice a = Empty | Full a"
+                , "witness :: (forall a. (Choice a -> a) -> Bool) -> Bool"
+                , "witness use = use selected"
+                , "  where"
+                , "    {-# NOINLINE selected #-}"
+                , "    selected :: forall a. Choice a -> a"
+                , "    selected = let { {-# NOINLINE helper #-}; helper :: Choice a -> a; helper (Full x) = x } in helper"
+                ]
+    (before, after) <- GHC.runGhc (Just libdir) $ do
+        (_, checked) <- typecheckSourceCode "AnfTypeScope" source
+        desugared <- GHC.desugarModule checked
+        environment <- GHC.getSession
+        let guts = GHC.dm_core_module desugared
+        (normalized, _) <- liftIO $ anormalize defConfig environment guts
+        pure (GHC.mg_binds guts, normalized)
+    forM_ [("desugared", before), ("normalized", after)] $ \(stage, program) ->
+        case findExpr "witness" program of
+            Nothing -> assertFailure (stage ++ " witness missing")
+            Just body ->
+                assertBool (stage ++ " leaked type variables: " ++ showPprQualified body) $
+                    null (filter isTyVar (nonDetEltsUniqSet (exprFreeVars body)))
 
 typecheckSourceCode
   :: GHC.GhcMonad m => String -> String -> m (GHC.ModSummary, GHC.TypecheckedModule)

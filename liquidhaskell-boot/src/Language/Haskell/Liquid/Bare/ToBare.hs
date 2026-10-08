@@ -57,6 +57,7 @@ txRType cF vF = go
     go (RAppTy t t' r)     = RAppTy          (go t) (go t') r
     go (RApp c ts rs r)    = RApp  (cF c)    (go <$> ts) (goRTP <$> rs) r
     go (RRTy xts r o t)    = RRTy  (fmap go <$> xts) r o (go t)
+    go (RLit l)            = RLit l
     go (RExprArg e)        = RExprArg e
     go (RHole r)           = RHole r
 

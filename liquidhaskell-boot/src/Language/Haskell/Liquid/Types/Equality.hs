@@ -50,6 +50,8 @@ compareRType i1 i2 = res && unify ys
       = and <$> zipWithM go ts1 ts2
     go (REx x1 t11 t12) (REx x2 t21 t22) | x1 == x2
       = liftM2 (&&) (go t11 t21) (go t12 t22)
+    go (RLit l) (RLit l')
+      = return (l == l')
     go (RExprArg e1) (RExprArg e2)
       = return (e1 =*= e2)
     go (RAppTy t11 t12 r1) (RAppTy t21 t22 r2) | r1 =*= r2

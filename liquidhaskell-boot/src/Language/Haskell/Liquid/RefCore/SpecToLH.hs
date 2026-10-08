@@ -124,6 +124,7 @@ transType modId intCont (RApp f _ _ reft) = Calc.RefType x transT r
     x = refVar modId intCont reft
     r = transRef modId intCont x reft
 transType _ _ (REx {}) = unsupported "transType: unsupported REx"
+transType _ _ (RLit {}) = unsupported "transType: unsupported type literal"
 transType _ _ (RExprArg {}) = unsupported "transType: unsupported RExprArg"
 transType _ _ (RAppTy {}) = unsupported "transType: unsupported RAppTy"
 transType _ _ (RRTy {}) = unsupported "transType: unsupported RRTy"

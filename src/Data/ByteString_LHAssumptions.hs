@@ -5,6 +5,13 @@ module Data.ByteString_LHAssumptions where
 import Data.ByteString
 import Data.String_LHAssumptions()
 import GHC.Word
+import GHC.Word_LHAssumptions ()
+
+-- Byte observations belong to this producer, including their logical carrier.
+-- Import Word8's interpretation before publishing unpack, so downstream models
+-- see [int], not an opaque [GHC.Internal.Word.Word8]. This names the observation
+-- without asserting a body/content theorem; its length contract remains below.
+{-@ opaque-reflect Data.ByteString.unpack @-}
 
 {-@
 measure bslen :: ByteString -> { n : Int | 0 <= n }

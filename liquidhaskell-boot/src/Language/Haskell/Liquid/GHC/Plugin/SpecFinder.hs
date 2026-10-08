@@ -21,6 +21,7 @@ requiring users to mind how they specify dependencies.
 
 module Language.Haskell.Liquid.GHC.Plugin.SpecFinder
     ( findRelevantSpecs
+    , findTotalitySpec
     , LoadedSpec(..)
     , configToRedundantDependencies
     ) where
@@ -31,6 +32,10 @@ import           Language.Haskell.Liquid.Types.Specs
 import           Language.Haskell.Liquid.UX.Config
 
 import           Liquid.GHC.API         as GHC
+import qualified GHC.Data.Maybe as MaybeErr
+import           GHC.Driver.Session (ghcMode, isOneShot)
+import           GHC.Unit.Module (getModuleInstantiation)
+import qualified GHC.Unit.Home.Graph as HUG
 
 import           Data.Bifunctor
 import qualified Data.Char
@@ -166,8 +171,18 @@ findRelevantSpecs cfg hscEnv mods = foldM loadAndMerge HM.empty mods
           _       -> findPluginModule hscEnv assumptionsModName
       case res of
         Found _ assumptionsMod -> do
-          _ <- initIfaceTcRn $ loadInterface "liquidhaskell assumptions" assumptionsMod ImportBySystem
-          liftIO $ Serialisation.deserialiseLiquidLib hscEnv assumptionsMod
+          -- A future/self home module has no completed interface. Loading it
+          -- would cache a failed empty interface in EPS.
+          home <- liftIO $ HUG.lookupHugByModule assumptionsMod (hsc_HUG hscEnv)
+          let installed = fst $ getModuleInstantiation assumptionsMod
+              unavailable = HUG.memberHugUnitId (moduleUnit installed) (hsc_HUG hscEnv)
+                && not (isOneShot (ghcMode $ hsc_dflags hscEnv)) && isNothing home
+          if unavailable then pure Nothing else do
+            loaded <- initIfaceTcRn $ loadInterface "liquidhaskell assumptions" assumptionsMod ImportBySystem
+            case loaded of
+              MaybeErr.Failed err -> failWithTc $ mkTcRnUnknownMessage $ mkPlainError [] $
+                missingInterfaceErrorDiagnostic (initIfaceMessageOpts $ hsc_dflags hscEnv) err
+              MaybeErr.Succeeded _ -> liftIO $ Serialisation.deserialiseLiquidLib hscEnv assumptionsMod
         FoundMultiple{} -> failWithTc $ mkTcRnUnknownMessage $ mkPlainError [] $
                              missingInterfaceErrorDiagnostic (initIfaceMessageOpts $ hsc_dflags hscEnv) $
                              cannotFindModule hscEnv assumptionsModName res
@@ -180,6 +195,47 @@ findRelevantSpecs cfg hscEnv mods = foldM loadAndMerge HM.empty mods
     assumptionsModuleName m =
       mkModuleNameFS $ moduleNameFS (moduleName m) <> "_LHAssumptions"
 
+-- Totality is a checking policy, independent of importing Prelude or the
+-- facade through which a client obtains a partial primitive.
+findTotalitySpec :: HscEnv -> Config -> TcM [Module]
+findTotalitySpec env cfg
+  | compileSpec cfg || not (totalityCheck cfg) = pure []
+  | otherwise = do
+      policy <- liftIO $ lookupLiquidBaseModule env totalityModuleName
+      case policy of
+        Nothing -> missingPolicy
+        Just mdl -> do
+          loaded <- initIfaceTcRn $ loadInterface "liquidhaskell totality policy" mdl ImportBySystem
+          case loaded of
+            MaybeErr.Failed err ->
+              failWithTc $
+                mkTcRnUnknownMessage $
+                  mkPlainError [] $
+                    missingInterfaceErrorDiagnostic (initIfaceMessageOpts $ hsc_dflags env) err
+            MaybeErr.Succeeded _ -> pure ()
+          result <- liftIO $ Serialisation.deserialiseLiquidLib env mdl
+          maybe missingPolicy (const $ pure [mdl]) result
+ where
+  missingPolicy =
+    failWithTc $
+      mkTcRnUnknownMessage $
+        mkPlainError [] $
+          text "LiquidHaskell totality policy is unavailable; expose the liquidhaskell package with its compiled LH assumptions."
+
+totalityModuleName :: ModuleName
+totalityModuleName = mkModuleName "Liquid.Prelude.Totality_LHAssumptions"
+
+lookupLiquidBaseModule :: HscEnv -> ModuleName -> IO (Maybe Module)
+lookupLiquidBaseModule env mn = do
+  res <- findImportedModule env mn (renamePkgQual (hsc_unit_env env) mn (Just "liquidhaskell"))
+  case res of
+    Found _ mdl -> pure $ Just mdl
+    _ -> do
+      other <- findPluginModule env mn
+      case other of
+        Found _ mdl -> pure $ Just mdl
+        _ -> pure Nothing
+
 -- | Returns a list of 'StableModule's which can be filtered out of the dependency list, because they are
 -- selectively \"toggled\" on and off by the LiquidHaskell's configuration, which granularity can be
 -- /per module/.
@@ -189,21 +245,9 @@ configToRedundantDependencies env cfg = do
   where
     lookupModule' :: (Bool, ModuleName) -> IO (Maybe StableModule)
     lookupModule' (fetchModule, modName)
-      | fetchModule = lookupLiquidBaseModule modName
+      | fetchModule = fmap toStableModule <$> lookupLiquidBaseModule env modName
       | otherwise   = pure Nothing
 
-    lookupLiquidBaseModule :: ModuleName -> IO (Maybe StableModule)
-    lookupLiquidBaseModule mn = do
-      res <- findImportedModule env mn (renamePkgQual (hsc_unit_env env) mn (Just "liquidhaskell"))
-      case res of
-        Found _ mdl -> pure $ Just (toStableModule mdl)
-        _ -> do
-          -- Fall back to plugin package visibility
-          -- See Note [Module Visibility and Lookup in GHC] for details.
-          res2 <- findPluginModule env mn
-          case res2 of
-            Found _ mdl -> pure $ Just (toStableModule mdl)
-            _           -> pure Nothing
 
 -- | Static associative map of the 'ModuleName' that needs to be filtered from the final 'TargetDependencies'
 -- due to some particular configuration options.

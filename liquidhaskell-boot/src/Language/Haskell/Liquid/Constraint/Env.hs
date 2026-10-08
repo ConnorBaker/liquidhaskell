@@ -19,6 +19,7 @@ module Language.Haskell.Liquid.Constraint.Env (
   , (+=)
   , extendEnvWithVV
   , addBinders
+  , addSortBind
   , addSEnv
   , addEEnv
   , addRewritesForNextBinding
@@ -72,6 +73,8 @@ import           Language.Fixpoint.SortCheck (pruneUnsortedReft)
 import           Liquid.GHC.API hiding (get, panic)
 import           Language.Haskell.Liquid.Types.RefType
 import qualified Language.Haskell.Liquid.GHC.SpanStack as Sp
+import qualified Language.Haskell.Liquid.GHC.Misc as GM
+import           Language.Haskell.Liquid.Types.Specs (giSpec, gsSig, gsTySigs)
 import           Language.Haskell.Liquid.Types.Errors
 import           Language.Haskell.Liquid.Types.Fresh
 import           Language.Haskell.Liquid.Types.RType
@@ -151,6 +154,14 @@ extendEnvWithVV γ t
 
 addBinders :: CGEnv -> F.Symbol -> [(F.Symbol, SpecType)] -> CG CGEnv
 addBinders γ0 x' cbs   = foldM (++=) (γ0 -= x') [("addBinders", x, t) | (x, t) <- cbs]
+
+-- | Put a value's identity in logical scope without assuming its contract.
+-- This adds no callable type, class binding, or datatype invariant.
+addSortBind :: CGEnv -> (F.Symbol, F.Sort) -> CG CGEnv
+addSortBind γ (x, sort) = do
+  binding <- addBind (getLocation γ) x (F.RR sort mempty)
+  return $ γ { fenv = insertsFEnv (fenv γ) [binding] }
+
 
 addBind :: SrcSpan -> F.Symbol -> F.SortedReft -> CG ((F.Symbol, F.Sort), F.BindId)
 addBind l x r = do
@@ -273,12 +284,20 @@ setLocation γ p = γ { cgLoc = Sp.push p $ cgLoc γ }
 ------------------------------------------------------------------------
 setBind :: CGEnv -> Var -> CGEnv
 ------------------------------------------------------------------------
-setBind γ x = γ `setLocation` Sp.Var x `setBind'` x
+setBind γ x = located `setLocation` Sp.Var x `setBind'` x
+  where
+    -- Imported unfoldings can lack body positions. Attribute the obligation
+    -- to its authored claim, without replacing an actual source location.
+    located
+        | isGoodSrcSpan (getSrcSpan x) || isGoodSrcSpan (getLocation γ) = γ
+        | Just claim <- lookup x (gsTySigs (gsSig (giSpec (cgInfo γ)))) =
+            γ `setLocation` Sp.Span (GM.fSrcSpan claim)
+        | otherwise = γ
 
 setBind' :: CGEnv -> Tg.TagKey -> CGEnv
 setBind' γ k
-  | Tg.memTagEnv k (tgEnv γ) = γ { tgKey = Just k }
-  | otherwise                = γ
+    | Tg.memTagEnv k (tgEnv γ) = γ{tgKey = Just k, cgVar = Just k}
+    | otherwise = γ
 
 ------------------------------------------------------------------------
 setRecs :: CGEnv -> [Var] -> CGEnv

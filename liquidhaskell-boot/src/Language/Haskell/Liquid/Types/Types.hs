@@ -22,6 +22,8 @@ module Language.Haskell.Liquid.Types.Types (
 
   -- * Ghc Information
     TyConMap     (..)
+  , ConstructorBox (..)
+  , LogicSupport, retainLogicSupport
 
   -- * F.Located Things
   , F.Located (..)
@@ -199,6 +201,19 @@ import           Language.Haskell.Liquid.Misc
 
 
 -----------------------------------------------------------------------------
+-- | Actual source identities paired with their interpreted logical sorts.
+type LogicSupport = [(Var, F.Sort)]
+
+-- Retain actual typed source identities only while their observations remain
+-- free in the completed meaning. Local telescopes own their bound symbols.
+retainLogicSupport :: S.HashSet F.Symbol -> LogicSupport -> LogicSupport
+retainLogicSupport symbols = filter ((`S.member` symbols) . F.symbol . fst)
+
+-- | GHC's typed reconstruction of source fields from the worker telescope.
+data ConstructorBox = ConstructorBox [Var] [(Var, CoreExpr)]
+instance Show ConstructorBox where
+    show (ConstructorBox worker fields) = showPpr worker ++ showPpr fields
+
 -- | Information about Type Constructors
 -----------------------------------------------------------------------------
 data TyConMap = TyConMap
@@ -240,8 +255,16 @@ type BareRTAlias = RTAlias Symbol BareType
 type SpecRTAlias = RTAlias RTyVar SpecType
 
 
-class SubsTy tv ty a where
+class F.Symbolic tv => SubsTy tv ty a where
   subt :: (tv, ty) -> a -> a
+  subt = subtWithSort Nothing
+
+  -- Nothing transports variable coordinates; a supplied interpretation gives
+  -- the logical sort of every structural replacement under the same scope.
+  -- Replacement free coordinates must be fresh for retained named type binders
+  -- (RAllT and ETAbs): masking preserves scope, but does not alpha-freshen them.
+  subtWithSort :: Maybe (ty -> F.Sort) -> (tv, ty) -> a -> a
+  {-# MINIMAL subtWithSort #-}
 
 -- [NOTE:LIFTED-VAR-SYMBOLS]: Following NOTE:REFLECT-IMPORTS, by default
 -- each (lifted) `Var` is mapped to its `Symbol` via the `Symbolic Var`
@@ -536,12 +559,13 @@ instance NFData a => NFData (TError a)
 -- | Source Information Associated With Constraints ----------------------------
 --------------------------------------------------------------------------------
 
-data Cinfo    = Ci
-  { ci_loc :: !SrcSpan
-  , ci_err :: !(Maybe Error)
-  , ci_var :: !(Maybe Var)
-  }
-  deriving (Eq, Generic)
+data Cinfo = Ci
+    { ci_loc :: !SrcSpan
+    , -- Solver preprocessing needs locations and owners, not rich diagnostics.
+      ci_err :: !(Maybe (F.Delayed Error))
+    , ci_var :: !(Maybe Var)
+    }
+    deriving (Eq, Generic)
 
 instance F.Loc Cinfo where
   srcSpan = srcSpanFSrcSpan . ci_loc
@@ -976,7 +1000,7 @@ hasHole :: (IsReft r, ReftBind r ~ Symbol, ReftVar r ~ Symbol) => r -> Bool
 hasHole = any isHole . F.conjuncts . F.reftPred . toReft
 
 instance F.Symbolic DataCon where
-  symbol = F.symbol . dataConWorkId
+  symbol = F.symbol . getName
 
 instance Ord TyCon where
   compare = compare `on` F.symbol

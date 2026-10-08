@@ -18,9 +18,12 @@ module Language.Haskell.Liquid.GHC.Plugin (
 import qualified Liquid.GHC.API         as O
 import           Liquid.GHC.API         as GHC hiding (Type)
 import           GHC.Data.FastString    (LexicalFastString (..))
-import           GHC.Types.Name         (setNameLoc)
+import           GHC.Driver.Session    (targetPlatform)
+import GHC.Cmm.Utils (mAX_PTR_TAG)
+import GHC.Platform (platformWordSizeInBits)
 import qualified Text.PrettyPrint.HughesPJ               as PJ
 import qualified Language.Fixpoint.Types                 as F
+import           Language.Haskell.Liquid.GHC.ImportedBodies (hydrateAuthoredImportedBodies)
 import qualified Language.Haskell.Liquid.GHC.Misc        as LH
 import qualified Language.Haskell.Liquid.UX.CmdLine      as LH
 import qualified Language.Haskell.Liquid.GHC.Interface   as LH
@@ -44,7 +47,8 @@ import           Language.Haskell.Liquid.Transforms.Rewrite (rewriteBinds)
 
 import           Control.Monad
 import qualified Control.Monad.Catch as Ex
-import           Control.Exception (SomeException, someExceptionContext)
+import           Control.Exception (SomeException, fromException, someExceptionContext)
+import           GHC.Data.IOEnv (IOEnvFailure)
 import           Control.Exception.Context
 import           Control.Monad.IO.Class (MonadIO)
 
@@ -80,6 +84,7 @@ import           Language.Haskell.Liquid.Types.Types
 import           Language.Haskell.Liquid.Types.RType (SpecType)
 import           Language.Haskell.Liquid.Types.Visitors
 import           Language.Haskell.Liquid.Bare
+import           Language.Haskell.Liquid.Constraint.Publication
 import qualified Language.Haskell.Liquid.Bare.Resolve as Resolve
 import           Language.Haskell.Liquid.UX.CmdLine
 import           Language.Haskell.Liquid.UX.Config
@@ -141,8 +146,14 @@ plugin = GHC.defaultPlugin {
     typecheckPlugin :: [CommandLineOption] -> ModSummary -> TcGblEnv -> TcM TcGblEnv
     typecheckPlugin opts summary gblEnv = liquidPlugin opts gblEnv $ \cfg ->
       Ex.catch (typecheckPluginGo cfg summary gblEnv) $ \(e :: SomeException) -> do
-        liftIO $ hPutStrLn stderr $ "LiquidHaskell plugin panics:\n" ++
-          displayExceptionContext (someExceptionContext e)
+        -- GHC uses exceptions to return ordinary source diagnostics, too.
+        case (fromException e :: Maybe SourceError, fromException e :: Maybe IOEnvFailure) of
+          (Nothing, Nothing) ->
+            liftIO $
+              hPutStrLn stderr $
+                "LiquidHaskell plugin panics:\n"
+                  ++ displayExceptionContext (someExceptionContext e)
+          _ -> pure ()
         Ex.throwM e
 
     typecheckPluginGo cfg summary gblEnv = do
@@ -154,12 +165,13 @@ plugin = GHC.defaultPlugin {
           logger (text "LiquidHaskell" <+> brackets (ppr $ ms_mod_name summary)) (const ()) $
         fromMaybe gblEnv <$> typecheckHook cfg summary gblEnv
 
-    -- We instruct LH to collect timings instead of doing it directly to GHC
-    -- This helps work around https://github.com/haskell/cabal/issues/11116
-    maybeDDumpTimings :: Config -> LogFlags -> LogFlags
-    maybeDDumpTimings cfg =
-      if ddumpTimings cfg then log_set_dopt Opt_D_dump_timings
-      else id
+-- We instruct LH to collect timings instead of doing it directly to GHC
+-- This helps work around https://github.com/haskell/cabal/issues/11116
+maybeDDumpTimings :: Config -> LogFlags -> LogFlags
+maybeDDumpTimings cfg =
+  if ddumpTimings cfg
+    then log_set_dopt Opt_D_dump_timings
+    else id
 
 --------------------------------------------------------------------------------
 -- | Inter-phase communication -------------------------------------------------
@@ -308,7 +320,14 @@ typecheckHook' cfg ms tcGblEnv specComments = do
 
 liquidCheckModule :: Config -> ModSummary -> TcGblEnv -> [BPspec] -> TcM (Maybe TcGblEnv)
 liquidCheckModule cfg0 ms tcg specs = do
-  withPragmas cfg0 pragmas $ \cfg -> do
+  targetEnv <- getTopEnv
+  let platform = targetPlatform (GHC.hsc_dflags targetEnv)
+      targetCfg =
+        cfg0
+          { targetIntBits = Just (platformWordSizeInBits platform)
+          , targetMaxSmallTag = Just (mAX_PTR_TAG platform)
+          }
+  withPragmas targetCfg pragmas $ \cfg -> do
     pipelineData <- do
       env <- getTopEnv
       session <- Session <$> liftIO (newIORef env)
@@ -421,22 +440,28 @@ checkLiquidHaskellContext lhContext = do
   case pmr of
     Nothing -> pure Nothing
     Just ProcessModuleResult{..} -> do
-      -- Call into the existing Liquid interface
-      (programOut, infTypes) <- liftIO $ LH.checkTargetInfo pmrTargetInfo
-      refinementOut <- case (o_result programOut, pmrRefinementTargetInfo) of
-        (F.Safe _, Just refinementTargetInfo) -> fst <$> liftIO (LH.checkTargetInfo refinementTargetInfo)
-        _                                     -> pure mempty
-      let out = programOut <> refinementOut
+      let candidates = publicationCandidates pmrTargetInfo
+      logger0 <- getLogger
+      let logger = updateLogFlags logger0 (maybeDDumpTimings (lhGlobalCfg lhContext))
+      (out, infTypes, checked) <-
+        GHC.withTimingWallClock
+          logger
+          (text "LiquidHaskellCheck" <+> brackets (ppr $ ms_mod_name $ lhModuleSummary lhContext))
+          (const ())
+          $ liftIO
+          $ LH.checkTargetInfo pmrTargetInfo
+      let specifications = libTarget pmrClientLib : pmrDependencySpecs
+          admissible = maybe False (publicationAdmissible candidates specifications) checked
 
       let bareSpec = lhInputSpec lhContext
-          cfg     = lhGlobalCfg lhContext
+          cfg = lhGlobalCfg lhContext
 
       when (refcore cfg) $ liftIO $ do
         (calcSource, meta) <- extractCalculus (mkSrcInfo lhContext pmrTargetInfo pmrRefCoreCbs infTypes)
         writeIlhBin meta calcSource
         when (refcoreText cfg) $ writeIlh meta calcSource
 
-      withPragmas (lhGlobalCfg lhContext) (Ms.pragmas bareSpec) $ \moduleCfg ->  do
+      withPragmas (lhGlobalCfg lhContext) (Ms.pragmas bareSpec) $ \moduleCfg -> do
         let filters = getFilters moduleCfg
             file = LH.modSummaryHsFile $ lhModuleSummary lhContext
         -- Report the outcome of the checking
@@ -447,8 +472,11 @@ checkLiquidHaskellContext lhContext = do
         --
         -- F.Crash is also handled by reportResult and errorLogger
         case o_result out of
-          F.Safe _ -> return $ Just pmrClientLib
-          _ | json moduleCfg -> failM
+          -- compile-spec is an explicit trust mode, not solver evidence.
+          F.Safe _ | compileSpec moduleCfg || admissible -> return $ Just pmrClientLib
+          F.Safe _ -> pure Nothing
+          _
+            | json moduleCfg -> failM
             | otherwise -> pure Nothing
 
 errorLogger :: FilePath -> [Filter] -> OutputResult -> TcM ()
@@ -469,12 +497,12 @@ isIgnore sp = any ((== "--skip-module") . F.val) (pragmas sp)
 -- | Working with bare & lifted specs ------------------------------------------
 --------------------------------------------------------------------------------
 
--- | Load direct and transitive specifications, keeping each reference with its
--- specification while removing configuration-dependent exclusions.
+-- | Loads the specs of direct dependencies and /their/ dependencies as well.
 loadDependencies :: Config -> [Module] -> TcM (HM.HashMap StableModule LoadedSpec)
 loadDependencies currentModuleConfig mods = do
   hscEnv    <- env_top <$> getEnv
-  deps <- SpecFinder.findRelevantSpecs currentModuleConfig hscEnv mods
+  totality  <- SpecFinder.findTotalitySpec hscEnv currentModuleConfig
+  deps <- SpecFinder.findRelevantSpecs currentModuleConfig hscEnv (mods <> totality)
   redundant <- liftIO $ configToRedundantDependencies hscEnv currentModuleConfig
 
   debugLog $ "Redundant dependencies ==> " ++ show redundant
@@ -498,8 +526,8 @@ data ProcessModuleResult = ProcessModuleResult {
   -- ^ The \"client library\" we will serialise on disk into an interface's 'Annotation'.
   , pmrTargetInfo :: TargetInfo
   -- ^ The 'GhcInfo' for the current 'Module' that LiquidHaskell will process.
-  , pmrRefinementTargetInfo :: Maybe TargetInfo
-  -- ^ An isolated target containing only synthetic Boolean refinement checks.
+  , pmrDependencySpecs :: [LiftedSpec]
+  -- ^ Checked dependency bodies for publication support, not serialized again.
   , pmrRefCoreCbs :: [CoreBind]
   -- ^ Pre-'?'-elimination ANF binds, used by RefCore extraction (--refcore).
   --   Empty unless the @--refcore@ flag is set.
@@ -527,10 +555,18 @@ processModule LiquidHaskellContext{..} = do
 
     hscEnv <- getTopEnv
     tcg <- getGblEnv
-    let preNormalizedCore = preNormalizeCore moduleCfg modGuts0
-        modGuts = modGuts0 { mg_binds = preNormalizedCore }
+    let originalCore = preNormalizeCore moduleCfg modGuts0
         file = LH.modSummaryHsFile lhModuleSummary
-    (targetSrc, refCoreCbs)  <- liftIO $
+    -- Only imported signature owners are selected before ANF. Refinements
+    -- and local names retain their existing final resolution path.
+    hydrated <- hydrateAuthoredImportedBodies
+      moduleCfg thisModule (tcg_rdr_env tcg) bareSpec0
+      (HM.elems (getDependencies dependencies)) originalCore
+    (bareSpecOwned, preNormalizedCore) <- case hydrated of
+      Left (location, diagnostic) -> Ex.throwM (ErrOther location (PJ.text diagnostic) :: Error)
+      Right core -> pure core
+    let modGuts = modGuts0 { mg_binds = preNormalizedCore }
+    (targetSrc, refCoreCbs, anfRenamings)  <- liftIO $
       makeTargetSrc
         moduleCfg
         file
@@ -545,14 +581,14 @@ processModule LiquidHaskellContext{..} = do
     -- Due to the fact the internals can throw exceptions from pure code at any point, we need to
     -- call 'evaluate' to force any exception and catch it, if we can.
 
-    let localVars = Resolve.makeLocalVars preNormalizedCore
+    let localVars = Resolve.makeLocalVars anfRenamings preNormalizedCore
         eBareSpec = resolveLHNames
           moduleCfg
           thisModule
           localVars
           (imp_mods $ tcg_imports tcg)
           (tcg_rdr_env tcg)
-          bareSpec0
+          bareSpecOwned
           dependencies
     result <-
       case eBareSpec of
@@ -581,7 +617,7 @@ processModule LiquidHaskellContext{..} = do
 
       Right ((warnings, targetSpec, liftedSpec), bareSpec) -> do
         liftIO $ mapM_ (printWarning logger) warnings
-        (normalizedTargetSrc, normalizedTargetSpec, refinementTargetInfo) <- liftIO $
+        (normalizedTargetSrc, normalizedTargetSpec) <- liftIO $
           normalizeRefinementChecks moduleCfg hscEnv modGuts targetSrc targetSpec
         let targetInfo = TargetInfo normalizedTargetSrc normalizedTargetSpec
 
@@ -594,7 +630,7 @@ processModule LiquidHaskellContext{..} = do
         let result' = ProcessModuleResult {
             pmrClientLib  = clientLib
             , pmrTargetInfo = targetInfo
-            , pmrRefinementTargetInfo = refinementTargetInfo
+            , pmrDependencySpecs = HM.elems $ getDependencies dependencies
             , pmrRefCoreCbs = refCoreCbs
             }
 
@@ -607,71 +643,44 @@ processModule LiquidHaskellContext{..} = do
 -- generation.  See 'RefinementCheck' for how these checks are constructed and
 -- what their Core expression and Liquid type represent.
 --
--- "Normalizing" a refinement check means turning its synthetic Core function
--- into the same top-level, A-normal form expected by the ordinary LiquidHaskell
--- pipeline.  This function attaches the refinement's source location, creates a
--- non-recursive binding for each normalized expression, and pairs that binding
--- with its synthetic Liquid signature.
---
--- The normalized bindings are returned in a separate 'TargetInfo'.  In that
--- isolated target, the module's ordinary asserted signatures become
--- assumptions (providing the environment in which the predicates occur), and
--- only the generated Boolean bindings are asserted.  The returned 'TargetSrc'
--- and 'TargetSpec' describe the ordinary program with the pending checks
--- removed, so the program and its refinement predicates can be checked in two
--- independent passes.  'Nothing' is returned when there are no checks.
-normalizeRefinementChecks :: Config -> HscEnv -> ModGuts -> TargetSrc -> TargetSpec -> IO (TargetSrc, TargetSpec, Maybe TargetInfo)
+-- Normalization does not lift an open predicate out of its source scope.
+-- The ordinary constraint generator checks it at its owning binding group.
+normalizeRefinementChecks :: Config -> HscEnv -> ModGuts -> TargetSrc -> TargetSpec -> IO (TargetSrc, TargetSpec)
 normalizeRefinementChecks cfg hscEnv modGuts src spec
-  | null checks = pure (src, spec, Nothing)
-  | otherwise = do
-      normalizedCbs <- anormalizeExprBinds cfg hscEnv modGuts (map locatedRefinementExpr checks)
-      let cbs = zipWith locatedRefinementBind checks normalizedCbs
-      let xs = map bindVar cbs
-          refinementSigs = zip xs (map refinementCheckType checks)
-          checkSrc = src
-            { giCbs = cbs
-            , giDefVars = xs
-            , giUseVars = L.nub (readVars cbs ++ giUseVars src)
-            , giImpVars = L.nub (LH.importVars cbs ++ giImpVars src)
-            }
-          -- Keep the checks out of the program's dependency graph. In this
-          -- isolated pass, program signatures are assumptions and only the
-          -- generated Boolean bindings are asserted and checked.
-          checkSpec = spec
-            { gsConfig = quietConfig
-            -- Expected-failure annotations refer to bindings in the ordinary
-            -- program, none of which are checked in this isolated target.
-            , gsTerm = (gsTerm spec) { gsFail = mempty }
-            , gsSig = sig
-            { gsTySigs = refinementSigs
-            , gsAsmSigs = gsTySigs sig ++ gsAsmSigs sig
-            , gsRelation = []
-            , gsAsmRel = []
-            , gsReftChecks = []
-            } }
-          -- Both solver invocations are implementation details. Their results
-          -- are combined and reported once by 'checkLiquidHaskellContext'.
-          programSpec = spec
-            { gsConfig = quietConfig
-            , gsSig = sig { gsReftChecks = [] }
-            }
-      pure (src, programSpec, Just (TargetInfo checkSrc checkSpec))
+    | null checks = pure (src, spec)
+    | otherwise = do
+        normalizedCbs <- anormalizeExprBinds cfg hscEnv modGuts (map locatedRefinementExpr checks)
+        unless (length normalizedCbs == length checks) $
+            GHC.panic "Refinement normalization changed the number of obligations"
+        let normalized = zipWith normalizedCheck checks normalizedCbs
+            queryImports = filter (isExternalName . getName) (LH.importVars normalizedCbs)
+            source =
+                src
+                    { giUseVars = L.nub (readVars normalizedCbs ++ giUseVars src)
+                    , giImpVars = L.nub (filter (`notElem` giDefVars src) queryImports ++ giImpVars src)
+                    }
+            checkedSpec =
+                spec
+                    { gsName =
+                        (gsName spec)
+                            { gsTcEmbeds = mconcat (map refinementCheckEmbeds checks) <> gsTcEmbeds (gsName spec)
+                            }
+                    , gsSig = sig{gsReftChecks = normalized}
+                    }
+        pure (source, checkedSpec)
   where
     sig = gsSig spec
-    quietConfig = (gsConfig spec) { loggingVerbosity = Quiet }
     checks = gsReftChecks sig
     locatedRefinementExpr check =
-      case LH.fSrcSpan (F.loc (refinementCheckType check)) of
-        RealSrcSpan realSpan _ ->
-          Tick (SourceNote realSpan (LexicalFastString (fsLit "Liquid refinement")))
-            (refinementCheckExpr check)
-        _ -> refinementCheckExpr check
-    locatedRefinementBind check (NonRec x e) =
-      NonRec (setVarName x (setNameLoc (varName x) (LH.fSrcSpan (F.loc (refinementCheckType check))))) e
-    locatedRefinementBind _ _ =
-      GHC.panic "A refinement predicate normalized to a recursive binding"
-    bindVar (NonRec x _) = x
-    bindVar _ = GHC.panic "A refinement predicate normalized to a recursive binding"
+        case LH.fSrcSpan (F.loc (refinementCheckType check)) of
+            RealSrcSpan realSpan _ ->
+                Tick
+                    (SourceNote realSpan (LexicalFastString (fsLit "Liquid refinement")))
+                    (refinementCheckExpr check)
+            _ -> refinementCheckExpr check
+    normalizedCheck check (NonRec _ e) = check{refinementCheckExpr = e}
+    normalizedCheck _ _ =
+        GHC.panic "A refinement predicate normalized to a recursive binding"
 
 makeTargetSrc :: Config
               -> FilePath
@@ -680,12 +689,12 @@ makeTargetSrc :: Config
               -> GlobalRdrEnv
               -> [GHC.SrcSpan]
               -> [GHC.SrcSpan]
-              -> IO (TargetSrc, [CoreBind])
+              -> IO (TargetSrc, [CoreBind], AnfRenamings)
 makeTargetSrc cfg file modGuts hscEnv rdrEnv methodSpans instanceSpans = do
   when (dumpPreNormalizedCore cfg) $ do
     putStrLn "\n*************** Pre-normalized CoreBinds *****************\n"
     putStrLn $ unlines $ L.intersperse "" $ map (GHC.showPpr (GHC.hsc_dflags hscEnv)) (mg_binds modGuts)
-  coreBindsANF <- anormalize cfg hscEnv modGuts
+  (coreBindsANF, anfRenamings) <- anormalize cfg hscEnv modGuts
   let coreBinds = eliminateQuestionMark rdrEnv coreBindsANF
   when (dumpNormalizedCore cfg) $ do
     putStrLn "\n*************** normalized CoreBinds *****************\n"
@@ -729,7 +738,7 @@ makeTargetSrc cfg file modGuts hscEnv rdrEnv methodSpans instanceSpans = do
     , gsFiDcs     = fiDcs
     , gsPrimTcs   = GHC.primTyCons
     , giInstSpans = instanceSpans
-    }, refCoreCbs)
+    }, refCoreCbs, anfRenamings)
   where
     mgiModGuts :: MGIModGuts
     mgiModGuts = miModGuts deriv modGuts

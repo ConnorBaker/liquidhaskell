@@ -32,6 +32,7 @@ import Data.Typeable (typeOf, typeRep, Proxy(..))
 import Data.IORef
 import qualified Data.Map.Strict as M
 import Data.Word
+import GHC.Iface.Syntax (ifAnnotatedTarget)
 import qualified Liquid.GHC.API as GHC
 
 
@@ -127,7 +128,13 @@ rebuildSimpleIface env pmarker iface = do
     -- forget to copy relevant fields.
     let marker = GHC.IfaceAnnotation (GHC.ModuleTarget $ GHC.mi_module iface) $
           GHC.toSerialized markerBytes pmarker
-    GHC.mkFullIface env (GHC.set_mi_anns (marker : GHC.mi_anns iface) partial) Nothing Nothing GHC.NoStubs []
+        annotations = GHC.mi_anns iface
+        alreadyPresent ann = case (ifAnnotatedTarget ann, GHC.ifAnnotatedValue ann) of
+          (GHC.ModuleTarget mdl, GHC.Serialized actual bytes) ->
+            mdl == GHC.mi_module iface && actual == typeOf pmarker && bytes == markerBytes pmarker
+          _ -> False
+        withMarker = if any alreadyPresent annotations then annotations else marker : annotations
+    GHC.mkFullIface env (GHC.set_mi_anns withMarker partial) Nothing Nothing GHC.NoStubs []
   where
     partial =
       GHC.set_mi_decls (map snd $ GHC.mi_decls iface) $
@@ -236,9 +243,9 @@ installInterfaceHook env =
           -- The interface file has been already written, so after updating the
           -- interface we write it to disk again.
           GHC.HscUpdate iface -> do
-            -- Extra wart: in this path, GHC ignores tcg_anns and our payload
-            -- marker in it. We use rebuildSimpleIface to still add the marker
-            -- to the interface file.
+            -- Rebuild the simple interface so the staged marker participates
+            -- in its hash. GHC may already have copied it from tcg_anns;
+            -- inserting that same marker is therefore idempotent.
             rebuilt <- rebuildSimpleIface
               hscEnv
               (payloadMarker fingerprint)

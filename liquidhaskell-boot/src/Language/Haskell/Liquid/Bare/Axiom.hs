@@ -8,7 +8,7 @@
 -- | This module contains the code that DOES reflection; i.e. converts Haskell
 --   definitions into refinements.
 
-module Language.Haskell.Liquid.Bare.Axiom ( makeHaskellAxioms, strengthenSpecWithMeasure, makeAssumeReflectAxioms, AxiomType(..) ) where
+module Language.Haskell.Liquid.Bare.Axiom ( makeHaskellAxioms, strengthenSpecWithMeasure, makeAssumeReflectAxioms, addSingletonApp, AxiomType(..) ) where
 
 import Prelude hiding (error)
 import Prelude hiding (mapM)
@@ -65,11 +65,12 @@ findDuplicateBetweenLists key l1 l2 =
 
 -----------------------------------------------------------------------------------------------
 makeHaskellAxioms :: GhcSrc -> Bare.Env -> Bare.TycEnv -> LogicMap -> GhcSpecSig -> Ms.BareSpec
-                  -> Bare.Lookup [(Ghc.Var, LocSpecType, F.Equation)]
+                  -> Bare.Lookup ([(Ghc.Var, LocSpecType, F.Equation)], LogicSupport)
 -----------------------------------------------------------------------------------------------
 makeHaskellAxioms src env tycEnv lmap spSig spec = do
   let refDefs = getReflectDefs src spSig spec env
-  return (makeAxiom env tycEnv lmap <$> refDefs)
+  let (axioms, support) = unzip (makeAxiom env tycEnv lmap <$> refDefs)
+  return (axioms, concat support)
 
 -----------------------------------------------------------------------------------------------
 --          Returns a list of elements, one per assume reflect                               --
@@ -316,12 +317,12 @@ getExprFromUnfolding _ = Nothing
 --------------------------------------------------------------------------------
 makeAxiom :: Bare.Env -> Bare.TycEnv -> LogicMap
           -> (LocSymbol, Maybe SpecType, Ghc.Var, Ghc.CoreExpr)
-          -> (Ghc.Var, LocSpecType, F.Equation)
+          -> ((Ghc.Var, LocSpecType, F.Equation), LogicSupport)
 --------------------------------------------------------------------------------
 makeAxiom env tycEnv lmap (x, mbT, v, def)
-            = (v, t, e)
+            = ((v, t, e), support)
   where
-    (t, e)  = makeAssumeType (getConfig env) embs lmap dm x mbT v def
+    ((t, e), support) = makeAssumeType (Bare.tcConstructorBoxes tycEnv) (getConfig env) embs lmap dm x mbT v def
     embs    = Bare.tcEmbs       tycEnv
     dm      = Bare.tcDataConMap tycEnv
 
@@ -330,18 +331,18 @@ mkError x str = ErrHMeas (sourcePosSrcSpan $ loc x) (pprint $ val x) (PJ.text st
 
 -- This function is used to generate the fixpoint code for reflected functions
 makeAssumeType
-  :: Config
+  :: M.HashMap Ghc.DataCon ConstructorBox -> Config
   -> F.TCEmb Ghc.TyCon -> LogicMap -> DataConMap -> LocSymbol -> Maybe SpecType
   -> Ghc.Var -> Ghc.CoreExpr
-  -> (LocSpecType, F.Equation)
-makeAssumeType cfg tce lmap dm sym mbT v def
-  = ( sym {val = aty at `strengthenRes` F.subst su ref}
+  -> ((LocSpecType, F.Equation), LogicSupport)
+makeAssumeType boxes cfg tce lmap dm sym mbT v def
+  = (( sym {val = aty at `strengthenRes` F.subst su ref}
     , F.mkEquation
         symbolV
         (fmap (second $ F.sortSubst sortSub) xts)
         (F.sortSubstInExpr sortSub (F.subst su le))
         (F.sortSubst sortSub out)
-    )
+    ), retainLogicSupport (F.syms (F.subst su le) `S.difference` S.fromList (map fst xts)) support)
   where
     allowTC = typeclass cfg
     symbolV = F.symbol v
@@ -354,7 +355,7 @@ makeAssumeType cfg tce lmap dm sym mbT v def
     out   = rTypeSort tce $ ares at
     xArgs = F.EVar . fst <$> aargs at
     _msg  = unwords [showpp sym, showpp mbT]
-    le    = case runToLogicWithBoolBinds bbs tce lmap dm cfg mkErr (coreToLogic def') of
+    (le, support) = case runToLogicWithBoolBinds bbs boxes tce lmap dm cfg mkErr (coreToLogic def') of
               Right e -> e
               Left  e -> Ex.throw e
     ref        = F.Reft (F.vv_, F.PAtom F.Eq (F.EVar F.vv_) le)
@@ -398,10 +399,11 @@ grabBody :: Bool -- ^ typeclass enabled
          -> Ghc.Type -> Ghc.CoreExpr -> ([Ghc.Var], Ghc.CoreExpr)
 grabBody allowTC inScope (Ghc.ForAllTy _ ty) e
   = grabBody allowTC inScope ty e
-grabBody allowTC@False inScope Ghc.FunTy{ Ghc.ft_arg = tx, Ghc.ft_res = t} e | Ghc.isClassPred tx
-  = grabBody allowTC inScope t e
-grabBody allowTC@True inScope Ghc.FunTy{ Ghc.ft_arg = tx, Ghc.ft_res = t} e | isEmbeddedDictType tx
-  = grabBody allowTC inScope t e
+-- Match the retained Core and addSingletonApp telescope: runtime dictionary
+-- lambdas are value coordinates in both modes; only primitive evidence erases.
+grabBody allowTC inScope Ghc.FunTy{Ghc.ft_arg = tx, Ghc.ft_res = t} e
+  | isEmbeddedDictType tx =
+      grabBody allowTC inScope t e
 grabBody allowTC inScope torig@Ghc.FunTy {} (Ghc.Let (Ghc.NonRec x e) body)
   = grabBody allowTC inScope torig (Ghc.substExpr (Ghc.extendIdSubst inScope x e) body)
 grabBody allowTC inScope Ghc.FunTy{ Ghc.ft_res = t} (Ghc.Lam x e)
@@ -443,25 +445,25 @@ data AxiomType = AT { aty :: SpecType, aargs :: [(F.Symbol, SpecType)], ares :: 
 -- @x:_ -> y:_ -> {v:_ | p && v = f x y}@
 --
 addSingletonApp :: Bool -> F.Symbol -> SpecType -> AxiomType
-addSingletonApp allowTC s st = AT to (reverse xts) res
+addSingletonApp _allowTC s st = AT to (reverse xts) res
   where
-    (to, (_,xts, Just res)) = runState (go st) (1,[], Nothing)
+    (to, (_, xts, Just res)) = runState (go st) (1, [], Nothing)
     go (RAllT a t r) = RAllT a <$> go t <*> return r
     go (RAllP p t) = RAllP p <$> go t
     go (RFun x i tx t r) | isErasable tx = (\t' -> RFun x i tx t' r) <$> go t
     go (RFun x ii tx t r) = do
-      (i,bs,mres) <- get
-      let x' = unDummy x i
-      put (i+1, (x', tx):bs,mres)
-      t' <- go t
-      return $ RFun x' ii tx t' r
+        (i, bs, mres) <- get
+        let x' = unDummy x i
+        put (i + 1, (x', tx) : bs, mres)
+        t' <- go t
+        return $ RFun x' ii tx t' r
     go t = do
-      (i,bs,_) <- get
-      let ys = reverse $ map fst bs
-      let t' = strengthen t (singletonApp s ys)
-      put (i, bs, Just t')
-      return t'
-    isErasable = if allowTC then isEmbeddedClass else isClassType
+        (i, bs, _) <- get
+        let ys = reverse $ map fst bs
+        let t' = strengthen t (singletonApp s ys)
+        put (i, bs, Just t')
+        return t'
+    isErasable = isEmbeddedClass
 unDummy :: F.Symbol -> Int -> F.Symbol
 unDummy x i
   | x /= F.dummySymbol = x

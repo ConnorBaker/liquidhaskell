@@ -12,6 +12,7 @@ module Language.Haskell.Liquid.Types.PredType (
     TyConP (..), DataConP (..)
   , dataConTy
   , dataConPSpecType
+  , dataConRuntimeFields
   , makeTyConInfo
   , replacePreds
   , replacePredsWithRefs
@@ -33,6 +34,8 @@ module Language.Haskell.Liquid.Types.PredType (
   ) where
 
 import           Prelude                         hiding (error)
+import qualified Control.Exception as Ex
+import qualified Text.PrettyPrint.HughesPJ as Pretty
 import           Liquid.GHC.API hiding ( panic
                                                         , (<+>)
                                                         , hsep
@@ -42,8 +45,8 @@ import           Liquid.GHC.API hiding ( panic
                                                         , showPpr
                                                         )
 import           Language.Haskell.Liquid.GHC.TypeRep ()
-import           Data.Hashable
 import qualified Data.HashMap.Strict             as M
+import qualified Data.HashSet                    as S
 import qualified Data.Maybe                                 as Mb
 import qualified Data.List         as L -- (foldl', partition)
 -- import           Data.List                       (nub)
@@ -62,67 +65,124 @@ import           Language.Haskell.Liquid.Types.RefType hiding (generalize)
 import           Language.Haskell.Liquid.Types.RType
 import           Language.Haskell.Liquid.Types.RTypeOp
 import           Language.Haskell.Liquid.Types.Types
+import           Language.Haskell.Liquid.Types.Variance
+import qualified Language.Haskell.Liquid.Measure as Measure
 
-makeTyConInfo :: F.TCEmb Ghc.TyCon -> [Ghc.TyCon] -> [TyConP] -> TyConMap
-makeTyConInfo tce fiTcs tcps = TyConMap
-  { tcmTyRTy    = tcM
-  , tcmFIRTy    = tcInstM
-  , tcmFtcArity = arities
-  }
+makeTyConInfo :: F.TCEmb Ghc.TyCon -> [Ghc.TyCon] -> [Ghc.TyCon] -> [TyConP] -> TyConMap
+makeTyConInfo tce fiTcs localTyCons tcps =
+  TyConMap
+    { tcmTyRTy = tcM
+    , tcmFIRTy = tcInstM
+    , tcmFtcArity = arities
+    }
   where
-    tcM         = M.fromList [(tcpCon tcp, mkRTyCon tcp) | tcp <- tcps ]
-    tcInstM     = mkFInstRTyCon tce fiTcs tcM
+    declarations = M.fromList [(tcpCon tcp, tcp) | tcp <- tcps]
+    local = S.fromList localTyCons
+    authored = M.mapMaybe (\tcp -> if null (tcpVarianceTs tcp) then Nothing else Just (map restriction (tcpVarianceTs tcp))) declarations
+    lowerBounds = M.filterWithKey (\c _ -> S.member c local) authored
+    external = M.difference authored lowerBounds
+    variances = makeTyConVariances external lowerBounds (localTyCons ++ M.keys declarations)
+    defaults = M.mapWithKey (\c vs -> RTyCon c [] (TyConInfo vs [] Nothing)) variances
+    tcM = M.union (M.mapWithKey (\c -> mkRTyCon (M.findWithDefault [] c variances)) declarations) defaults
+    -- An authored invariant restricts transport in both directions; it is not
+    -- evidence of an absent occurrence. Keeping that restriction compositional
+    -- can conservatively reject positivity through an invariant wrapper.
+    restriction Invariant = Bivariant
+    restriction v = v
+    tcInstM = mkFInstRTyCon tce fiTcs tcM
     arities =
-     foldr
-       (\(c, a) -> M.insertWith (checkEqValues c) c a)
-       M.empty
-       [ (c, length ts) | (c, ts) <- M.keys tcInstM ]
+      foldr
+        (\(c, a) -> M.insertWith (checkEqValues c) c a)
+        M.empty
+        [(c, length ts) | (c, ts) <- M.keys tcInstM]
 
     checkEqValues c v0 v1 =
-      if v0 == v1 then v0
-      else
-        panic Nothing $
-          "makeTyConInfo: Conflicting arities for TyCon: " ++
-          showPpr c ++ " " ++ showPpr v0 ++ " " ++ showPpr v1
+      if v0 == v1
+        then v0
+        else
+          panic Nothing $
+            "makeTyConInfo: Conflicting arities for TyCon: "
+              ++ showPpr c
+              ++ " "
+              ++ showPpr v0
+              ++ " "
+              ++ showPpr v1
 
 mkFInstRTyCon :: F.TCEmb Ghc.TyCon -> [Ghc.TyCon] -> M.HashMap Ghc.TyCon RTyCon -> M.HashMap (Ghc.TyCon, [F.Sort]) RTyCon
-mkFInstRTyCon tce fiTcs tcm = M.fromList
-  [ ((c, typeSort tce <$> ts), rtc)
-    | fiTc    <- fiTcs
-    , rtc     <- Mb.maybeToList (M.lookup fiTc tcm)
-    , (c, ts) <- Mb.maybeToList (famInstArgs fiTc)
-  ]
-
-mkRTyCon ::  TyConP -> RTyCon
-mkRTyCon (TyConP _ tc αs' ps tyvariance predvariance size)
-  = RTyCon tc pvs' (mkTyConInfo tc tyvariance predvariance size)
+mkFInstRTyCon tce fiTcs tcm =
+    M.fromList
+        [ ((c, typeSort tce <$> ts), rtc)
+        | fiTc <- fiTcs
+        , rtc <- Mb.maybeToList (M.lookup fiTc tcm)
+        , (c, ts) <- Mb.maybeToList (famInstArgs fiTc)
+        , M.member c predicateFamilies
+        ]
   where
-    τs   = [rVar α :: RSort |  α <- tyConTyVarsDef tc]
+    -- This map selects predicate parameters, not representation equalities.
+    -- Omit only whole families with no predicates: an empty instance may
+    -- override origin predicates, and mixed families must retain every key.
+    predicateFamilies =
+        M.fromList
+            [ (maybe tc fst (Ghc.tyConFamInst_maybe tc), ())
+            | (tc, rtc) <- M.toList tcm
+            , not (null (rTyConPVs rtc))
+            ]
+
+mkRTyCon :: VarianceInfo -> TyConP -> RTyCon
+mkRTyCon tyvariance (TyConP _ tc αs' ps _ predvariance size) =
+  RTyCon tc pvs' (TyConInfo tyvariance predvariance size)
+  where
+    τs = [rVar α :: RSort | α <- tyConTyVarsDef tc]
     pvs' = subts (zip αs' τs) <$> ps
 
 
 -------------------------------------------------------------------------------
--- | @dataConPSpecType@ converts a @DataConP@, LH's internal representation for
---   a (refined) data constructor into a @SpecType@ for that constructor.
---   TODO: duplicated with Liquid.Measure.makeDataConType
--------------------------------------------------------------------------------
-dataConPSpecType :: Bool -> DataConP -> [(Var, SpecType)]
--------------------------------------------------------------------------------
-dataConPSpecType allowTC dcp    = [(workX, workT), (wrapX, wrapT) ]
-  where
-    workT | isVanilla   = wrapT
-          | otherwise   = dcWorkSpecType   dc wrapT
-    wrapT               = dcWrapSpecType   allowTC  dc dcp
-    workX               = dataConWorkId    dc            -- This is the weird one for GADTs
-    wrapX               = dataConWrapId    dc            -- This is what the user expects to see
-    isVanilla           = isVanillaDataCon dc
-    dc                  = dcpCon dcp
+{- | @dataConPSpecType@ converts a @DataConP@, LH's internal representation for
+  a (refined) data constructor into a @SpecType@ for that constructor.
+  TODO: duplicated with Liquid.Measure.makeDataConType
+-}
 
-dcWorkSpecType :: DataCon -> SpecType -> SpecType
-dcWorkSpecType c wrT    = fromRTypeRep (meetWorkWrapRep c wkR wrR)
+-------------------------------------------------------------------------------
+dataConPSpecType :: (CoreExpr -> (F.Expr, LogicSupport)) -> M.HashMap DataCon ConstructorBox -> Bool -> DataConP -> ([(Var, SpecType)], LogicSupport)
+-------------------------------------------------------------------------------
+dataConPSpecType interpret boxes allowTC dcp = ([(workX, workT), (wrapX, wrapT)], support)
   where
-    wkR                 = dataConWorkRep c
-    wrR                 = toRTypeRep wrT
+    wrapT
+        | Mb.isNothing (Measure.constructorSourceMatch dc sourceT) =
+            Ex.throw
+                ( ErrDataCon
+                    (fSrcSpan dcp)
+                    (F.pprint dc)
+                    ( Pretty.text "source constructor contract does not match GHC carrier"
+                        Pretty.$$ (Pretty.text "Declared:" Pretty.<+> F.pprint sourceT)
+                        Pretty.$$ (Pretty.text "GHC carrier:" Pretty.<+> F.pprint (varType wrapX))
+                    ) ::
+                    Error
+                )
+        | otherwise = sourceT
+    (workT, support)
+        | workX == wrapX = (wrapT, [])
+        | eqType (varType workX) (toType False wrapT) = (wrapT, [])
+        | all isTauto wrapT && null (ty_preds (toRTypeRep wrapT)) = (ofType (varType workX), [])
+        | otherwise = Measure.constructorWorkerType interpret boxes dc wrapT
+    sourceT = dcWrapSpecType allowTC dc dcp
+    workX = dataConWorkId dc -- This is the weird one for GADTs
+    wrapX = dataConWrapId dc -- This is what the user expects to see
+    dc = dcpCon dcp
+
+-- Runtime dictionaries precede declared fields in the actual constructor.
+-- Class constructors already carry their superclasses in dcpTyArgs; plugging
+-- leaves their dcpTyConstrs empty. Primitive equality evidence has no value
+-- coordinate. Keep this order shared by declarations and their projections.
+dataConRuntimeFields :: DataConP -> [(LHName, SpecType)]
+dataConRuntimeFields dcp = dictionaries ++ reverse (dcpTyArgs dcp)
+ where
+  dictionaries =
+    [ (makeGeneratedLogicLHName (F.intSymbol prefix i), t)
+    | (i, t) <- zip [1 ..] (filter (not . isEmbeddedDictType . toType False) (dcpTyConstrs dcp))
+    ]
+  prefix = F.suffixSymbol (F.symbol $ dcpCon dcp) "lq$dictionary"
+
 
 dataConWorkRep :: DataCon -> SpecRep
 dataConWorkRep c = toRTypeRep
@@ -133,59 +193,6 @@ dataConWorkRep c = toRTypeRep
                  -- . Var.varType
                  -- . dataConWorkId
                  $ c
-{-
-dataConWorkRep :: DataCon -> SpecRep
-dataConWorkRep dc = RTypeRep
-  { ty_vars   = as
-  , ty_preds  = []
-  , ty_labels = []
-  , ty_binds  = replicate nArgs F.dummySymbol
-  , ty_refts  = replicate nArgs mempty
-  , ty_args   = ts'
-  , ty_res    = t'
-  }
-  where
-    (ts', t')          = F.tracepp "DCWR-1" (ofType <$> ts, ofType t)
-    as                 = makeRTVar . rTyVar <$> αs
-    tArg
-    (αs,_,eqs,th,ts,t) = dataConFullSig dc
-    nArgs              = length ts
-
-dataConResultTy :: DataCon -> [TyVar] -> Type -> Type
-dataConResultTy dc αs t = mkFamilyTyConApp tc tArgs'
-  where
-    tArgs'              = take (nArgs - nVars) tArgs ++ (mkTyVarTy <$> αs)
-    nVars               = length αs
-    nArgs               = length tArgs
-    (tc, tArgs)         = fromMaybe err (splitTyConApp_maybe _t)
-    err                 = GM.namedPanic dc ("Cannot split result type of DataCon " ++ show dc)
-
-  --  t                 = RT.ofType  $  mkFamilyTyConApp tc tArgs'
-  -- as                = makeRTVar . rTyVar <$> αs
-  --  (αs,_,_,_,_ts,_t) = dataConFullSig dc
-
--}
-
-meetWorkWrapRep :: DataCon -> SpecRep -> SpecRep -> SpecRep
-meetWorkWrapRep c workR wrapR
-  | 0 <= pad'
-  = workR { ty_binds = xs ++ ty_binds wrapR
-          , ty_args  = ts ++ zipWith meet ts' (ty_args wrapR)
-          , ty_res   = strengthenRType (ty_res workR)    (ty_res  wrapR)
-          , ty_preds = ty_preds wrapR
-          }
-  | otherwise
-  = panic (Just (getSrcSpan c)) errMsg
-  where
-    pad'      = {- F.tracepp ("MEETWKRAP: " ++ show (ty_vars workR)) $ -} workN - wrapN
-    (xs, _)   = splitAt pad' (ty_binds workR)
-    (ts, ts') = splitAt pad' (ty_args  workR)
-    workN     = length      (ty_args  workR)
-    wrapN     = length      (ty_args  wrapR)
-    errMsg    = "Unsupported Work/Wrap types for Data Constructor " ++ showPpr c
-
-strengthenRType :: SpecType -> SpecType -> SpecType
-strengthenRType wkT wrT = maybe wkT (strengthen wkT) (stripRTypeBase wrT)
 
 
 -- maybe a tc flag is unnecessary but I don't know if {-@ class ... @-}
@@ -317,6 +324,7 @@ substPVar src dst = go
     go (RRTy e r o rt)    = RRTy e'   (goRR r) o (go rt) where e' = [(x, go t) | (x, t) <- e]
     go (RAppTy t1 t2 r)   = RAppTy    (go t1) (go t2) (goRR r)
     go (RHole r)          = RHole     (goRR r)
+    go t@(RLit _)        = t
     go t@(RExprArg  _)    = t
     goR :: BRPropV LocSymbol (RReftV LocSymbol) -> BRPropV LocSymbol (RReftV LocSymbol)
     goR rp = rp {rf_body = go (rf_body rp) }
@@ -334,7 +342,7 @@ substPred :: String -> (RPVar, SpecProp) -> SpecType -> SpecType
 -------------------------------------------------------------------------------
 
 substPred _   (rp, RProp ss (RVar a1 r1)) t@(RVar a2 r2)
-  | isPredInReft && a1 == a2    = RVar a1 $ meetListWithPSubs πs ss r1 r2'
+  | isPredInReft && a1 == a2    = RVar a1 $ meetListWithPSubs (thd3 <$> pargs rp) πs ss r1 r2'
   | isPredInReft                = panic Nothing ("substPred RVar Var Mismatch" ++ show (a1, a2))
   | otherwise                   = t
   where
@@ -370,36 +378,21 @@ substPred _   _  t              = t
 -- | Requires: @not $ null πs@
 -- substRCon :: String -> (RPVar, SpecType) -> SpecType -> SpecType
 
-substRCon
-  :: (PPrint t, PPrint t2, Eq tv, IsReft r, Hashable tv, PPrint tv, PPrint r,
-      F.Subable r, F.Variable r ~ F.Symbol, ReftBind r ~ F.Symbol, ReftVar r ~ F.Symbol,
-      SubsTy tv (RType RTyCon tv NoReft) r,
-      SubsTy tv (RType RTyCon tv NoReft) (RType RTyCon tv NoReft),
-      SubsTy tv (RType RTyCon tv NoReft) RTyCon,
-      SubsTy tv (RType RTyCon tv NoReft) tv,
-      SubsTy tv (RType RTyCon tv NoReft) (RTVar F.Symbol F.Symbol RTyCon tv),
-      FreeVar RTyCon tv,
-      Meet r,
-      Meet (RType RTyCon tv r))
-  => [Char]
-  -> (t, Ref RSort (RType RTyCon tv r))
-  -> RType RTyCon tv r
-  -> [PVar t2]
-  -> r
-  -> RType RTyCon tv r
-substRCon msg (_, RProp ss t1@(RApp c1 ts1 rs1 r1)) t2@(RApp c2 ts2 rs2 _) πs r2'
-  | rtc_tc c1 == rtc_tc c2 = RApp c1 ts rs $ meetListWithPSubs πs ss r1 r2'
+substRCon :: String -> (RPVar, SpecProp) -> SpecType -> [UsedPVar] -> UReft -> SpecType
+substRCon msg (rp, RProp ss t1@(RApp c1 ts1 rs1 r1)) t2@(RApp c2 ts2 rs2 _) πs r2'
+    | rtc_tc c1 == rtc_tc c2 = RApp c1 ts rs $ meetListWithPSubs defaults πs ss r1 r2'
   where
-    ts                     = F.subst su $ safeZipWith (msg ++ ": substRCon")  strSub  ts1  ts2
-    rs                     = F.subst su $ safeZipWith (msg ++ ": substRCon2") strSubR rs1' rs2'
-    (rs1', rs2')           = pad "substRCon" top rs1 rs2
-    strSub x r2           = meetListWithPSubs πs ss x r2
-    strSubR x r2          = meetListWithPSubsRef πs ss x r2
+    defaults = thd3 <$> pargs rp
+    ts = F.subst su $ safeZipWith (msg ++ ": substRCon") strSub ts1 ts2
+    rs = F.subst su $ safeZipWith (msg ++ ": substRCon2") strSubR rs1' rs2'
+    (rs1', rs2') = pad "substRCon" top rs1 rs2
+    strSub x r2 = meetListWithPSubs defaults πs ss x r2
+    strSubR x r2 = meetListWithPSubsRef πs ss x r2
 
     su = F.mkSubst $ zipWith (\s1 s2 -> (s1, F.EVar s2)) (rvs t1) (rvs t2)
 
-    rvs      = foldReft False (\_ r acc -> rvReft r : acc) []
-    rvReft r = let F.Reft(s,_) = toReft r in s
+    rvs = foldReft False (\_ r acc -> rvReft r : acc) []
+    rvReft r = let F.Reft (s, _) = toReft r in s
 
 substRCon msg su t _ _        = {- panic Nothing -} errorP "substRCon: " $ msg ++ " " ++ showpp (su, t)
 
@@ -449,6 +442,8 @@ freeArgsPs p (REx _ t1 t2)
   = L.nub $ freeArgsPs p t1 ++ freeArgsPs p t2
 freeArgsPs p (RAppTy t1 t2 r)
   = L.nub $ freeArgsPsRef p r ++ freeArgsPs p t1 ++ freeArgsPs p t2
+freeArgsPs _ (RLit _)
+  = []
 freeArgsPs _ (RExprArg _)
   = []
 freeArgsPs p (RHole r)
@@ -462,9 +457,10 @@ freeArgsPsRef p (MkUReft _ (Pr ps)) = [x | (_, x, w) <- concatMap pargs ps', F.E
    ps' = f <$> filter (uPVar p ==) ps
    f q = q {pargs = pargs q ++ drop (length (pargs q)) (pargs $ uPVar p)}
 
-meetListWithPSubs :: (Foldable t, PPrint t1, F.Subable b, F.Variable b ~ F.Symbol, Meet b)
-                  => t (PVar t1) -> [(F.Symbol, RSort)] -> b -> b -> b
-meetListWithPSubs πs ss r1 r2    = L.foldl' (meetListWithPSub ss r1) r2 πs
+meetListWithPSubs ::
+    (Foldable t, PPrint t1, F.Subable b, F.Variable b ~ F.Symbol, Meet b) =>
+    [F.Expr] -> t (PVar t1) -> [(F.Symbol, RSort)] -> b -> b -> b
+meetListWithPSubs defaults πs ss r1 r2 = L.foldl' (meetListWithPSub defaults ss r1) r2 πs
 
 meetListWithPSubsRef
   :: ( Foldable t
@@ -483,16 +479,15 @@ meetListWithPSubsRef
   -> Ref τ (RType c tv r)
 meetListWithPSubsRef πs ss r1 r2 = L.foldl' (meetListWithPSubRef ss r1) r2 πs
 
-meetListWithPSub ::  (PPrint t, F.Subable r, F.Variable r ~ F.Symbol, Meet r) => [(F.Symbol, RSort)]-> r -> r -> PVar t -> r
-meetListWithPSub ss r1 r2 π
-  | all (\(_, x, F.EVar y) -> x == y) (pargs π)
-  = r2 `meet` r1
-  | all (\(_, x, F.EVar y) -> x /= y) (pargs π)
-  = r2 `meet` F.subst su r1
-  | otherwise
-  = panic Nothing $ "PredType.meetListWithPSub partial application to " ++ showpp π
+meetListWithPSub :: (PPrint t, F.Subable r, F.Variable r ~ F.Symbol, Meet r) => [F.Expr] -> [(F.Symbol, RSort)] -> r -> r -> PVar t -> r
+meetListWithPSub defaults ss r1 r2 π
+    | length supplied <= length defaults && length actuals == length ss =
+        r2 `meet` F.subst (F.mkSubst (zip (fst <$> ss) actuals)) r1
+    | otherwise =
+        panic Nothing $ "PredType.meetListWithPSub argument arity mismatch: " ++ showpp π
   where
-    su  = F.mkSubst [(x, y) | (x, (_, _, y)) <- zip (fst <$> ss) (pargs π)]
+    supplied = thd3 <$> pargs π
+    actuals = supplied ++ drop (length supplied) defaults
 
 meetListWithPSubRef
   :: ( Meet (RType c tv r)
@@ -513,15 +508,18 @@ meetListWithPSubRef _ (RProp _ (RHole _)) _ _ -- TODO: Is this correct?
 meetListWithPSubRef _ _ (RProp _ (RHole _)) _
   = panic Nothing "PredType.meetListWithPSubRef called with invalid input"
 meetListWithPSubRef ss (RProp s1 r1) (RProp s2 r2) π
-  | all (\(_, x, F.EVar y) -> x == y) (pargs π)
-  = RProp s1 $ F.subst su' r2 `meet` r1
-  | all (\(_, x, F.EVar y) -> x /= y) (pargs π)
-  = RProp s2 $ r2 `meet` F.subst su r1
-  | otherwise
-  = panic Nothing $ "PredType.meetListWithPSubRef partial application to " ++ showpp π
+    | all (\(_, x, F.EVar y) -> x == y) (pargs π) =
+        RProp s1 $ F.subst su' r2 `meet` r1
+    | all (\(_, x, F.EVar y) -> x /= y) (pargs π) =
+        -- Keep the nested relation's dependencies under the retained telescope
+        -- before substituting the enclosing predicate's actual arguments.
+        RProp s2 $ r2 `meet` F.subst su (F.subst align r1)
+    | otherwise =
+        panic Nothing $ "PredType.meetListWithPSubRef partial application to " ++ showpp π
   where
-    su  = F.mkSubst [(x, y) | (x, (_, _, y)) <- zip (fst <$> ss) (pargs π)]
+    su = F.mkSubst [(x, y) | (x, (_, _, y)) <- zip (fst <$> ss) (pargs π)]
     su' = F.mkSubst [(x, F.EVar y) | (x, y) <- zip (fst <$> s2) (fst <$> s1)]
+    align = F.mkSubst [(x, F.EVar y) | (x, y) <- zip (fst <$> s1) (fst <$> s2)]
 
 
 ----------------------------------------------------------------------------

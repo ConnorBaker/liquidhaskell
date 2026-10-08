@@ -16,7 +16,7 @@ embed Set as Set_Set
 
 assume isSubsetOf    :: (Ord a) => x:(Set a) -> y:(Set a) -> {v:Bool | v <=> Set_sub x y}
 assume member        :: Ord a => x:a -> xs:(Set a) -> {v:Bool | v <=> Set_mem x xs}
-assume null          :: Ord a => xs:(Set a) -> {v:Bool | v <=> Set_emp xs}
+assume null          :: xs:(Set a) -> {v:Bool | v <=> Set_emp xs}
 assume size          :: xs:(Set a) -> {v:Nat | v = Set_card xs}
 
 assume empty         :: {v:(Set a) | Set_emp v}
@@ -29,7 +29,7 @@ assume intersection  :: Ord a => xs:(Set a) -> ys:(Set a) -> {v:(Set a) | v = Se
 assume difference    :: Ord a => xs:(Set a) -> ys:(Set a) -> {v:(Set a) | v = Set_dif xs ys}
 
 assume fromList :: Ord a => xs:[a] -> {v:Set a | v = listElts xs}
-assume toList   :: Ord a => s:Set a -> {xs:[a] | s = listElts xs}
+assume toList   :: s:Set a -> {xs:[a] | s = listElts xs}
 
 //  ---------------------------------------------------------------------------------------------
 //  -- | The set of elements in a list ----------------------------------------------------------

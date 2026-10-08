@@ -49,6 +49,7 @@ library
                       Language.Haskell.Liquid.Constraint.Generate
                       Language.Haskell.Liquid.Constraint.Init
                       Language.Haskell.Liquid.Constraint.Monad
+                      Language.Haskell.Liquid.Constraint.Publication
                       Language.Haskell.Liquid.Constraint.Qualifier
                       Language.Haskell.Liquid.Constraint.Split
                       Language.Haskell.Liquid.Constraint.ToFixpoint
@@ -69,6 +70,7 @@ library
                       Language.Haskell.Liquid.GHC.SpanStack
                       Language.Haskell.Liquid.GHC.Types
                       Language.Haskell.Liquid.GHC.TypeRep
+                      Language.Haskell.Liquid.GHC.PrimitiveContract
                       Language.Haskell.Liquid.GHC.Plugin
                       Language.Haskell.Liquid.GHC.Plugin.Tutorial
                       Language.Haskell.Liquid.RefCore.Calculus
@@ -120,8 +122,10 @@ library
                       LiquidHaskellBoot
                       Paths_liquidhaskell_boot
   other-modules:      Language.Haskell.Liquid.GHC.Plugin.Serialisation
+                      Language.Haskell.Liquid.GHC.ImportedBodies
                       Language.Haskell.Liquid.GHC.Plugin.Cache
                       Language.Haskell.Liquid.GHC.Plugin.Iface
+                      Language.Haskell.Liquid.GHC.Plugin.AnnotationIdentity
                       Language.Haskell.Liquid.GHC.Plugin.SpecFinder
                       Language.Haskell.Liquid.GHC.Plugin.Types
                       Language.Haskell.Liquid.RefCore.CoreToLH
@@ -166,7 +170,6 @@ library
                     , transformers         >= 0.3
                     , unordered-containers >= 0.2.11
                     , vector               >= 0.10
-                    , free
                     , extra
   default-language:   Haskell98
   default-extensions: PatternGuards, RecordWildCards, DoAndIfThenElse
@@ -174,24 +177,75 @@ library
   if flag(devel)
     ghc-options:      -Wall -Werror -Wno-x-partial -Wno-incomplete-record-selectors
 
+library annotation-identity-old
+  hs-source-dirs:   serialization-tests/identity-fixture
+  exposed-modules: IdentityFixture
+  build-depends:   base
+  default-language: Haskell2010
+
+library annotation-identity-current
+  hs-source-dirs:   serialization-tests/identity-fixture
+  exposed-modules: IdentityFixture
+  build-depends:   base
+  default-language: Haskell2010
+
+test-suite serialization-tests
+  type:             exitcode-stdio-1.0
+  main-is:          Main.hs
+  hs-source-dirs:   serialization-tests src
+  other-modules:    AnnotationIdentityTests
+                   Language.Haskell.Liquid.GHC.Plugin.AnnotationIdentity
+  build-depends:    base
+                  , ghc
+                  , ghc-boot
+                  , annotation-identity-old
+                  , annotation-identity-current
+                  , tasty
+                  , tasty-hunit
+  mixins:          annotation-identity-old (IdentityFixture as Old.IdentityFixture)
+                 , annotation-identity-current (IdentityFixture as Current.IdentityFixture)
+  default-language: Haskell2010
+
 test-suite ghc-api-tests
   type:             exitcode-stdio-1.0
   main-is:          GhcApiTests.hs
   hs-source-dirs:   ghc-api-tests
+  other-modules:
+    ConstraintGenerationTests
+    DefaultSchemaSharingTests
+    FamilyPredicateTests
+    LogicSupportTests
+    MeasureApplicabilityTests
+    MethodAdmissionTests
+    MethodTelescopeTests
+    QualifierDecompositionTests
+    QueryTelescopeTests
+    RewriteDependencyTests
+    SpecClosureTests
+    TypeLiteralIdentityTests
+    WiredInTests
   build-depends:    base
+                  , binary
+                  , deepseq
                   , ghc
                   , ghc-paths
+                  , liquid-fixpoint
                   , liquidhaskell-boot
+                  , mtl
+                  , store
+                  , syb
                   , tasty
                   , tasty-ant-xml
                   , tasty-hunit
                   , time
+                  , unordered-containers
   default-language: Haskell2010
   ghc-options:      -W
 
 test-suite liquidhaskell-parser
   type:             exitcode-stdio-1.0
   main-is:          Parser.hs
+  other-modules:    MeasurePatternBinderTests
   hs-source-dirs:   tests
   build-depends:    base            >= 4.8.1.0 && < 5
                   , directory       >= 1.2.5 && < 1.4

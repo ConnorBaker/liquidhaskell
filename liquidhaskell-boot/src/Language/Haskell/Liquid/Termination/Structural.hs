@@ -264,14 +264,17 @@ getCallInfoExpr env = \case
 
   Let bind e -> getCallInfoBind env bind <> getCallInfoExpr env e
 
-  Case (toVar -> Just var) bndr _ alts -> foldMap getCallInfoAlt alts
+  -- A case demands its scrutinee independently of any arguments applied to
+  -- the case's result. In particular, a recursive value is a zero-argument
+  -- demand here; the selected branch may then expose structural subterms.
+  Case scrut bndr _ alts ->
+    getCallInfoExpr (clearCurrentFun . clearCurrentArgs $ env) scrut
+      <> foldMap getCallInfoAlt alts
     where
       getCallInfoAlt (Alt _ subterms body) = getCallInfoExpr (branchEnv subterms) body
-      branchEnv subterms = addSubterms var subterms . addSynonym var bndr $ env
-
-  Case scrut _ _ alts -> getCallInfoExpr env scrut <> foldMap getCallInfoAlt alts
-    where
-      getCallInfoAlt (Alt _ _ body) = getCallInfoExpr env body
+      branchEnv subterms = case toVar scrut of
+        Just var -> addSubterms var subterms . addSynonym var bndr $ env
+        Nothing -> env
 
   Cast e _ -> getCallInfoExpr env e
   Tick _ e -> getCallInfoExpr env e

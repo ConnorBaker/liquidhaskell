@@ -99,6 +99,8 @@ defConfig = Config
   , fullcheck                     = False
   , diffcheck                     = False
   , higherorder                   = False
+  , targetIntBits                 = Nothing
+    , targetMaxSmallTag = Nothing
   , smtTimeout                    = Nothing
   , higherorderqs                 = False
   , linear                        = False
@@ -115,6 +117,7 @@ defConfig = Config
   , bscope                        = False
   , totalHaskell                  = False
   , nowarnings                    = False
+  , checkDerived                  = False
   , noannotations                 = False
   , caseExpandDepth               = 2
   , notruetypes                   = False
@@ -255,6 +258,8 @@ lhOptions =
       "Don't display warnings, only show errors"
   , opt [] ["no-annotations"] (NoArg $ fm $ \c -> c { noannotations = True })
       "Don't create intermediate annotation files"
+  , opt [] ["check-derived"] (NoArg $ fm $ \c -> c { checkDerived = True })
+      "Check GHC generated binders (e.g. Read, Show instances)"
   , opt [] ["max-case-expand"] (ReqArg (fm . setCaseExpandDepth) "N")
       "Maximum depth at which to expand DEFAULT in case-of (default=2)"
   , opt [] ["no-true-types"] (NoArg $ fm $ \c -> c { notruetypes = True })

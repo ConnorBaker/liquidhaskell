@@ -1,8 +1,12 @@
-{-# OPTIONS_GHC -fplugin=LiquidHaskellBoot #-}
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE MagicHash #-}
 {-# OPTIONS_GHC -Wno-missing-signatures #-}
 {-# OPTIONS_GHC -Wno-unused-imports #-}
-module GHC.Types_LHAssumptions() where
+{-# OPTIONS_GHC -fplugin=LiquidHaskellBoot #-}
+
+module GHC.Types_LHAssumptions () where
+
+#include "MachDeps.h"
 
 import GHC.Prim
 import GHC.Types
@@ -31,7 +35,7 @@ embed Integer as int
 
 assume True    :: {v:Bool | v     }
 assume False   :: {v:Bool | (~ v) }
-assume GHC.Types.isTrue# :: n:_ -> {v:Bool | (n = 1 <=> v)}
+assume GHC.Types.isTrue# :: n:{Int# | n = 0 || n = 1} -> {v:Bool | (n = 1 <=> v)}
 
 define True = (true)
 
@@ -56,3 +60,22 @@ type String  = [Char]
 class measure len :: forall f a. f a -> Int
 
 @-}
+
+-- Representation bounds of actual machine values, not caller preconditions.
+#if WORD_SIZE_IN_BITS == 32
+{-@
+invariant {v:Int | -2147483648 <= v && v < 2147483648}
+invariant {v:Int# | -2147483648 <= v && v < 2147483648}
+invariant {v:Word | 0 <= v && v < 4294967296}
+invariant {v:Word# | 0 <= v && v < 4294967296}
+@-}
+#elif WORD_SIZE_IN_BITS == 64
+{-@
+invariant {v:Int | -9223372036854775808 <= v && v < 9223372036854775808}
+invariant {v:Int# | -9223372036854775808 <= v && v < 9223372036854775808}
+invariant {v:Word | 0 <= v && v < 18446744073709551616}
+invariant {v:Word# | 0 <= v && v < 18446744073709551616}
+@-}
+#else
+#error Unsupported GHC target Int/Word width
+#endif

@@ -33,6 +33,9 @@ data Config = Config
   , linear                   :: Bool       -- ^ uninterpreted integer multiplication and division
   , stringTheory             :: Bool       -- ^ interpretation of string theory in the logic
   , higherorder              :: Bool       -- ^ allow higher order binders into the logic
+  , targetIntBits            :: Maybe Int  -- ^ internal GHC target width; not a user option
+  -- | Internal GHC target pointer-tag capacity; not a user option.
+  , targetMaxSmallTag :: Maybe Int
   , higherorderqs            :: Bool       -- ^ allow higher order qualifiers
   , smtTimeout               :: Maybe Int  -- ^ smt timeout
   , fullcheck                :: Bool       -- ^ check all binders (overrides diffcheck)
@@ -50,6 +53,7 @@ data Config = Config
   , totalHaskell             :: Bool       -- ^ Check for termination and totality, Overrides no-termination flags
   , nowarnings               :: Bool       -- ^ disable warnings output (only show errors)
   , noannotations            :: Bool       -- ^ disable creation of intermediate annotation files
+  , checkDerived             :: Bool       -- ^ check GHC-generated binders
   , caseExpandDepth          :: Int        -- ^ maximum case expand nesting depth.
   , notruetypes              :: Bool       -- ^ disable truing top level types
   , nototality               :: Bool       -- ^ disable totality check in definitions

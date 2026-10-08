@@ -658,9 +658,13 @@ provided cases for the case expression.
 
 ## Higher order logic
 
-**Options:** `higherorder`
+**Options:** `higherorder`, `higherorderqs`
 
 The flag `--higherorder` allows reasoning about higher order functions.
+Reflection also enables this logical support. Neither option enables automatic
+qualifier instantiation with function-sorted candidates: that is controlled
+separately by `--higherorderqs`, which is disabled by default. Enabling
+`--higherorderqs` does not itself enable higher order logical binders.
 
 ## Restriction to Linear Arithmetic
 

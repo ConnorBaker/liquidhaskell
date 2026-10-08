@@ -15,6 +15,7 @@
 module Language.Haskell.Liquid.Transforms.Rewrite
   ( -- * Top level rewrite function
     rewriteBinds
+  , unfoldFromIntegral
 
   -- * Low-level Rewriting Function
   -- , rewriteWith
@@ -25,6 +26,8 @@ module Language.Haskell.Liquid.Transforms.Rewrite
   ) where
 
 import           Liquid.GHC.API as Ghc hiding (get, showPpr)
+import           GHC.Builtin.Names (fromIntegralName)
+import           GHC.Core.SimpleOpt (defaultSimpleOpts, simpleOptExpr)
 import           Language.Haskell.Liquid.GHC.TypeRep ()
 import           Data.Maybe     (fromMaybe, isJust, mapMaybe)
 import           Control.Monad.State hiding (lift)
@@ -52,6 +55,24 @@ rewriteBinds cfg
 
 simplifyCore :: Config -> Bool
 simplifyCore = not . noSimplifyCore
+
+-- | Check the real conversion wrapper by composing its dictionary methods.
+-- This uses the installed GHC definition, not an assumed arithmetic identity.
+-- Expanding an unsaturated application preserves the complete inferred arrow
+-- for selected and higher-order uses. If its unfolding is unavailable, retain
+-- the original identifier and its conservative imported contract.
+-- GHC's simple optimizer beta-reduces and removes trivial dictionary aliases;
+-- it does not perform call-site inlining of the imported method selectors.
+unfoldFromIntegral :: CoreBind -> CoreBind
+unfoldFromIntegral = rewriteBindWith unfold
+  where
+    unfold e
+      | (Var f, args) <- collectArgs e
+      , varName f == fromIntegralName
+      , Just body <- maybeUnfoldingTemplate (realUnfoldingInfo (idInfo f))
+      = Just (simpleOptExpr defaultSimpleOpts (mkApps body args))
+      | otherwise = Nothing
+
 
 undollar :: RewriteRule
 undollar e

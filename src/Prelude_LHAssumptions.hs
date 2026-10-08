@@ -11,11 +11,10 @@ import GHC.Num_LHAssumptions()
 import GHC.Num.Integer_LHAssumptions()
 import GHC.Real_LHAssumptions()
 import Liquid.Prelude.Real_LHAssumptions()
+import Liquid.Prelude.Error_LHAssumptions()
 import Liquid.Prelude.Totality_LHAssumptions()
 
 {-@
-
-assume error :: {v:_ | false} -> a
 
 predicate Max V X Y = if X > Y then V = X else V = Y
 predicate Min V X Y = if X < Y then V = X else V = Y

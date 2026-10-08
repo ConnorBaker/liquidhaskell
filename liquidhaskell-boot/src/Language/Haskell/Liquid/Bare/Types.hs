@@ -103,7 +103,8 @@ data LocalVars = LocalVars
 data LocalVarDetails = LocalVarDetails
   { lvdSourcePos :: F.SourcePos
   , lvdVar :: Ghc.Var
-  , lvdLclEnv :: [Ghc.Var]
+  -- Original source spelling paired with the actual checked Core identity.
+  , lvdLclEnv :: [(F.Symbol, Ghc.Var)]
   , lvdIsTopLevel :: Bool  -- ^ Is the variable defined at the top-level?
   , lvdIsRec :: Bool  -- ^ Is the variable defined in a letrec?
   } deriving Show
@@ -131,6 +132,7 @@ data TycEnv = TycEnv
   { tcTyCons      :: ![TyConP]
   , tcDataCons    :: ![DataConP]
   , tcSelMeasures :: ![Measure SpecType Ghc.DataCon]
+  , tcConstructorBoxes :: !(M.HashMap Ghc.DataCon Ms.ConstructorBox)
   , tcSelVars     :: ![(Ghc.Var, LocSpecType)]
   , tcTyConMap    :: !RT.TyConMap
   , tcAdts        :: ![F.DataDecl]

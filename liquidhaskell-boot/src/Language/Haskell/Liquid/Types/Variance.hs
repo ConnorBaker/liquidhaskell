@@ -6,7 +6,7 @@
 {-# OPTIONS_GHC -Wno-orphans #-}
 
 module Language.Haskell.Liquid.Types.Variance (
-  Variance(..), VarianceInfo, makeTyConVariance, flipVariance
+  Variance(..), VarianceInfo, makeTyConVariances, flipVariance
   ) where
 
 import Prelude hiding (error)
@@ -17,9 +17,10 @@ import Data.Binary
 import Data.Hashable
 import Text.PrettyPrint.HughesPJ
 
-import           Data.Maybe                (fromJust)
-import qualified Data.List               as L
+import qualified Data.HashMap.Strict as M
 import qualified Data.HashSet            as S
+import GHC.Core.Type (coreView, tyConsOfType)
+import GHC.Types.Unique.Set (nonDetEltsUniqSet)
 
 import qualified Language.Fixpoint.Types as F
 
@@ -39,82 +40,81 @@ flipVariance Contravariant = Covariant
 flipVariance Covariant     = Contravariant
 
 instance Semigroup Variance where
+  Invariant <> _ = Invariant
+  _ <> Invariant = Invariant
   Bivariant     <> _         = Bivariant
   _             <> Bivariant = Bivariant
-  Invariant     <> v         = v
-  v             <> Invariant = v
   Covariant     <> v         = v
   Contravariant <> v         = flipVariance v
 
 instance Monoid Variance where
-  mempty = Bivariant
+  mempty = Covariant
 
 instance Binary Variance
 instance NFData Variance
 instance F.PPrint Variance where
   pprintTidy _ = text . show
 
-
-
-makeTyConVariance :: TyCon -> VarianceInfo
-makeTyConVariance tyCon = varSignToVariance <$> tvs
+-- External interfaces are fixed boundaries; local annotations are only lower
+-- bounds, so they cannot erase an occurrence found in the constructor fields.
+makeTyConVariances :: M.HashMap TyCon VarianceInfo -> M.HashMap TyCon VarianceInfo -> [TyCon] -> M.HashMap TyCon VarianceInfo
+makeTyConVariances external declared roots = fixedPoint initial
   where
-    tvs = GM.tyConTyVarsDef tyCon
+    declarations = collect M.empty roots
+    initial = M.union external $ M.mapWithKey (\c _ -> replicate (length (GM.tyConTyVarsDef c)) Invariant) declarations
 
-    varsigns = if Ghc.isTypeSynonymTyCon tyCon
-                  then go True (fromJust $ Ghc.synTyConRhs_maybe tyCon)
-                  else L.nub $ concatMap goDCon $ Ghc.tyConDataCons tyCon
+    -- Each parameter accumulates a subset of {positive, negative}. Starting
+    -- with no occurrences gives a finite least fixed point, including changed
+    -- arguments of recursive applications. Variance's Semigroup is not union.
+    fixedPoint variances
+      | next == variances = variances
+      | otherwise = fixedPoint next
+      where
+        next = M.union external $ M.mapWithKey step declarations
+        step c bodies = zipWith union (varianceOf variances c bodies) (M.findWithDefault [] c declared ++ repeat Invariant)
 
-    varSignToVariance v = case filter (\p -> GM.showPpr (fst p) == GM.showPpr v) varsigns of
-                            []       -> Invariant
-                            [(_, b)] -> if b then Covariant else Contravariant
-                            _        -> Bivariant
+    union Invariant v = v
+    union v Invariant = v
+    union v w | v == w = v
+    union _ _ = Bivariant
 
+    collect seen [] = seen
+    collect seen (c : cs)
+      | M.member c seen || M.member c external = collect seen cs
+      | otherwise = collect (M.insert c bodies seen) (dependencies ++ cs)
+      where
+        bodies = case Ghc.synTyConRhs_maybe c of
+          Just rhs -> Just [rhs]
+          Nothing -> concatMap fields <$> Ghc.tyConDataCons_maybe c
+        dependencies = maybe [] (concatMap (nonDetEltsUniqSet . tyConsOfType)) bodies
+        -- Constructor universals correspond positionally to the parent's
+        -- parameters, but need not have the same names or native identities.
+        fields dc = map (Ghc.substTyWith (Ghc.dataConUnivTyVars dc) (Ghc.mkTyVarTys (Ghc.tyConTyVars c)) . irrelevantMult) (Ghc.dataConOrigArgTys dc)
 
-    goDCon dc = concatMap (go True . irrelevantMult) (Ghc.dataConOrigArgTys dc)
+    varianceOf _ c Nothing = replicate (length (GM.tyConTyVarsDef c)) Bivariant
+    varianceOf variances c (Just bodies) = map (varSignToVariance signs) (GM.tyConTyVarsDef c)
+      where
+        signs = S.unions (map (go variances True) bodies)
 
-    go pos (FunTy _ _ t1 t2) = go (not pos) t1 ++ go pos t2
-    go pos (ForAllTy _ t)    = go pos t
-    go pos (TyVarTy v)       = [(v, pos)]
-    go pos (AppTy t1 t2)     = go pos t1 ++ go pos t2
-    go pos (TyConApp c' ts)
-       | tyCon == c'
-       = []
+    varSignToVariance signs v = case (S.member (v, True) signs, S.member (v, False) signs) of
+      (False, False) -> Invariant
+      (True, False) -> Covariant
+      (False, True) -> Contravariant
+      (True, True) -> Bivariant
 
--- NV fix that: what happens if we have mutually recursive data types?
--- now just provide "default" Bivariant for mutually rec types.
--- but there should be a finer solution
-       | mutuallyRecursive tyCon c'
-       = concatMap (goTyConApp pos Bivariant) ts
-       | otherwise
-       = concat $ zipWith (goTyConApp pos) (makeTyConVariance c') ts
+    go variances pos (FunTy _ _ t1 t2) = go variances (not pos) t1 `S.union` go variances pos t2
+    go variances pos (ForAllTy _ t) = go variances pos t
+    go _ pos (TyVarTy v) = S.singleton (v, pos)
+    go variances pos (AppTy t1 t2) = go variances pos t1 `S.union` goTyConApp variances pos Bivariant t2
+    go variances pos t@(TyConApp c ts)
+      | Just vs <- M.lookup c variances = S.unions $ zipWith (goTyConApp variances pos) (vs ++ repeat Bivariant) ts
+      | Just t' <- coreView t = go variances pos t'
+      | otherwise = S.unions $ map (goTyConApp variances pos Bivariant) ts
+    go _ _ (LitTy _) = S.empty
+    go _ _ (CoercionTy _) = S.empty
+    go variances pos (CastTy t _) = go variances pos t
 
-    go _   (LitTy _)       = []
-    go _   (CoercionTy _)  = []
-    go pos (CastTy t _)    = go pos t
-
-    goTyConApp _   Invariant     _ = []
-    goTyConApp pos Bivariant     t = goTyConApp pos Contravariant t ++ goTyConApp pos Covariant t
-    goTyConApp pos Covariant     t = go pos       t
-    goTyConApp pos Contravariant t = go (not pos) t
-
-    mutuallyRecursive c c' = c `S.member` dataConsOfTyCon c'
-
-
-dataConsOfTyCon :: TyCon -> S.HashSet TyCon
-dataConsOfTyCon = dcs S.empty
-  where
-    dcs vis c                 = mconcat $ go vis <$> [irrelevantMult t | dc <- Ghc.tyConDataCons c, t <- Ghc.dataConOrigArgTys dc]
-    go  vis (FunTy _ _ t1 t2) = go vis t1 `S.union` go vis t2
-    go  vis (ForAllTy _ t)    = go vis t
-    go  _   (TyVarTy _)       = S.empty
-    go  vis (AppTy t1 t2)     = go vis t1 `S.union` go vis t2
-    go  vis (TyConApp c ts)
-      | c `S.member` vis
-      = S.empty
-      | otherwise
-      = S.insert c (mconcat $ go vis <$> ts) `S.union` dcs (S.insert c vis) c
-    go  _   (LitTy _)       = S.empty
-    go  _   (CoercionTy _)  = S.empty
-    go  vis (CastTy t _)    = go vis t
-
+    goTyConApp _ _ Invariant _ = S.empty
+    goTyConApp variances pos Bivariant t = go variances pos t `S.union` go variances (not pos) t
+    goTyConApp variances pos Covariant t = go variances pos t
+    goTyConApp variances pos Contravariant t = go variances (not pos) t

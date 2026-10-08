@@ -15,16 +15,18 @@
 module Language.Haskell.Liquid.Bare (
   -- * Creating a TargetSpec
   -- $creatingTargetSpecs
-    makeTargetSpec
-  ) where
+  makeTargetSpec,
+  measureTypeToInv,
+  targetSpecEnv,
+) where
 
 import           Control.Monad                              (forM, mplus, when)
 import qualified Control.Exception                          as Ex
 import           Data.Either (fromRight)
-import           Data.Foldable                              (traverse_)
 import qualified Data.Maybe                                 as Mb
 import qualified Data.List                                  as L
 import qualified Data.HashMap.Strict                        as M
+import qualified Data.Map.Strict                            as Map
 import qualified Data.HashSet                               as S
 import           Text.PrettyPrint.HughesPJ                  hiding (first, (<>)) -- (text, (<+>))
 import           System.FilePath                            (dropExtension)
@@ -39,6 +41,7 @@ import           Language.Haskell.Liquid.GHC.Types          (StableName)
 import           Language.Haskell.Liquid.LHNameResolution
 import           Language.Haskell.Liquid.Types.Errors
 import           Language.Haskell.Liquid.Types.DataDecl
+import qualified Language.Haskell.Liquid.Types.DataDecl      as DataDecl
 import           Language.Haskell.Liquid.Types.Names
 import           Language.Haskell.Liquid.Types.PredType
 import           Language.Haskell.Liquid.Types.RefType
@@ -64,14 +67,19 @@ import qualified Language.Haskell.Liquid.Bare.Resolve       as Resolve
 import qualified Language.Haskell.Liquid.Bare.Typeclass     as Bare
 import qualified Language.Haskell.Liquid.Transforms.CoreToLogic as CoreToLogic
 import           Language.Haskell.Liquid.UX.Config
+import qualified Language.Fixpoint.Types.Config as FC
+import Language.Haskell.Liquid.Constraint.ToFixpoint (sourceNativeEnv)
 import Data.Hashable (Hashable)
 import Data.Bifunctor (bimap, first)
 import Data.Function (on)
 import qualified Data.IORef as IORef
-import qualified GHC.Tc.Utils.TcType as TcType
+import qualified GHC.Tc.Types as Ghc
 import qualified GHC.Tc.Utils.Monad as TcMonad
 import qualified GHC.Types.Var.Set as VarSet
-import qualified GHC.Data.IOEnv as IOEnv
+import qualified GHC.Types.Name.Set as NameSet
+import qualified GHC.Types.Name.Reader as RdrName
+import GHC.Core.Type (tyConsOfType)
+import GHC.Types.Unique.Set (nonDetEltsUniqSet)
 
 
 {- $creatingTargetSpecs
@@ -100,11 +108,10 @@ makeTargetSpec :: Config
                -> TargetDependencies
                -> Ghc.TcRn (Either Diagnostics ([Warning], TargetSpec, LiftedSpec))
 makeTargetSpec cfg localVars lnameEnv lmap targetSrc bareSpec dependencies = do
-  let targDiagnostics     = Bare.checkTargetSrc cfg bareSpec targetSrc
   let depsDiagnostics     = mapM (Bare.checkBareSpec . snd) legacyDependencies
   let bareSpecDiagnostics = Bare.checkBareSpec bareSpec
   let stratDiagnostics   = Bare.checkStratTys bareSpec targetSrc
-  case targDiagnostics >> depsDiagnostics >> bareSpecDiagnostics >> stratDiagnostics of
+  case depsDiagnostics >> bareSpecDiagnostics >> stratDiagnostics of
    Left d | noErrors d -> secondPhase [] (allWarnings d)
    Left d              -> return $ Left d
    Right stratNames   -> secondPhase stratNames mempty
@@ -152,46 +159,59 @@ makeTargetSpec cfg localVars lnameEnv lmap targetSrc bareSpec dependencies = do
 -- | @makeGhcSpec@ invokes @makeGhcSpec0@ to construct the @GhcSpec@ and then
 --   validates it using @checkGhcSpec@.
 -------------------------------------------------------------------------------------
-makeGhcSpec :: [Ghc.Name]
-            -> Config
-            -> LogicNameEnv
-            -> Bare.LocalVars
-            -> GhcSrc
-            -> LogicMap
-            -> Ms.BareSpec
-            -> [(ModName, Ms.BareSpec)]
-            -> Ghc.TcRn (Either Diagnostics ([Warning], GhcSpec))
+makeGhcSpec ::
+    [Ghc.Name] ->
+    Config ->
+    LogicNameEnv ->
+    Bare.LocalVars ->
+    GhcSrc ->
+    LogicMap ->
+    Ms.BareSpec ->
+    [(ModName, Ms.BareSpec)] ->
+    Ghc.TcRn (Either Diagnostics ([Warning], GhcSpec))
 -------------------------------------------------------------------------------------
 makeGhcSpec stratNames cfg lenv localVars src lmap bareSpec dependencySpecs = do
-  ghcTyLookupEnv <- Bare.makeGHCTyLookupEnv (_giCbs src)
-  tcg <- Ghc.getGblEnv
-  instEnvs <- Ghc.tcGetInstEnvs
-  (dg0, sp) <- makeGhcSpec0 stratNames cfg ghcTyLookupEnv tcg instEnvs lenv localVars src lmap bareSpec dependencySpecs
-  let diagnostics = Bare.checkTargetSpec (bareSpec : map snd dependencySpecs)
-                                         (toTargetSrc src)
-                                         (ghcSpecEnv sp)
-                                         (_giCbs src)
-                                         (toTargetSpec sp)
-  pure $ if not (noErrors dg0) then Left dg0 else
-           case diagnostics of
-             Left dg1
-               | noErrors dg1 -> pure (allWarnings dg1, sp)
-               | otherwise    -> Left dg1
-             Right ()         -> pure (mempty, sp)
+    ghcTyLookupEnv <- Bare.makeGHCTyLookupEnv (_giCbs src)
+    tcg <- Ghc.getGblEnv
+    instEnvs <- Ghc.tcGetInstEnvs
+    let used =
+            Mb.mapMaybe (resolvedDataCon ghcTyLookupEnv) $
+                S.toList (collectAllDataCons (_giCbs src) (bareSpec : map snd dependencySpecs))
+        local = concatMap Ghc.tyConDataCons (filter Ghc.isAlgTyCon (Ghc.tcg_tcs tcg))
+    boxes <- Ms.makeConstructorBoxes (local ++ used)
+    (dg0, sp, formationTemplates, originalMeasures) <- makeGhcSpec0 boxes stratNames cfg ghcTyLookupEnv tcg instEnvs lenv localVars src lmap bareSpec dependencySpecs
+    let diagnostics =
+            Bare.checkTargetSpec
+                formationTemplates
+                originalMeasures
+                (bareSpec : map snd dependencySpecs)
+                (toTargetSrc src)
+                (targetSpecEnv (toTargetSpec sp))
+                (_giCbs src)
+                (toTargetSpec sp)
+    pure $
+        if not (noErrors dg0)
+            then Left dg0
+            else case diagnostics of
+                Left dg1
+                    | noErrors dg1 -> pure (allWarnings dg1, sp)
+                    | otherwise -> Left dg1
+                Right () -> pure (mempty, sp)
 
 
-ghcSpecEnv :: GhcSpec -> SEnv SortedReft
-ghcSpecEnv sp = F.notracepp "RENV" $ fromListSEnv binds
+targetSpecEnv :: TargetSpec -> SEnv SortedReft
+targetSpecEnv sp = F.notracepp "RENV" $ fromListSEnv binds
   where
-    emb       = gsTcEmbeds (_gsName sp)
+    emb       = gsTcEmbeds (gsName sp)
     binds     = F.notracepp "binds" $ concat
-                 [ [(x,        rSort t) | (x, Loc _ _ t)  <- gsMeas     (_gsData sp)]
-                 , [(symbol v, rSort t) | (v, Loc _ _ t)  <- gsCtors    (_gsData sp)]
-                 , [(symbol v, vSort v) | v               <- gsReflects (_gsRefl sp)]
-                 , [(symbol v, vSort v) | (v, _)          <- gsTySigs   (_gsSig  sp), Mb.isJust (Ghc.isClassOpId_maybe v)]
-                 , [(symbol v, vSort v) | (v, _)          <- gsAsmSigs  (_gsSig  sp), Mb.isJust (Ghc.isClassOpId_maybe v)]
+                 [ [(x,        rSort t) | (x, Loc _ _ t)  <- gsMeas     (gsData sp)]
+                 , [(symbol v, rSort t) | (v, Loc _ _ t)  <- gsCtors    (gsData sp)]
+                 , [(symbol dc, vSort (Ghc.dataConWrapId dc)) | dc <- M.keys (gsConstructorBoxes (gsName sp))]
+                 , [(symbol v, vSort v) | v               <- gsReflects (gsRefl sp)]
+                 , [(symbol v, vSort v) | (v, _)          <- gsTySigs   (gsSig  sp), Mb.isJust (Ghc.isClassOpId_maybe v)]
+                 , [(symbol v, vSort v) | (v, _)          <- gsAsmSigs  (gsSig  sp), Mb.isJust (Ghc.isClassOpId_maybe v)]
                  , [(x, RR s mempty)    | (x, s)          <- wiredSortedSyms       ]
-                 , [(x, RR s mempty)    | (x, s)          <- _gsImps sp       ]
+                 , [(x, RR s mempty)    | (x, s)          <- gsImps sp       ]
                  ]
     vSort     = rSort . classRFInfoType (typeclass $ getConfig sp) .
                 (ofType :: Ghc.Type -> SpecType) . Ghc.varType
@@ -206,7 +226,8 @@ ghcSpecEnv sp = F.notracepp "RENV" $ fromListSEnv binds
 --   lets us use aliases inside data-constructor definitions.
 -------------------------------------------------------------------------------------
 makeGhcSpec0
-  :: [Ghc.Name]
+  :: M.HashMap Ghc.DataCon ConstructorBox
+  -> [Ghc.Name]
   -> Config
   -> Bare.GHCTyLookupEnv
   -> Ghc.TcGblEnv
@@ -217,15 +238,32 @@ makeGhcSpec0
   -> LogicMap
   -> Ms.BareSpec
   -> [(ModName, Ms.BareSpec)]
-  -> Ghc.TcRn (Diagnostics, GhcSpec)
-makeGhcSpec0 stratNames cfg ghcTyLookupEnv tcg instEnvs lenv localVars src lmap bareSpec dependencySpecs = do
+  -> Ghc.TcRn (Diagnostics, GhcSpec, [UnSortedExpr], [Measure SpecType Ghc.DataCon])
+makeGhcSpec0 boxes stratNames cfg ghcTyLookupEnv tcg instEnvs lenv localVars src lmap bareSpec dependencySpecs = do
   globalRdrEnv <- Ghc.tcg_rdr_env <$> Ghc.getGblEnv
+  -- Elaboration can introduce dictionary functions and selectors absent from
+  -- the authored expression. Retain their actual free global Ids, not names
+  -- guessed back from the resulting logic. Query-local binders stay local.
+  support <- Ghc.liftIO $ IORef.newIORef []
+  let collect _ _ _ declarations =
+        Ghc.liftIO $
+          IORef.modifyIORef'
+            support
+            (declarations ++)
+      sigEnv = makeSigEnv embs (Bare.tcTyConMap tycEnv0) (_gsExports src) rtEnv
+      -- Interpret logical declarations before elaborating class fields. Their
+      -- type constructors are already resolved; constructor equations and
+      -- source-lifted measures are assembled after the fields are elaborated.
+      rawDeclarations = M.mapWithKey (\owner spec -> Bare.makeMeasureSpec env sigEnv name (owner, spec)) declaredSpecs
+  declarations <- M.traverseWithKey normalizeMeasures rawDeclarations
+  let (resolvedDiagnostics, resolvedDeclarations) = withDiagnostics $ traverse (Bare.resolveMeasureSpec env) declarations
+      declaredMeasures = mconcat (Ms.mkMSpec' (Bare.tcSelMeasures tycEnv0) : M.elems resolvedDeclarations)
+      declaredCatalog = prepareLogicalCatalog declaredMeasures
+  let elaborate = elaborateWithCatalog globalRdrEnv declaredMeasures declaredCatalog [] [] collect
   -- build up environments
-  tycEnv <- makeTycEnv1 env (tycEnv0, datacons) coreToLg simplifier
-  let tyi      = Bare.tcTyConMap   tycEnv
-  let sigEnv   = makeSigEnv  embs tyi (_gsExports src) rtEnv
+  tycEnv <- makeTycEnv1 boxes env (tycEnv0, datacons) elaborate
   -- This spec is used to add lifted measures.
-  let lSpec1   = makeLiftedSpec1 cfg src tycEnv lmap mySpec1
+  let (lSpec1, measureSupport) = makeLiftedSpec1 cfg src tycEnv lmap mySpec1
   -- 'mySpec' and 'specs' contain the result of the first lifting stages, see [NOTE]: REFLECT-IMPORTS
   -- and the expanded aliases obtained using 'rtEnv'. 'myRTE' is a filtered 'rtEnv' used at the final
   -- lifting.
@@ -234,22 +272,92 @@ makeGhcSpec0 stratNames cfg ghcTyLookupEnv tcg instEnvs lenv localVars src lmap 
   let myRTE    = myRTEnv src env sigEnv rtEnv
   -- NB: we first compute a measure environment w/o the opaque reflections, so that we can bootstrap
   -- the signature `sig`. Then we'll add the opaque reflections before we compute `sData` and al.
-  let (dg1, measEnv0) = withDiagnostics $ makeMeasEnv      env tycEnv sigEnv       specs
-  let (dg2, (specInstances, sig)) = withDiagnostics $ makeSpecSig stratNames cfg name mySpec iSpecs2 env sigEnv tycEnv measEnv0 (_giCbs src)
-  elaboratedSig <-
-    if allowTC then Bare.makeClassAuxTypes (elaborateSpecType coreToLg simplifier) datacons instMethods
-                              >>= elaborateSig sig
-               else pure sig
-  checkedSig <- if checkRefinements cfg then addRefinementChecks elaboratedSig else pure elaboratedSig
-  let (dg3, refl)    = withDiagnostics $ makeSpecRefl src specs env name checkedSig tycEnv
+  -- Reassemble the full per-module declarations here, retaining the existing
+  -- duplicate checks between authored and source-lifted measures.
+  let liftedMeasures =
+        -- Preserve the original authored/source-lifted duplicate check without
+        -- resolving the already normalized declarations a second time.
+        Ms.checkDuplicateMeasure (Ms.measures mySpec) `seq` Bare.makeMeasureSpec env sigEnv name (name, lSpec1)
+      completeDeclarations = M.adjust (<> liftedMeasures) name declarations
+      publishedSpecs = M.intersectionWith publishMeasures completeDeclarations specs
+      publishedSpec = M.lookupDefault mySpec name publishedSpecs
+      (completeDiagnostics, completeMeasures) = withDiagnostics $ Bare.resolveMeasureSpec env liftedMeasures
+      allMeasures = mconcat (Ms.mkMSpec' (Bare.tcSelMeasures tycEnv) : completeMeasures : M.elems resolvedDeclarations)
+      localDeferred = S.map (lhNameToResolvedSymbol . val) (Ms.hmeas mySpec) `S.difference` S.map (lhNameToResolvedSymbol . val) (Ms.ignores mySpec)
+      project owner declarations = declarations{Ms.ctorMap = M.map (filter (not . (`S.member` deferred) . lhNameToResolvedSymbol . val . measure)) (Ms.ctorMap declarations)}
+        where
+          deferred = S.fromList
+            [ lhNameToResolvedSymbol (val (msName declaration))
+            | declaration <- M.elems (Ms.measMap declarations) ++ Ms.imeas declarations
+            , deferredLiftedMeasure name localDeferred owner declaration
+            ]
+      formationMeasures = mconcat
+        (Ms.mkMSpec' (Bare.tcSelMeasures tycEnv) : project name completeMeasures : M.elems (M.mapWithKey project resolvedDeclarations))
+      originalMeasures = concatMap (\declarations -> M.elems (Ms.measMap declarations) ++ Ms.imeas declarations)
+        (completeMeasures : M.elems resolvedDeclarations)
+  ((dg1, measEnv0), constructorSupport) <- makeMeasEnv coreToLg elaborate env tycEnv sigEnv specs allMeasures formationMeasures
+  let logicalCatalog = prepareLogicalCatalog (Bare.meMeasureSpec measEnv0)
+  dictionaries <- Bare.makeSpecDictionaries env sigEnv (name, mySpec) (M.toList iSpecs2)
+  let (dg2, (specInstances, sig, generatedSigs, sourceAssumptions)) = withDiagnostics $ makeSpecSig dictionaries stratNames cfg name mySpec iSpecs2 env sigEnv tycEnv measEnv0 (_giCbs src)
+  auxiliaryChecks <- Ghc.liftIO $ IORef.newIORef []
+  let elaborateOwned owner location ty =
+        let captures = lexicalCaptures owner
+         in TcMonad.setSrcSpan (GM.fSrcSpan location) $
+              elaborateWithCatalog
+                globalRdrEnv
+                (Bare.meMeasureSpec measEnv0)
+                logicalCatalog
+                [owner]
+                captures
+                (collectRefinement refinementOwners collect auxiliaryChecks owner (map snd captures) location)
+                ty
+      elaborateAuxiliary owner = elaborateOwned owner (GM.locNamedThing owner)
+  auxiliarySigs <- if allowTC then Bare.makeClassAuxTypes embs elaborateAuxiliary datacons instMethods else pure []
+  -- Instance schemas have actual method-body owners too. Collect their
+  -- formation judgments in the same lexical queue as auxiliary method types.
+  elaboratedSig <- elaborateMethods elaborateOwned sig
+  (interpretedSig, interpretedAssumptions) <- elaborateSignatures globalRdrEnv collect measEnv0 logicalCatalog sourceAssumptions elaboratedSig
+  auxiliaryQueries <- reverse <$> Ghc.liftIO (IORef.readIORef auxiliaryChecks)
+  -- These singleton rows are constructed from the actual owner's full arrow,
+  -- not parsed source predicates. Join them only after interpreting authored
+  -- refinements, under the final merged input domain. Their owners still face
+  -- ordinary body checking and independent measure/source admission.
+  let querySig =
+        interpretedSig
+          { gsTySigs = strengthenSigs ([(v, (0, t)) | (v, t) <- gsTySigs interpretedSig] ++ generatedSigs) ++ auxiliarySigs
+          , gsReftChecks = gsReftChecks interpretedSig ++ auxiliaryQueries
+          }
+  -- GHC can introduce source operations while elaborating a predicate (for
+  -- example, a missing case calls the ordinary pattern-match error function).
+  -- Prune imported contracts only after those actual dependencies are known.
+  let queryNames =
+        NameSet.mkNameSet
+          [ Ghc.getName identifier
+          | check <- gsReftChecks querySig
+          , identifier <- freeVars S.empty (refinementCheckExpr check)
+          , Ghc.isId identifier
+          , Ghc.isExternalName (Ghc.getName identifier)
+          ]
+      queryEnv = env{Bare.reUsedExternals = Bare.reUsedExternals env `NameSet.unionNameSet` queryNames}
+      (dgChecks, queryImports) =
+        withDiagnostics $
+          if null (gsReftChecks querySig)
+            then pure []
+            else snd <$> makeAsmSigs queryEnv sigEnv name ((name, mySpec) : M.toList iSpecs2)
+      existingImports = S.fromList (map fst (gsAsmSigs querySig))
+      checkedSig =
+        querySig
+          { gsAsmSigs = gsAsmSigs querySig ++ filter (not . (`S.member` existingImports) . fst) queryImports
+          }
+  let (dg3, (refl, reflectionSupport)) = withDiagnostics $ makeSpecRefl src specs env name checkedSig tycEnv
   let eqs            = gsHAxioms refl
-  let (dg4, measEnv) = withDiagnostics $ addOpaqueReflMeas cfg tycEnv env mySpec measEnv0 specs eqs
+  let (dg4, (measEnv, opaqueSupport)) = withDiagnostics $ addOpaqueReflMeas coreToLg cfg tycEnv env mySpec measEnv0 specs eqs reflectionSupport
   let qual = makeSpecQual cfg env globalRdrEnv tycEnv measEnv rtEnv mySpec iSpecs2
   let (dg5, spcVars) = withDiagnostics $ makeSpecVars cfg src mySpec env measEnv
   let (dg6, spcTerm) = withDiagnostics $ makeSpecTerm cfg     mySpec lenv env
-  let sData    = makeSpecData  src env sigEnv measEnv checkedSig specs
+  let (sData, formationTemplates) = makeSpecData src env sigEnv measEnv checkedSig publishedSpecs
   let finalLiftedSpec = makeLiftedSpec name src env refl sData checkedSig qual myRTE (lSpec0 <> lSpec1)
-  let diags    = mconcat [dg0, dg1, dg2, dg3, dg4, dg5, dg6]
+  let diags = mconcat [dg0, resolvedDiagnostics, completeDiagnostics, dg1, dg2, dg3, dg4, dg5, dg6, dgChecks]
 
   -- Dump reflections, if requested
   when (dumpOpaqueReflections cfg) . Ghc.liftIO $ do
@@ -262,148 +370,310 @@ makeGhcSpec0 stratNames cfg ghcTyLookupEnv tcg instEnvs lenv localVars src lmap 
       mapM_ (putStrLn . ("- " ++) . show) sortedRefls
     putStrLn ""
 
-  pure (diags, SP
-    { _gsConfig = cfg
-    , _gsImps   = makeImports mspecs
-    , _gsSig    = addReflSigs env name rtEnv measEnv refl checkedSig
-    , _gsRefl   = refl
-    , _gsData   = sData
-    , _gsQual   = qual
-    , _gsName   = makeSpecName tycEnv measEnv dataConIds
-    , _gsVars   = spcVars
-    , _gsTerm   = spcTerm
-
-    , _gsLSpec  = finalLiftedSpec
-                { expSigs   =
-                    [ (lhNameToResolvedSymbol $ reflectGHCName thisModule $ Ghc.getName v, F.sr_sort $ Bare.varSortedReft embs v)
-                    | v <- gsReflects refl
-                    ]
-                , dataDecls = Bare.dataDeclSize mySpec $ dataDecls mySpec
-                  -- Placing mySpec at the end causes local measures to take precedence over
-                  -- imported measures when their names clash.
-                , measures  = mconcat $ map Ms.measures $ map snd dependencySpecs ++ [mySpec]
-                  -- We want to export measures in a 'LiftedSpec', especially if they are
-                  -- required to check termination of some 'liftedSigs' we export. Due to the fact
-                  -- that 'lSpec1' doesn't contain the measures that we compute via 'makeHaskellMeasures',
-                  -- we take them from 'mySpec', which has those.
-                , asmSigs = Ms.asmSigs finalLiftedSpec ++ Ms.asmSigs mySpec
-                  -- Export all the assumptions (not just the ones created out of reflection) in
-                  -- a 'LiftedSpec'.
-                , omeasures = Ms.omeasures finalLiftedSpec ++ (snd <$> Bare.meOpaqueRefl measEnv)
-                  -- Preserve 'o-measures': they are the opaque reflections
-                , imeasures = Ms.imeasures finalLiftedSpec ++ Ms.imeasures mySpec
-                  -- Preserve user-defined 'imeasures'.
-                , dvariance = Ms.dvariance finalLiftedSpec ++ Ms.dvariance mySpec
-                  -- Preserve user-defined 'dvariance'.
-                , rinstance = specInstances
-                  -- Preserve rinstances.
-                , asmReflectSigs = Ms.asmReflectSigs mySpec
-                , reflects = Ms.reflects mySpec0
-                , cmeasures  = mconcat $ map Ms.cmeasures $ map snd dependencySpecs ++ [bareSpec]
-                , embeds = Ms.embeds bareSpec
-                , privateReflects = mconcat $ map (privateReflects . snd) mspecs
-                , defines = Ms.defines bareSpec
-                , usedDataCons = usedDcs
-                  -- Placing the @bareSpec@ at the end causes local aliases
-                  -- to take precedence over imported ones when their names clash.
-                  -- Alternatively, the last among @dependencySpecs@ (which is
-                  -- ordered lexcographically) is picked.
-                  -- See @tests/name/pos/ImportedTypeAlias.hs@
-                , aliases = M.elems $ M.fromList $
-                    [ (lhNameToUnqualifiedSymbol (val . rtName $ rt) , rt)
-                    | rt <- concat $
-                        map (aliases . snd) dependencySpecs ++
-                        [expandedAliasesOf myRTE typeAliases $ aliases bareSpec]
-                    ]
-                , ealiases = M.elems $ M.fromList $
-                    [ (lhNameToUnqualifiedSymbol (val . rtName $ rt) , rt)
-                    | rt <- concat $
-                        map (ealiases . snd) dependencySpecs ++
-                        [expandedAliasesOf myRTE exprAliases $ ealiases mySpec1']
-                    ]
-                }
-    })
+  querySupport <- Ghc.liftIO (IORef.readIORef support)
+  let declarations = filter (Ghc.isExternalName . Ghc.getName . fst)
+        (querySupport ++ inlineSupport ++ measureSupport ++ constructorSupport ++ reflectionSupport ++ opaqueSupport)
+      groupedSorts = M.fromListWith (++) [(F.symbol identifier, [(identifier, sort)]) | (identifier, sort) <- declarations]
+  mapM_ checkSupportSort (M.toList groupedSorts)
+  -- These are declarations of logical sorts, not assumed source contracts.
+  -- Re-export imported support because exported predicates can retain it.
+  let supportSorts =
+        [ (symbol, sort)
+        | (symbol, (_, sort) : _) <- M.toList groupedSorts
+        ]
+      logicalImports = supportSorts ++ makeImports mspecs
+      -- An explicit ignore removes the entire source body, including nested
+      -- lexical owners. Use the same pruning as the checking pipeline; keep
+      -- its interpreted schema, but do not publish body-owned obligations.
+      checkedOwners = S.fromList (letVars (GM.ignoreCoreBinds (gsIgnoreVars spcVars) (_giCbs src)))
+      externalAssumptions = S.fromList (map fst sourceAssumptions) `S.difference` refinementOwners
+      checkedRefinements = filter ((`S.member` (checkedOwners `S.union` externalAssumptions)) . refinementCheckOwner) (gsReftChecks checkedSig)
+  pure
+    ( diags
+    , SP
+        { _gsConfig = cfg
+        , _gsImps = logicalImports
+        , _gsSig = (addReflSigs queryEnv sigEnv name rtEnv measEnv refl checkedSig){gsReftChecks = checkedRefinements}
+        , _gsRefl = refl
+        , _gsData = sData
+        , _gsQual = qual
+        , _gsName = makeSpecName tycEnv measEnv dataConIds
+        , _gsVars = spcVars
+        , _gsTerm = spcTerm
+        , _gsLSpec =
+            finalLiftedSpec
+              { expSigs =
+                  logicalImports
+                    ++ [ (lhNameToResolvedSymbol $ reflectGHCName thisModule $ Ghc.getName v, F.sr_sort $ Bare.varSortedReft embs v)
+                       | v <- gsReflects refl
+                       ]
+              , dataDecls = Bare.dataDeclSize mySpec $ dataDecls mySpec
+              , -- Placing mySpec at the end causes local measures to take precedence over
+                -- imported measures when their names clash.
+                measures =
+                  exportMeasureClosure measEnv $
+                    exportMeasureInputs src checkedSig $
+                    mconcat $
+                      map Ms.measures $
+                        [M.lookupDefault spec owner publishedSpecs | (owner, spec) <- dependencySpecs] ++ [publishedSpec]
+              , -- We want to export measures in a 'LiftedSpec', especially if they are
+                -- required to check termination of some 'liftedSigs' we export. Due to the fact
+                -- that 'lSpec1' doesn't contain the measures that we compute via 'makeHaskellMeasures',
+                -- we take them from 'mySpec', which has those.
+                asmSigs = Ms.asmSigs finalLiftedSpec ++
+                  [(makeGHCLHNameLocatedFromId owner, Bare.specToBare <$> ty) | (owner, ty) <- interpretedAssumptions]
+              , -- Export all the assumptions (not just the ones created out of reflection) in
+                -- a 'LiftedSpec'.
+                omeasures = exportOpaqueInputs checkedSig $ Ms.omeasures finalLiftedSpec ++ (snd <$> Bare.meOpaqueRefl measEnv)
+              , -- Preserve 'o-measures': they are the opaque reflections
+                imeasures = Ms.imeasures finalLiftedSpec ++ Ms.imeasures publishedSpec
+              , -- Preserve user-defined 'imeasures'.
+                dvariance = Ms.dvariance finalLiftedSpec ++ Ms.dvariance mySpec
+              , -- Preserve user-defined 'dvariance'.
+                rinstance = specInstances
+              , -- Preserve rinstances.
+                classes = Ms.classes mySpec
+              , -- Clients need the complete declared dictionary fields,
+                -- including methods not exported by a companion module.
+                asmReflectSigs = Ms.asmReflectSigs mySpec
+              , reflects = Ms.reflects mySpec0
+              , cmeasures = mconcat $ map Ms.cmeasures $ [M.lookupDefault spec owner publishedSpecs | (owner, spec) <- dependencySpecs] ++ [publishedSpec]
+              , embeds = Ms.embeds bareSpec
+              , privateReflects = mconcat $ map (privateReflects . snd) mspecs
+              , defines = Ms.defines bareSpec
+              , usedDataCons = usedDcs
+              , -- Placing the @bareSpec@ at the end causes local aliases
+                -- to take precedence over imported ones when their names clash.
+                -- Alternatively, the last among @dependencySpecs@ (which is
+                -- ordered lexcographically) is picked.
+                -- See @tests/name/pos/ImportedTypeAlias.hs@
+                aliases =
+                  M.elems $
+                    M.fromList $
+                      [ (lhNameToUnqualifiedSymbol (val . rtName $ rt), rt)
+                      | rt <-
+                          concat $
+                            map (aliases . snd) dependencySpecs
+                              ++ [expandedAliasesOf myRTE typeAliases $ aliases bareSpec]
+                      ]
+              , ealiases =
+                  M.elems $
+                    M.fromList $
+                      [ (lhNameToUnqualifiedSymbol (val . rtName $ rt), rt)
+                      | rt <-
+                          concat $
+                            map (ealiases . snd) dependencySpecs
+                              ++ [expandedAliasesOf myRTE exprAliases $ ealiases mySpec1']
+                      ]
+              }
+        }
+    , formationTemplates
+    , originalMeasures
+    )
   where
+    checkSupportSort (_, []) = pure ()
+    checkSupportSort (symbol, (identifier, sort) : observations)
+      | all ((== sort) . snd) observations
+          && all ((== sort) . snd) (filter ((== symbol) . fst) (makeImports mspecs)) = pure ()
+      | otherwise = uError (ErrOther (Ghc.getSrcSpan identifier)
+          ("Conflicting interpreted sorts for" <+> F.pprint symbol) :: UserError)
     thisModule = Ghc.tcg_mod tcg
     expandedAliasesOf myRTE fld = Mb.mapMaybe ((`M.lookup` fld myRTE) . val . rtName)
 
     -- typeclass elaboration
 
-    coreToLg ce =
+    coreToLg = coreToLgWith mempty []
+    coreToLgWith logicalEmbeddings definitions ce =
       case CoreToLogic.runToLogic
-             embs
-             lmap
-             dm
-             cfg
-             (\x -> todo Nothing ("coreToLogic not working " ++ x))
-             (CoreToLogic.coreToLogic ce) of
+        boxes
+        (logicalEmbeddings <> embs)
+        lmap
+        dm
+        cfg
+        (\x -> todo Nothing ("coreToLogic not working " ++ x))
+        (CoreToLogic.coreToLogicWithDefinitions definitions ce) of
         Left msg -> panic Nothing (F.showpp msg)
-        Right e -> e
-    elaborateSig si auxsig = do
-      tySigs <-
-        forM (gsTySigs si) $ \(x, t) ->
-          if GM.isFromGHCReal x then
-            pure (x, t)
-          else do t' <- traverse (elaborateSpecType coreToLg simplifier) t
-                  pure (x, t')
-      -- things like len breaks the code
-      -- asmsigs should be elaborated only if they are from the current module
-      -- asmSigs <- forM (gsAsmSigs si) $ \(x, t) -> do
-      --   t' <- traverse (elaborateSpecType (pure ()) coreToLg) t
-      --   pure (x, fst <$> t')
-      pure
-        si
-          { gsTySigs = F.notracepp ("asmSigs" ++ F.showpp (gsAsmSigs si)) tySigs ++ auxsig  }
+        Right (e, declarations) -> (e, retainLogicSupport (F.syms e) declarations)
+    elaborateMethods elaborate si = do
+      methods <- forM (gsMethods si) $ \(x, MT instanceType classType) -> do
+        let located ty = traverse (elaborate x ty) ty
+        instanceType' <- traverse located instanceType
+        classType' <- traverse located classType
+        pure (x, MT instanceType' classType')
+      pure si {gsMethods = methods}
 
-    addRefinementChecks si = do
+    -- Normalize each declaration before its equations acquire constructor
+    -- evidence fields. The checking and exported views share these owners.
+    normalizeMeasures owner measureSpec = do
+        ms <- traverse check (Ms.measMap measureSpec)
+        cms <- traverse check (Ms.cmeasMap measureSpec)
+        ims <- traverse check (Ms.imeas measureSpec)
+        pure (Ms.mkMSpec (M.elems ms) (M.elems cms) ims [])
+      where
+        check declaration =
+            TcMonad.setSrcSpan (GM.fSrcSpan (msName declaration)) $
+                kindCheckLogicalMeasure (isSrcImport owner) declaration
+
+    -- Preserve the existing export selection and source-pattern coordinates.
+    -- Out-of-scope dependency declarations were not resolved in this module.
+    publishMeasures canonical spec =
+        spec
+            { Ms.measures = map (publish (M.elems (Ms.measMap canonical))) (Ms.measures spec)
+            , Ms.cmeasures = map (publish (M.elems (Ms.cmeasMap canonical))) (Ms.cmeasures spec)
+            , Ms.imeasures = map (publish (Ms.imeas canonical)) (Ms.imeasures spec)
+            }
+      where
+        publish normalized original =
+            case L.find
+                ( \declaration ->
+                    msName declaration == msName original
+                        && F.loc (msName declaration) == F.loc (msName original)
+                        && F.locE (msName declaration) == F.locE (msName original)
+                        && map ctor (msEqns declaration) == map ctor (msEqns original)
+                )
+                normalized of
+                Just declaration -> first (F.atLoc (msSort original) . Bare.specToBare) declaration
+                Nothing -> original
+
+    -- A catalog is only a projection of the normalized declarations, never a
+    -- second kind-checking authority with a divergent type-variable telescope.
+    prepareLogicalCatalog measureSpec = (logicalTypes, instances)
+      where
+        measures = map (fmap (const ())) (M.elems (Ms.measMap measureSpec)) ++ M.elems (Ms.cmeasMap measureSpec)
+        logicalTypes = [(lhNameToResolvedSymbol (F.val (msName declaration)), msKind declaration, msSort declaration) | declaration <- declarations]
+        declarations =
+            [ declaration
+            | declaration <- measures
+            , msKind declaration /= MsLifted
+            ]
+        instanceTypes =
+            [ case msEqns measure of
+                equation : _ -> (measure, Ghc.dataConTyCon (ctor equation))
+                [] -> panic Nothing "Instance measure has no defining constructor"
+            | measure <- Ms.imeas measureSpec
+            , msKind measure `notElem` [MsLifted, MsReflect]
+            ]
+        instances = [(lhNameToResolvedSymbol (F.val (msName measure)), receiver, msSort measure) | (measure, receiver) <- instanceTypes]
+
+    elaborateWithCatalog globals measureSpec (logicalTypes, instances) extraSources captures collect ty =
+      elaborateSpecTypeWithPrimitives
+        (bscope cfg)
+        (maybe (FC.ElabFlags False False) (\solver -> FC.mkElabFlags solver False) (smtsolver cfg))
+        (sourceNativeEnv cfg (Bare.tcAdts tycEnv0))
+        embs
+        logicalTypes
+        projections
+        instances
+        sources
+        (map snd captures)
+        collect
+        coreToLgWith
+        ty
+      where
+        projections =
+          [ (lhNameToResolvedSymbol (F.val (msName declaration)), alternatives)
+          | declaration <- M.elems (Ms.measMap measureSpec)
+          , msKind declaration `notElem` [MsLifted, MsReflect]
+          , not (null (msEqns declaration))
+          , Just alternatives <- [traverse fieldProjection (msEqns declaration)]
+          ]
+        fieldProjection equation
+          | E (F.EVar field) <- body equation
+          , length (binds equation) == length (Ghc.dataConOrigArgTys (ctor equation))
+          , Just index <- L.elemIndex field (map fst (binds equation)) =
+              Just (ctor equation, index)
+          | otherwise = Nothing
+        measureNames = M.keys (Ms.measMap measureSpec) ++ M.keys (Ms.cmeasMap measureSpec) ++ map msName (Ms.imeas measureSpec)
+        requested = F.syms ty
+        -- Match resolved names before loading their Ids. This also covers
+        -- source operations used only in refinements, not in the module body.
+        referencedIds =
+          [ identifier
+          | entry <- RdrName.globalRdrEnvElts globals
+          , let owner = RdrName.greName entry
+          , F.symbol owner `S.member` requested || GM.dropModuleUnique (F.symbol owner) `S.member` requested
+          , Just identifier <- [Bare.lookupGhcId env owner]
+          ]
+        sources =
+          [ (name, identifier)
+          | identifier <- referencedIds ++ _giDefVars src ++ _giImpVars src ++ _giUseVars src ++ extraSources
+          , name <- [F.symbol identifier, GM.dropModuleUnique (F.symbol identifier)]
+          ]
+            ++ [ (lhNameToResolvedSymbol (F.val name), identifier)
+               | name <- measureNames
+               , Just identifier <- [maybeReflectedLHName (F.val name) >>= Bare.lookupGhcId env]
+               ]
+            ++ [(F.symbol dc, Ghc.dataConWrapId dc) | dc <- M.keys boxes]
+            ++ concat
+              [ [(name, identifier), (F.symbol identifier, identifier)]
+              | (name, identifier) <- reverse captures
+              , Ghc.isId identifier
+              ]
+
+    lexicalCaptures owner =
+      maybe [] Bare.lvdLclEnv $
+        Ghc.lookupNameEnv (Bare.lvNames (Bare.reLocalVars env)) (Ghc.getName owner)
+
+    -- Imported method/default-method schemas are interpreted above, but only
+    -- an actual local Core owner has a body context in which to check a query.
+    -- Keep dependency assumptions distinct from newly verified source bodies.
+    refinementOwners = S.fromList (letVars (_giCbs src))
+    moduleScope = VarSet.mkVarSet (Ghc.bindersOfBinds (_giCbs src))
+
+    collectRefinement owners collectSupport ref owner captures location logicalEmbeddings expression queryType declarations = do
+      collectSupport logicalEmbeddings expression queryType declarations
+      when (checkRefinements cfg && owner `S.member` owners) $
+        let coreType = Ghc.exprType expression
+            lexical = VarSet.mkVarSet captures
+            hasUnscopedTypeVariables =
+              not . VarSet.isEmptyVarSet $
+                Ghc.tyCoVarsOfType coreType `VarSet.minusVarSet` lexical
+            hasUnscopedEvidence =
+              VarSet.anyVarSet GM.isEvidenceVar $
+                Ghc.exprFreeVars expression `VarSet.minusVarSet`
+                  (lexical `VarSet.unionVarSet` moduleScope)
+         in -- GHC has checked this expression against the complete declared
+            -- telescope. Its bound class dictionaries are ordinary lambda
+            -- inputs checked by cconsE, not escaping evidence. Module-level
+            -- dictionary definitions are available through the source checking
+            -- environment; unlike free local evidence, they need no query binder.
+            if not hasUnscopedTypeVariables && not hasUnscopedEvidence
+              then
+                Ghc.liftIO $
+                  IORef.modifyIORef'
+                    ref
+                    (RefinementCheck owner expression (F.atLoc location queryType) logicalEmbeddings :)
+              else
+                panic
+                  (Just (GM.sourcePos2SrcSpan (F.loc location) (F.locE location)))
+                  "Cannot check a refinement telescope with unscoped type variables or evidence"
+
+    elaborateSignatures globals collectSupport measures logicalCatalog sourceAssumptions si = do
       ref <- Ghc.liftIO $ IORef.newIORef []
-      logger <- Ghc.getLogger
-      let collect signatureType e queryType =
-            let coreType = Ghc.exprType e
-                (typeBinders, constraints, _) = TcType.tcSplitSigmaTy coreType
-                hasFreeTypeVariables = not . VarSet.isEmptyVarSet $ Ghc.tyCoVarsOfType coreType
-                hasEvidenceVariables = VarSet.anyVarSet GM.isEvidenceVar (Ghc.exprFreeVars e)
-            in when (null typeBinders && null constraints && not hasFreeTypeVariables && not hasEvidenceVariables) $
-                 Ghc.liftIO $ IORef.modifyIORef' ref
-                 (RefinementCheck e (F.atLoc signatureType queryType) :)
-          checkSignature (x, signatureType) = do
-            oldChecks <- Ghc.liftIO $ IORef.readIORef ref
-            -- Conversion helpers currently report unsupported Liquid-only
-            -- constructs with GhcException (via `todo`/`panic`), which
-            -- `tryMostM` deliberately does not catch.  Treat those as a
-            -- failed best-effort conversion as well.
-            -- Keep `tryTc` on the outside: if conversion panics after adding
-            -- wanted constraints, it must still get a chance to restore the
-            -- typechecker state before we continue with the module.
-            result <- if null (allTyVars (F.val signatureType))
-              then TcMonad.tryTc $ IOEnv.tryAllM $ TcMonad.discardWarnings $ TcMonad.discardConstraints $
-                traverse_
-                  (elaborateSpecTypeWith (collect signatureType) coreToLg simplifier)
-                  signatureType
-              else pure (Nothing, mempty)
-            case result of
-              (Just (Right ()), _) -> pure ()
-              _ -> do
-                -- Elaboration may have collected earlier refinements from the
-                -- same signature before encountering an unsupported one.
-                Ghc.liftIO $ IORef.writeIORef ref oldChecks
-                let warning = mkWarning
-                      (GM.sourcePos2SrcSpan (F.loc signatureType) (F.locE signatureType))
-                      (text $ "Cannot check refinements for " ++ F.showpp x ++
-                        ": not every predicate has a Haskell equivalent.")
-                Ghc.liftIO $ printWarning logger warning
-      -- Elaboration supplies the dependent lambda type for every refinement.
-      -- This is a best-effort pass: Liquid-only predicates are left to the
-      -- ordinary sort checker and reported with a warning.
-      mapM_ checkSignature (gsTySigs si)
+      let interpretSignature (owner, signatureType) =
+            TcMonad.setSrcSpan (GM.fSrcSpan signatureType) $ TcMonad.discardWarnings $
+              TcMonad.discardConstraints $
+                (owner,)
+                  <$> traverse
+                    (elaborateWithCatalog globals (Bare.meMeasureSpec measures) logicalCatalog sourceOwners captures (collectRefinement owners collectSupport ref owner (map snd captures) signatureType)
+                      . mapExprReft (const CoreToLogic.preserveDemand))
+                    signatureType
+            where
+              captures = lexicalCaptures owner
+          sourceOwners = map fst (gsTySigs si ++ gsAsmSigs si ++ sourceAssumptions)
+          owners = refinementOwners `S.union` S.fromList (map fst sourceAssumptions)
+      -- One typed interpretation yields both the published predicate and the
+      -- exact checking Core. Imported, already interpreted assumptions do not
+      -- pass through this source-syntax operation again.
+      signatures <- mapM interpretSignature (gsTySigs si)
+      assumptions <- mapM interpretSignature sourceAssumptions
       checks <- reverse <$> Ghc.liftIO (IORef.readIORef ref)
-      pure si { gsReftChecks = checks }
+      pure (si{gsTySigs = signatures, gsAsmSigs = gsAsmSigs si ++ assumptions, gsReftChecks = checks}, assumptions)
 
-    simplifier :: Ghc.CoreExpr -> Ghc.TcRn Ghc.CoreExpr
-    simplifier = pure -- no simplification
     allowTC  = typeclass cfg
     -- Specs with type and expression aliases expanded.
     mySpec2  = Bare.expand rtEnv (F.dummyPos "expand-mySpec2") mySpec1
+    declaredSpecs = M.insert name mySpec2 iSpecs2
     iSpecs2  = Bare.expand rtEnv (F.dummyPos "expand-iSpecs2") (M.fromList dependencySpecs)
     -- Environment for alias lookup and expansion.
     rtEnv    = Bare.makeRTEnv lenv name mySpec1' dependencySpecs
@@ -416,11 +686,13 @@ makeGhcSpec0 stratNames cfg ghcTyLookupEnv tcg instEnvs lenv localVars src lmap 
     -- Ready for alias expansion.
     mySpec1  = mySpec0 <> lSpec0
     -- This spec just has the 'ealiases' (with Haskell inlines) and 'dataDecls' fields.
-    lSpec0   = makeLiftedSpec0 cfg src embs lmap mySpec0
-    embs     = makeEmbeds          src ghcTyLookupEnv (mySpec0 : map snd dependencySpecs)
-    dm       = Bare.tcDataConMap tycEnv0
-    (dg0, datacons, tycEnv0) = makeTycEnv0   cfg name env embs mySpec2 iSpecs2
-    env      = Bare.makeEnv cfg ghcTyLookupEnv dataConIds tcg instEnvs localVars src lmap ((name, bareSpec) : dependencySpecs)
+    (lSpec0, inlineSupport) = makeLiftedSpec0 boxes cfg src embs lmap mySpec0
+    familyTyCons = uniqNub (_gsFiTcs src ++ [tc | dc <- M.keys boxes, let tc = Ghc.dataConTyCon dc, Ghc.isFamInstTyCon tc])
+    embs = makeEmbeds familyTyCons src ghcTyLookupEnv (mySpec0 : map snd dependencySpecs)
+    dm = Bare.tcDataConMap tycEnv0
+    (dg0, datacons, tycEnv0) = makeTycEnv0 (_gsTcs src) familyTyCons boxes cfg name env embs mySpec2 iSpecs2
+    env = Bare.makeEnv cfg ghcTyLookupEnv dataConIds tcg instEnvs localVars src lmap ((name, bareSpec) : dependencySpecs)
+
     -- check barespecs
     name     = F.notracepp ("ALL-SPECS" ++ zzz) $ _giTargetMod  src
     zzz      = F.showpp (fst <$> mspecs)
@@ -429,24 +701,44 @@ makeGhcSpec0 stratNames cfg ghcTyLookupEnv tcg instEnvs lenv localVars src lmap 
     dataConIds =
       [ Ghc.dataConWorkId dc
       | lhn <- S.toList usedDcs
-      , Just (Ghc.AConLike (Ghc.RealDataCon dc)) <-
-          [maybeReflectedLHName lhn >>= Resolve.lookupGhcTyThingFromName ghcTyLookupEnv]
+      , Just dc <- [resolvedDataCon ghcTyLookupEnv lhn]
       ]
 
+resolvedDataCon :: Bare.GHCTyLookupEnv -> LHName -> Maybe Ghc.DataCon
+resolvedDataCon env name = do
+  source <- getLHGHCName name `mplus` maybeReflectedLHName name
+  case Resolve.lookupGhcTyThingFromName env source of
+    Just (Ghc.AConLike (Ghc.RealDataCon dc)) -> Just dc
+    _ -> Nothing
 
 collectAllDataCons :: Ghc.CoreProgram -> [BareSpec] -> S.HashSet LHName
 collectAllDataCons cbs =
-    S.unions .  (castDCs :) . (usedInCoreDCs :) . map usedDataCons
+    S.unions .  (castDCs :) . (usedInCoreDCs :) . map specDataCons
   where
-    -- Constraint generation might inserts data constructors which are not
-    -- present in the original program.
-    -- See Note [Type classes with a single method] in
-    -- Haskell.Liquid.Constraint.Generate
+    -- Imported constructor declarations need their actual source boxer even
+    -- when neither Core nor a logical expression mentions the constructor.
+    specDataCons spec = usedDataCons spec `S.union` S.fromList
+      [ val (DataDecl.dcName dc)
+      | declaration <- dataDecls spec
+      , dc <- Mb.fromMaybe [] (tycDCons declaration)
+      ]
+
+    -- Casts and coercion evidence can use a constructor's representation
+    -- without a term-level constructor occurrence. Discover the declarations
+    -- through the same Core coercions, including nested newtype axioms.
     castDCs =
       S.fromList $
       map makeLogicLHNameFromDC $
-      Mb.mapMaybe isClassConCoDC $
+      concatMap coercionDataCons $
       collectCastCoercions cbs
+
+    coercionDataCons co =
+        Mb.maybeToList (fst <$> CoreToLogic.newtypeCoercionDataCon co)
+            ++ [ dc
+               | tc <- nonDetEltsUniqSet (tyConsOfType (Ghc.CoercionTy co))
+               , Ghc.isNewTyCon tc
+               , Just dc <- [Ghc.tyConSingleDataCon_maybe tc]
+               ]
 
     makeLogicLHNameFromDC dc =
       let n = Ghc.getName dc
@@ -467,34 +759,18 @@ collectAllDataCons cbs =
           _ -> []
       ]
 
-    isClassConCoDC :: Ghc.Coercion -> Maybe Ghc.DataCon
-    -- See Note [Type classes with a single method] in
-    -- Haskell.Liquid.Constraint.Generate
-    isClassConCoDC co
-      | Ghc.Pair _t1 t2 <- Ghc.coercionKind co
-      , Ghc.isClassPred t2
-      , (tc,_ts) <- Ghc.splitTyConApp t2
-      , [dc]    <- Ghc.tyConDataCons tc
-      = Just dc
-      | otherwise
-      = Nothing
-
-    collectCastCoercions :: [Ghc.CoreBind] -> [Ghc.Coercion]
-    collectCastCoercions = gos [] . concatMap Ghc.rhssOfBind
-      where
-        go acc e = case e of
-          Ghc.Var{} -> acc
-          Ghc.Lit{} -> acc
-          Ghc.Type{} -> acc
-          Ghc.Coercion{} -> acc
-          Ghc.App e1 e2 -> go (go acc e1) e2
-          Ghc.Cast e1 c -> go (c:acc) e1
-          Ghc.Tick _ e1 -> go acc e1
-          Ghc.Lam _ e1 -> go acc e1
-          Ghc.Let b e1 -> go (gos acc (Ghc.rhssOfBind b)) e1
-          Ghc.Case e1 _ _ alts -> go (gos acc (Ghc.rhssOfAlts alts)) e1
-
-        gos acc = foldr ($) acc . map (flip go)
+collectCastCoercions :: [Ghc.CoreBind] -> [Ghc.Coercion]
+collectCastCoercions = coreVisitor visitor () []
+ where
+  visitor =
+    CoreVisitor
+      { envF = const
+      , bindF = const const
+      , exprF = \_ acc expression -> case expression of
+          Ghc.Cast _ co -> co : acc
+          Ghc.Coercion co -> co : acc
+          _ -> acc
+      }
 
 
 makeImports :: [(ModName, Ms.BareSpec)] -> [(F.Symbol, F.Sort)]
@@ -502,10 +778,10 @@ makeImports specs = concatMap (expSigs . snd) specs'
   where specs' = filter (isSrcImport . fst) specs
 
 
-makeEmbeds :: GhcSrc -> Bare.GHCTyLookupEnv -> [Ms.BareSpec] -> F.TCEmb Ghc.TyCon
-makeEmbeds src env
+makeEmbeds :: [Ghc.TyCon] -> GhcSrc -> Bare.GHCTyLookupEnv -> [Ms.BareSpec] -> F.TCEmb Ghc.TyCon
+makeEmbeds familyTyCons src env
   = addBoolEmbed
-  . Bare.addClassEmbeds (_gsCls src) (_gsFiTcs src)
+  . Bare.addClassEmbeds (_gsCls src) familyTyCons
   . mconcat
   . map (makeTyConEmbeds env)
 
@@ -546,6 +822,24 @@ addDefinesToExprAliases env lmap mySpec =
       else [ e | (_, xl) <- M.toList (lmSymDefs lmap), let e = lmapEAlias xl ]
     }
 
+{- | Export the generated declarations that the verified signatures and equations
+refer to. Reconstructing these in a client is insufficient: private imported
+constructors need not occur in its Core, and its higher-order setting may
+differ from the producer's. Preserve the actual measure definitions, including
+their constructor equations, rather than exporting just uninterpreted sorts.
+Ordinary measures retain their existing ordering and precedence.
+-}
+exportMeasureClosure :: Bare.MeasEnv -> [BareMeasure] -> [BareMeasure]
+exportMeasureClosure env measures = generated ++ filter absent measures
+  where
+    generated =
+        [ Bare.measureToBare $ first (F.atLoc $ msName m) m
+        | m <- L.sortOn msName $ M.elems $ measMap $ Bare.meMeasureSpec env
+        , msKind m `elem` [MsSelector, MsChecker]
+        ]
+    names = S.fromList $ val . msName <$> generated
+    absent m = not $ val (msName m) `S.member` names
+
 --------------------------------------------------------------------------------
 -- | [NOTE]: REFLECT-IMPORTS
 --
@@ -558,9 +852,9 @@ addDefinesToExprAliases env lmap mySpec =
 --   as we need the inlines and aliases to properly `expand` the SpecTypes.
 --------------------------------------------------------------------------------
 makeLiftedSpec1 :: Config -> GhcSrc -> Bare.TycEnv -> LogicMap -> Ms.BareSpec
-                -> Ms.BareSpec
-makeLiftedSpec1 config src tycEnv lmap mySpec = mempty
-  { Ms.measures  = Bare.makeHaskellMeasures config src tycEnv lmap mySpec }
+                -> (Ms.BareSpec, LogicSupport)
+makeLiftedSpec1 config src tycEnv lmap mySpec = (mempty{Ms.measures = measures}, support)
+  where (measures, support) = Bare.makeHaskellMeasures config src tycEnv lmap mySpec
 
 --------------------------------------------------------------------------------
 -- | [NOTE]: LIFTING-STAGES
@@ -575,13 +869,14 @@ makeLiftedSpec1 config src tycEnv lmap mySpec = mempty
 -- that are needed for subsequent stages of the lifting. Here is relevant to
 -- [NOTE:EXPRESSION-ALIASES].
 --------------------------------------------------------------------------------
-makeLiftedSpec0 :: Config -> GhcSrc -> F.TCEmb Ghc.TyCon -> LogicMap -> Ms.BareSpec
-                -> Ms.BareSpec
-makeLiftedSpec0 cfg src embs lmap mySpec = mempty
-  { Ms.ealiases  = lmapEAlias . snd <$> Bare.makeHaskellInlines cfg src embs lmap mySpec
+makeLiftedSpec0 :: M.HashMap Ghc.DataCon ConstructorBox -> Config -> GhcSrc -> F.TCEmb Ghc.TyCon -> LogicMap -> Ms.BareSpec
+                -> (Ms.BareSpec, LogicSupport)
+makeLiftedSpec0 boxes cfg src embs lmap mySpec = (mempty
+  { Ms.ealiases  = lmapEAlias . snd <$> inlines
   , Ms.dataDecls = Bare.makeHaskellDataDecls mySpec tcs
-  }
+  }, support)
   where
+    (inlines, support) = Bare.makeHaskellInlines boxes cfg src embs lmap mySpec
     tcs          = uniqNub (_gsTcs src ++ refTcs)
     refTcs       = reflectedTyCons embs cbs  mySpec
     cbs          = _giCbs       src
@@ -923,13 +1218,13 @@ getSizeFuns decl
 
 ------------------------------------------------------------------------------------------
 makeSpecRefl :: GhcSrc -> Bare.ModSpecs -> Bare.Env -> ModName -> GhcSpecSig -> Bare.TycEnv
-             -> Bare.Lookup GhcSpecRefl
+             -> Bare.Lookup (GhcSpecRefl, LogicSupport)
 ------------------------------------------------------------------------------------------
 makeSpecRefl src specs env name sig tycEnv = do
   autoInst <- makeAutoInst env mySpec
   rwr      <- makeRewrite env mySpec
   rwrWith  <- makeRewriteWith env mySpec
-  xtes     <- Bare.makeHaskellAxioms src env tycEnv lmap sig mySpec
+  (xtes, support) <- Bare.makeHaskellAxioms src env tycEnv lmap sig mySpec
   asmReflAxioms <- Bare.makeAssumeReflectAxioms src env tycEnv sig mySpec
   let otherAxioms = thd3 <$> asmReflAxioms
   let myAxioms =
@@ -947,7 +1242,7 @@ makeSpecRefl src specs env name sig tycEnv = do
              (GM.sourcePosSrcSpan $ loc actSym)
              (pprint $ val actSym)
              (text errorMsg) :: Error)
-    Nothing -> return SpRefl
+    Nothing -> return (SpRefl
       { gsLogicMap   = lmap
       , gsAutoInst   = autoInst
       , gsImpAxioms  = impAxioms
@@ -956,7 +1251,7 @@ makeSpecRefl src specs env name sig tycEnv = do
       , gsHAxioms    = F.notracepp "gsHAxioms" $ xtes ++ asmReflAxioms
       , gsRewrites   = rwr
       , gsRewritesWith = rwrWith
-      }
+      }, support)
   where
     mySpec       = M.lookupDefault mempty name specs
     lmap         = Bare.reLMap env
@@ -966,15 +1261,16 @@ makeSpecRefl src specs env name sig tycEnv = do
     anyNonReflFn = L.find notInReflOnes (Ms.asmReflectSigs mySpec)
 
 ------------------------------------------------------------------------------------------
--- | @updateReflSpecSig@ uses the information about reflected functions (included the opaque ones) to update the
---   "assumed" signatures.
+-- | Add callable identities for reflected functions, including opaque ones,
+--   separately from explicitly trusted assumptions.
 ------------------------------------------------------------------------------------------
-addReflSigs :: Bare.Env -> ModName -> BareRTEnv -> Bare.MeasEnv -> GhcSpecRefl -> GhcSpecSig -> GhcSpecSig
+addReflSigs :: Bare.Env -> Bare.SigEnv -> ModName -> BareRTEnv -> Bare.MeasEnv -> GhcSpecRefl -> GhcSpecSig -> GhcSpecSig
 ------------------------------------------------------------------------------------------
-addReflSigs env name rtEnv measEnv refl sig =
-  sig { gsRefSigs = F.notracepp ("gsRefSigs for " ++ F.showpp name) $ map expandReflectedSignature reflSigs
-      , gsAsmSigs = F.notracepp ("gsAsmSigs for " ++ F.showpp name) combinedOpaqueAndReflectedAsmSigs
-      }
+addReflSigs env sigEnv name rtEnv measEnv refl sig =
+    sig
+        { gsRefSigs = F.notracepp ("gsRefSigs for " ++ F.showpp name) $ map expandReflectedSignature (reflSigs ++ opaqueSigs)
+        , gsAsmSigs = F.notracepp ("gsAsmSigs for " ++ F.showpp name) $ filter notReflected (gsAsmSigs sig)
+        }
   where
     -- We make sure that the reflected functions are excluded from `gsAsmSigs`, except for the signatures of
     -- actual functions in assume-reflect. The latter are added here because 1. it's what makes tests work
@@ -982,16 +1278,48 @@ addReflSigs env name rtEnv measEnv refl sig =
     -- signature of the actual function was asserted and not assumed, we do not put our new signature for the actual function
     -- in `gsTySigs` (which is for asserted signatures). Indeed, the new signature will *always* be an assumption since we
     -- add the extra post-condition that the actual and pretended function behave in the same way.
-    -- Also, we add here the strengthened post-conditions relative to opaque reflections.
-    -- We may redefine assumptions because of opaque reflections, so we just take the union of maps and ignore duplicates.
-    -- Based on `M.union`'s handling of duplicates, the leftmost elements in the chain of `M.union` will precede over those
-    -- after, which is why we put the opaque reflection first in the chain. The signatures for opaque reflections are created
-    -- by strengthening the post-conditions, as in (assume-)reflection.
-    combinedOpaqueAndReflectedAsmSigs = M.toList $
-        M.fromList (createUpdatedSpecs . fst <$> Bare.meOpaqueRefl measEnv)
-        `M.union` M.fromList (filter notReflected (gsAsmSigs sig))
-    -- Strengthen the post-condition of each of the opaque reflections.
-    createUpdatedSpecs var = (var, Bare.aty <$> Bare.strengthenSpecWithMeasure sig env var (Bare.varLocSym var))
+    -- Opaque reflection adds the source function's logical identity, not a
+    -- trusted copy of its authored guarantee. It follows the same callable
+    -- admission path as reflection; explicit assumptions remain separate.
+    opaqueSigs = createUpdatedSpecs <$> Misc.nubHashOn id (localOpaqueOwners ++ map fst selectedOpaqueOwners)
+    localOpaqueOwners = fst <$> Bare.meOpaqueRefl measEnv
+    -- Compiled interfaces retain opaque declarations and their original GHC
+    -- names, but not the source annotation that generated them. Recover only
+    -- those selected opaque owners, using the same callable strengthening as
+    -- local opaque reflection; ordinary logical measures acquire no identity.
+    selectedOpaqueOwners =
+        [ (owner, declaration)
+        | declaration <- M.elems (measMap $ Bare.meMeasureSpec measEnv)
+        , msKind declaration == MsReflect
+        , Just originalName <- [maybeReflectedLHName $ val $ msName declaration]
+        , Just owner <- [Bare.lookupGhcId env originalName]
+        , isAvailableImportedCallable env owner || owner `S.member` selectedSignatureOwners
+        ]
+    selectedSignatureOwners = S.fromList $ map fst (gsTySigs sig ++ gsAsmSigs sig)
+    opaqueInputSignatures =
+        [ (owner, checkedInput owner declaration)
+        | (owner, declaration) <- selectedOpaqueOwners
+        , not (owner `S.member` selectedSignatureOwners)
+        ]
+    checkedInput owner declaration
+        | resolved
+        , supported
+        , nominal =
+            aligned
+        | otherwise =
+            uError (ErrTySpec (GM.fSrcSpan $ msName declaration) (Just "opaque source input") "opaque reflection" (F.pprint $ msSort declaration) (text "Opaque callable requires resolved, nominally compatible inputs and supported native result-domain metadata"))
+      where
+        resolved = Ms.resolvedSourceInputType (msSort declaration)
+        supported = Ms.supportedOpaqueResult (ty_res $ toRTypeRep $ msSort declaration)
+        -- Imported LH coordinates deliberately reuse synthetic GHC uniques.
+        -- Restore their joint source ownership before native nominal equality;
+        -- the original schema has already passed the no-hole premise above.
+        aligned = Bare.makePluggedSig (typeclass $ getConfig env) name (Bare.sigEmbs sigEnv) (Bare.sigTyRTyMap sigEnv) mempty (Bare.HsTV owner) (F.atLoc (msName declaration) (msSort declaration))
+        declaredType = toType False $ val aligned
+        actualType = toType False $ (ofType $ Ghc.varType owner :: SpecType)
+        nominal = Ghc.eqType declaredType actualType
+    callableSig = sig{gsAsmSigs = gsAsmSigs sig ++ opaqueInputSignatures}
+    createUpdatedSpecs var = (var, Bare.aty <$> Bare.strengthenSpecWithMeasure callableSig env var (Bare.varLocSym var))
     -- See T1738. We need to expand and qualify any reflected signature /here/, after any
     -- relevant binder has been detected and \"promoted\". The problem stems from the fact that any input
     -- 'BareSpec' will have a 'reflects' list of binders to reflect under the form of an opaque 'Var', that
@@ -1001,15 +1329,15 @@ addReflSigs env name rtEnv measEnv refl sig =
     expandReflectedSignature :: (Ghc.Var, LocSpecType) -> (Ghc.Var, LocSpecType)
     expandReflectedSignature = fmap (Bare.expand rtEnv (F.dummyPos "expand-refSigs"))
 
-    reflSigs = [ (x, t) | (x, t, _) <- gsHAxioms refl ]
+    reflSigs = [(x, t) | (x, t, _) <- gsHAxioms refl]
     -- Get the set of all the actual functions (in assume-reflects)
-    actualFnsInAssmRefl     = S.fromList $ fst <$> gsAsmReflects sig
-    isActualFn           x  = S.member x actualFnsInAssmRefl
+    actualFnsInAssmRefl = S.fromList $ fst <$> gsAsmReflects sig
+    isActualFn x = S.member x actualFnsInAssmRefl
     -- Get all the variables from the axioms that are not actual functions (in assume-reflects)
-    notReflActualTySigs     = L.filter (not . isActualFn . fst) reflSigs
+    notReflActualTySigs = L.filter (not . isActualFn . fst) reflSigs
     -- Get the list of reflected elements. We do not count actual functions in assume reflect as reflected
-    reflected               = S.fromList $ fst <$> notReflActualTySigs
-    notReflected xt         = fst xt `notElem` reflected
+    reflected = S.fromList $ fst <$> notReflActualTySigs
+    notReflected xt = fst xt `notElem` reflected
 
 -- | Resolves the binders of the @ple@ and @automatic-instances@ annotations.
 --
@@ -1029,40 +1357,57 @@ makeAutoInst env spec
 
 
 ----------------------------------------------------------------------------------------
-makeSpecSig :: [Ghc.Name] -> Config -> ModName -> Ms.BareSpec -> Bare.ModSpecs -> Bare.Env -> Bare.SigEnv -> Bare.TycEnv -> Bare.MeasEnv -> [Ghc.CoreBind]
-            -> Bare.Lookup ([RInstance LocBareType], GhcSpecSig)
+makeSpecSig
+  :: ([RInstance LocBareType], DEnv Ghc.Var LocSpecType)
+  -> [Ghc.Name]
+  -> Config
+  -> ModName
+  -> Ms.BareSpec
+  -> Bare.ModSpecs
+  -> Bare.Env
+  -> Bare.SigEnv
+  -> Bare.TycEnv
+  -> Bare.MeasEnv
+  -> [Ghc.CoreBind]
+  -> Bare.Lookup ([RInstance LocBareType], GhcSpecSig, [(Ghc.Var, (Int, LocSpecType))], [(Ghc.Var, LocSpecType)])
 ----------------------------------------------------------------------------------------
-makeSpecSig stratNames cfg name mySpec specs env sigEnv tycEnv measEnv cbs = do
+makeSpecSig (instances, dicts) stratNames cfg name mySpec specs env sigEnv tycEnv measEnv cbs = do
   mySigs     <- makeTySigs  env sigEnv name mySpec
-  aSigs      <- F.notracepp ("makeSpecSig aSigs " ++ F.showpp name) $ makeAsmSigs env sigEnv name allSpecs
+  (sourceAssumptions, aSigs) <- F.notracepp ("makeSpecSig aSigs " ++ F.showpp name) $ makeAsmSigs env sigEnv name allSpecs
   let asmSigs =  Bare.tcSelVars tycEnv ++ aSigs
-  let tySigs  = strengthenSigs . concat $
-                  [ [(v, (0, t)) | (v, t,_) <- mySigs                         ]   -- NOTE: these weights are to priortize
-                  , [(v, (1, t)) | (v, t  ) <- makeMthSigs measEnv            ]   -- user defined sigs OVER auto-generated
-                  , [(v, (2, t)) | (v, t  ) <- makeInlSigs env rtEnv allSpecs ]   -- during the strengthening, i.e. to KEEP
-                  , [(v, (3, t)) | (v, t  ) <- makeMsrSigs env rtEnv allSpecs ]   -- the binders used in USER-defined sigs
-                  ]                                                               -- as they appear in termination metrics
+  let tySigs =
+        strengthenSigs . concat $
+          [ [(v, (0, t)) | (v, t, _) <- mySigs] -- NOTE: these weights are to priortize
+          , [(v, (1, t)) | (v, t) <- makeMthSigs measEnv] -- user defined sigs OVER auto-generated
+          ] -- as they appear in termination metrics
   newTys     <-  makeNewTypes env sigEnv allSpecs
   relation   <-  makeRelation env name sigEnv (Ms.relational mySpec)
   asmRel     <-  makeRelation env name sigEnv (Ms.asmRel mySpec)
-  return (instances, SpSig
-    { gsTySigs   = tySigs
-    , gsStratCtos = stratNames
-    , gsAsmSigs  = asmSigs
-    , gsAsmReflects = bimap getVar getVar <$> concatMap (asmReflectSigs . snd) allSpecs
-    , gsRefSigs  = []
-    , gsDicts    = dicts
-    -- , gsMethods  = if noclasscheck cfg then [] else Bare.makeMethodTypes dicts (Bare.meClasses  measEnv) cbs
-    , gsMethods  = if noclasscheck cfg then [] else Bare.makeMethodTypes (typeclass cfg) dicts (Bare.meClasses  measEnv) cbs
-    , gsInSigs   = mempty
-    , gsNewTypes = newTys
-    , gsTexprs   = [ (v, t, es) | (v, t, Just es) <- mySigs ]
-    , gsRelation = relation
-    , gsAsmRel   = asmRel
-    , gsReftChecks = []
-    })
+  return
+    ( instances
+    , SpSig
+        { gsTySigs = tySigs
+        , gsStratCtos = stratNames
+        , gsAsmSigs = asmSigs
+        , gsAsmReflects = bimap getVar getVar <$> concatMap (asmReflectSigs . snd) allSpecs
+        , gsRefSigs = []
+        , gsDicts = dicts
+        , -- , gsMethods  = if noclasscheck cfg then [] else Bare.makeMethodTypes dicts (Bare.meClasses  measEnv) cbs
+          gsMethods = if noclasscheck cfg then [] else Bare.makeMethodTypes (Bare.sigEmbs sigEnv) (typeclass cfg) dicts (Bare.meClasses measEnv) cbs
+        , gsInSigs = mempty
+        , gsNewTypes = newTys
+        , gsTexprs = [(v, t, es) | (v, t, Just es) <- mySigs]
+        , gsRelation = relation
+        , gsAsmRel = asmRel
+        , gsReftChecks = []
+        }
+    , generatedSigs
+    , sourceAssumptions
+    )
   where
-    (instances, dicts) = Bare.makeSpecDictionaries env sigEnv (name, mySpec) (M.toList specs)
+    generatedSigs =
+      [(v, (2, t)) | (v, t) <- makeInlSigs env rtEnv allSpecs]
+        ++ [(v, (3, t)) | (v, t) <- makeMsrSigs env rtEnv allSpecs]
     allSpecs   = (name, mySpec) : M.toList specs
     rtEnv      = Bare.sigRTEnv sigEnv
     getVar sym = case Bare.lookupGhcIdLHName env sym of
@@ -1131,10 +1476,16 @@ checkDuplicateSigs xts = case Misc.uniqueByKey symXs  of
     symXs = [ (F.symbol x, F.loc t) | (x, t) <- xts ]
 
 
-makeAsmSigs :: Bare.Env -> Bare.SigEnv -> ModName -> [(ModName, Ms.BareSpec)] -> Bare.Lookup [(Ghc.Var, LocSpecType)]
+-- Keep the selected declaration's origin until source elaboration. A local
+-- assumption can name an imported function; its Var's module is not its origin.
+makeAsmSigs :: Bare.Env -> Bare.SigEnv -> ModName -> [(ModName, Ms.BareSpec)] -> Bare.Lookup ([(Ghc.Var, LocSpecType)], [(Ghc.Var, LocSpecType)])
 makeAsmSigs env sigEnv myName specs = do
-  raSigs <- rawAsmSigs env myName specs
-  return [ (x, t) | (name, x, bt) <- raSigs, let t = Bare.cookSpecType env sigEnv name (Bare.LqTV x) bt ]
+    raSigs <- rawAsmSigs env myName specs
+    let (authored, imported) = L.partition (\(origin, _, _) -> origin == myName) raSigs
+        cook variables (origin, x, bt) = (x, Bare.cookSpecType env sigEnv origin (variables x) bt)
+    -- Authored predicates enter GHC with the named function's actual type
+    -- variables and kinds. Imported schemas retain their logical coordinates.
+    return (map (cook Bare.HsTV) authored, map (cook Bare.LqTV) imported)
 
 rawAsmSigs :: Bare.Env -> ModName -> [(ModName, Ms.BareSpec)] -> Bare.Lookup [(ModName, Ghc.Var, LocBareType)]
 rawAsmSigs env myName specs = do
@@ -1208,47 +1559,62 @@ takeBiggest :: (Ord b) => (a -> b) -> [a] -> Maybe a
 takeBiggest _ []  = Nothing
 takeBiggest f xs  = Just $ L.maximumBy (compare `on` f) xs
 
-allAsmSigs :: Bare.Env -> ModName -> [(ModName, Ms.BareSpec)] ->
-              Bare.Lookup [(Ghc.Var, [(Bool, ModName, LocBareType)])]
+allAsmSigs ::
+    Bare.Env ->
+    ModName ->
+    [(ModName, Ms.BareSpec)] ->
+    Bare.Lookup [(Ghc.Var, [(Bool, ModName, LocBareType)])]
 allAsmSigs env myName specs = do
-  let aSigs = [ (name, locallyDefined, x, t) | (name, spec) <- specs
-                                   , (locallyDefined, x, t) <- getAsmSigs myName name spec ]
-  vSigs    <- forM aSigs $ \(name, locallyDefined, x, t) -> do
-                v <- Bare.lookupGhcIdLHName env x
-                return (v, (locallyDefined, name, t))
-  return $ Misc.groupList
-    [ (v, z) | (v, z) <- vSigs
-      -- TODO: we require signatures to be in scope because LH includes them in
-      -- the environment of contraints sometimes. The criteria to add bindings to
-      -- constraints should account instead for what logic functions are used in
-      -- the constraints, which should be easier to do when precise renaming has
-      -- been implemented for expressions and reflected functions.
-    , isUsedExternalVar v ||
-      isInScope v ||
-      isNonTopLevelVar v -- Keep assumptions about non-top-level bindings
-    ]
+    let aSigs =
+            [ (name, locallyDefined, x, t)
+            | (name, spec) <- specs
+            , (locallyDefined, x, t) <- getAsmSigs myName name spec
+            ]
+    vSigs <- forM aSigs $ \(name, locallyDefined, x, t) -> do
+        v <- Bare.lookupGhcIdLHName env x
+        return (v, (locallyDefined, name, t))
+    return $
+        Misc.groupList
+            [ (v, z)
+            | (v, z@(locallyDefined, _, _)) <- vSigs
+            , -- TODO: we require signatures to be in scope because LH includes them in
+            -- the environment of contraints sometimes. The criteria to add bindings to
+            -- constraints should account instead for what logic functions are used in
+            -- the constraints, which should be easier to do when precise renaming has
+            -- been implemented for expressions and reflected functions.
+            locallyDefined || isAvailableImportedCallable env v
+            ]
+
+{- | Share the source-callable selection boundary between imported contracts
+and opaque callable identities. GHC interface availability alone is broader
+than the source environment whose contracts have been retained.
+-}
+isAvailableImportedCallable :: Bare.Env -> Ghc.Var -> Bool
+isAvailableImportedCallable env v =
+    isUsedExternalVar v || isInScope v || isNonTopLevelVar v
   where
     isUsedExternalVar :: Ghc.Var -> Bool
     isUsedExternalVar v = case Ghc.idDetails v of
-      Ghc.DataConWrapId dc ->
-        Ghc.getName v `Ghc.elemNameSet` Bare.reUsedExternals env
-         ||
-        Ghc.getName (Ghc.dataConWorkId dc) `Ghc.elemNameSet` Bare.reUsedExternals env
-      _ ->
-        Ghc.getName v `Ghc.elemNameSet` Bare.reUsedExternals env
+        Ghc.DataConWrapId dc ->
+            Ghc.getName v `Ghc.elemNameSet` Bare.reUsedExternals env
+                || Ghc.getName (Ghc.dataConWorkId dc) `Ghc.elemNameSet` Bare.reUsedExternals env
+        _ ->
+            Ghc.getName v `Ghc.elemNameSet` Bare.reUsedExternals env
 
     isInScope :: Ghc.Var -> Bool
     isInScope v0 =
-      let inScope v = not $ null $
-            Ghc.lookupGRE_Name
-              (Ghc.tcg_rdr_env $ Bare.reTcGblEnv env)
-              (Ghc.getName v)
-       in -- Names of data constructors are not found in the variable namespace
-          -- so we look them instead in the data constructor namespace.
-          case Ghc.idDetails v0 of
-            Ghc.DataConWrapId dc -> inScope dc
-            Ghc.DataConWorkId dc -> inScope dc
-            _ -> inScope v0
+        let inScope v =
+                not $
+                    null $
+                        Ghc.lookupGRE_Name
+                            (Ghc.tcg_rdr_env $ Bare.reTcGblEnv env)
+                            (Ghc.getName v)
+         in -- Names of data constructors are not found in the variable namespace
+            -- so we look them instead in the data constructor namespace.
+            case Ghc.idDetails v0 of
+                Ghc.DataConWrapId dc -> inScope dc
+                Ghc.DataConWorkId dc -> inScope dc
+                _ -> inScope v0
 
     isNonTopLevelVar = Mb.isNothing . Ghc.nameModule_maybe . Ghc.getName
 
@@ -1350,33 +1716,55 @@ mkNewTypeInvariant tc dc dcT l = do
     dcArgTys = let (_, _, ts, _, _) = bkArrowDeep dcT in ts
 
 ------------------------------------------------------------------------------------------
-makeSpecData :: GhcSrc -> Bare.Env -> Bare.SigEnv -> Bare.MeasEnv -> GhcSpecSig -> Bare.ModSpecs
-             -> GhcSpecData
+makeSpecData ::
+    GhcSrc ->
+    Bare.Env ->
+    Bare.SigEnv ->
+    Bare.MeasEnv ->
+    GhcSpecSig ->
+    Bare.ModSpecs ->
+    (GhcSpecData, [UnSortedExpr])
 ------------------------------------------------------------------------------------------
-makeSpecData src env sigEnv measEnv sig specs = SpData
-  { gsCtors      = F.notracepp "GS-CTORS"
-                   [ (x, if allowTC then t else tt)
-                       | (x, t) <- Bare.meDataCons measEnv
-                       , let tt  = Bare.plugHoles (typeclass $ getConfig env) sigEnv name (Bare.LqTV x) t
-                   ]
-  , gsMeas       = [ (F.symbol x, uRType <$> t) | (x, t) <- measVars ]
-  , gsMeasures   = ms1 ++ ms2
-  , gsOpaqueRefls = fst <$> Bare.meOpaqueRefl measEnv
-  , gsInvariants = Misc.nubHashOn (F.loc . snd) invs
-  , gsIaliases   = concatMap (makeIAliases env sigEnv) (M.toList specs)
-  , gsUnsorted   = usI ++ concatMap msUnSorted (concatMap measures specs)
-  }
+makeSpecData src env sigEnv measEnv sig specs =
+    ( SpData
+        { gsCtors =
+            F.notracepp
+                "GS-CTORS"
+                [ (x, if allowTC then t else tt)
+                | (x, t) <- Bare.meDataCons measEnv
+                , let tt = Bare.plugHoles (typeclass $ getConfig env) sigEnv name (Bare.LqTV x) t
+                ]
+        , gsMeas = [(F.symbol x, uRType <$> t) | (x, t) <- measVars]
+        , gsMeasures = ms1 ++ ms2
+        , gsOpaqueRefls = fst <$> Bare.meOpaqueRefl measEnv
+        , gsInvariants = Misc.nubHashOn (F.loc . snd) invs
+        , gsIaliases = concatMap (makeIAliases env sigEnv) (M.toList specs)
+        , gsUnsorted = usI ++ concatMap msUnSorted (concatMap measures specs)
+        }
+    , formationTemplates
+    )
   where
-    allowTC      = typeclass (getConfig env)
-    measVars     = Bare.getMeasVars env measEnv
-    measuresSp   = Bare.meMeasureSpec measEnv
-    ms1          = M.elems (Ms.measMap measuresSp)
-    ms2          = Ms.imeas   measuresSp
-    mySpec       = M.lookupDefault mempty name specs
-    name         = _giTargetMod      src
-    (minvs,usI)  = makeMeasureInvariants sig mySpec
-    invs         = minvs ++ concatMap (makeInvariants env sigEnv) (M.toList specs)
-                        ++ makeNewTypeInvariants env measEnv specs
+    allowTC = typeclass (getConfig env)
+    measVars = Bare.getMeasVars env measEnv
+    measuresSp = Bare.meMeasureSpec measEnv
+    ms1 = M.elems (Ms.measMap measuresSp)
+    ms2 = Ms.imeas measuresSp
+    mySpec = M.lookupDefault mempty name specs
+    name = _giTargetMod src
+    (minvs, usI) = makeMeasureInvariants sig mySpec
+    localDeferred = S.map (lhNameToResolvedSymbol . val) (Ms.hmeas mySpec) `S.difference` S.map (lhNameToResolvedSymbol . val) (Ms.ignores mySpec)
+    formationTemplates =
+        usI
+            ++ concat
+                [ msUnSorted declaration
+                | (owner, spec) <- M.toList specs
+                , declaration <- measures spec
+                , not (deferredLiftedMeasure name localDeferred owner declaration)
+                ]
+    invs =
+        minvs
+            ++ concatMap (makeInvariants env sigEnv) (M.toList specs)
+            ++ makeNewTypeInvariants env measEnv specs
 
 makeIAliases :: Bare.Env -> Bare.SigEnv -> (ModName, Ms.BareSpec) -> [(LocSpecType, LocSpecType)]
 makeIAliases env sigEnv (name, spec)
@@ -1447,12 +1835,16 @@ mkInvariant x z t tr = strengthen (top <$> t) (MkUReft reft' mempty)
 
 
 mkReft :: Located LHName -> Symbol -> SpecType -> SpecType -> Maybe (Symbol, Expr)
-mkReft x z _t tr
+mkReft x z t tr
   | Just q <- stripRTypeBase tr
   = let Reft (v, p) = toReft q
         su          = mkSubst [(v, mkEApp (fmap lhNameToResolvedSymbol x) [EVar v]), (z,EVar v)]
         -- p'          = pAnd $ filter (\e -> z `notElem` syms e) $ conjuncts p
-    in  Just (v, subst su p)
+        Reft (inputValue, domain) = rTypeReft t
+        admissible = if isBase t && isTrivial (topRTypeBase t)
+                       then subst1 domain (inputValue, EVar v)
+                       else PFalse
+    in  Just (v, PImp admissible (subst su p))
 mkReft _ _ _ _
   = Nothing
 
@@ -1469,6 +1861,7 @@ makeSpecName tycEnv measEnv dataConIds = SpNames
   , gsADTs     = Bare.tcAdts     tycEnv
   , gsTyconEnv = Bare.tcTyConMap tycEnv
   , gsDataConIds = dataConIds
+  , gsConstructorBoxes = Bare.tcConstructorBoxes tycEnv
   }
   where
     datacons, cls :: [DataConP]
@@ -1480,16 +1873,26 @@ makeSpecName tycEnv measEnv dataConIds = SpNames
 -- REBARE: formerly, makeGhcCHOP1
 -- split into two to break circular dependency. we need dataconmap for core2logic
 -------------------------------------------------------------------------------------------
-makeTycEnv0 :: Config -> ModName -> Bare.Env -> TCEmb Ghc.TyCon -> Ms.BareSpec -> Bare.ModSpecs
-           -> (Diagnostics,  [Located DataConP], Bare.TycEnv)
+makeTycEnv0 ::
+  [Ghc.TyCon] ->
+  [Ghc.TyCon] ->
+  M.HashMap Ghc.DataCon ConstructorBox ->
+  Config ->
+  ModName ->
+  Bare.Env ->
+  TCEmb Ghc.TyCon ->
+  Ms.BareSpec ->
+  Bare.ModSpecs ->
+  (Diagnostics, [Located DataConP], Bare.TycEnv)
 -------------------------------------------------------------------------------------------
-makeTycEnv0 cfg myName env embs mySpec iSpecs = (diag0 <> diag1, datacons, Bare.TycEnv
+makeTycEnv0 localTyCons fiTcs boxes cfg myName env embs mySpec iSpecs = (diag0 <> diag1, datacons, Bare.TycEnv
   { tcTyCons      = tycons
   , tcDataCons    = mempty -- val <$> datacons
     -- See the documentation of @addOpaqueReflMeas@. The selectors here are only
     -- those belonging to types mentioned in the types of functions defined in
     -- the current module.
   , tcSelMeasures = dcSelectors
+  , tcConstructorBoxes = mempty
   , tcSelVars     = mempty -- recSelectors
   , tcTyConMap    = tyi
   , tcAdts        = adts
@@ -1500,9 +1903,24 @@ makeTycEnv0 cfg myName env embs mySpec iSpecs = (diag0 <> diag1, datacons, Bare.
   where
     (tcDds, dcs)   = conTys
     (diag0, conTys) = withDiagnostics $ Bare.makeConTypes myName env specs
-    specs         = (myName, mySpec) : M.toList iSpecs
-    tcs           = Misc.snd3 <$> tcDds
-    tyi           = makeTyConInfo embs fiTcs tycons
+    specs = (myName, checkingSpec) : M.toList iSpecs
+
+    -- Constructor interpretation also needs declarations for ordinary source
+    -- checking. These defaults are local, not new orphan interface authority.
+    -- Existing complete declarations retain their selectors and refinements.
+    checkingSpec = mySpec{Ms.dataDecls = Ms.dataDecls mySpec ++ defaults}
+    defaults = Bare.makeHaskellDataDecls knownDeclarations usedTcs
+    knownDeclarations =
+        mySpec
+            { Ms.dataDecls =
+                Ms.dataDecls mySpec
+                    ++ [d | spec <- M.elems iSpecs, d <- Ms.dataDecls spec, Mb.isJust (tycDCons d)]
+            }
+    usedTcs =
+        uniqNub
+            [tc | dc <- M.keys boxes, let tc = Ghc.dataConTyCon dc, Ghc.isFamInstTyCon tc || not (F.tceMember tc embs)]
+    tcs = Misc.snd3 <$> tcDds
+    tyi           = makeTyConInfo embs fiTcs localTyCons tycons
     -- tycons        = F.tracepp "TYCONS" $ Misc.replaceWith tcpCon tcs wiredTyCons
     -- datacons      =  Bare.makePluggedDataCons embs tyi (Misc.replaceWith (dcpCon . val) (F.tracepp "DATACONS" $ concat dcs) wiredDataCons)
     tycons        = tcs ++ wiredTyCons
@@ -1511,22 +1929,22 @@ makeTycEnv0 cfg myName env embs mySpec iSpecs = (diag0 <> diag1, datacons, Bare.
     (diag1, adts) = Bare.makeDataDecls embs myName tds       datacons
     dm            = Bare.dataConMap adts
     dcSelectors   = concatMap (Bare.makeMeasureSelectors cfg dm) (if reflection cfg then charDataCon:datacons else datacons)
-    fiTcs         = _gsFiTcs (Bare.reSrc env)
 
 
 
-makeTycEnv1 ::
-     Bare.Env
+makeTycEnv1
+  :: M.HashMap Ghc.DataCon ConstructorBox
+  -> Bare.Env
   -> (Bare.TycEnv, [Located DataConP])
-  -> (Ghc.CoreExpr -> F.Expr)
-  -> (Ghc.CoreExpr -> Ghc.TcRn Ghc.CoreExpr)
+  -> (SpecType -> Ghc.TcRn SpecType)
   -> Ghc.TcRn Bare.TycEnv
-makeTycEnv1 env (tycEnv, datacons) coreToLg simplifier = do
+makeTycEnv1 boxes env (tycEnv, datacons) elaborate = do
   -- fst for selector generation, snd for dataconsig generation
-  lclassdcs <- forM classdcs $ traverse (Bare.elaborateClassDcp coreToLg simplifier)
+  lclassdcs <- forM classdcs $ \declaration ->
+    TcMonad.setSrcSpan (GM.fSrcSpan declaration) $ traverse (Bare.elaborateClassDcp elaborate) declaration
   let recSelectors = Bare.makeRecordSelectorSigs env (dcs ++ (fmap . fmap) snd lclassdcs)
   pure $
-    tycEnv {Bare.tcSelVars = recSelectors, Bare.tcDataCons = F.val <$> ((fmap . fmap) fst lclassdcs ++ dcs )}
+    tycEnv{Bare.tcConstructorBoxes = boxes, Bare.tcSelVars = recSelectors, Bare.tcDataCons = F.val <$> ((fmap . fmap) fst lclassdcs ++ dcs)}
   where
     (classdcs, dcs) =
       L.partition
@@ -1534,77 +1952,109 @@ makeTycEnv1 env (tycEnv, datacons) coreToLg simplifier = do
 
 -- REBARE: formerly, makeGhcCHOP2
 -------------------------------------------------------------------------------------------
-makeMeasEnv :: Bare.Env -> Bare.TycEnv -> Bare.SigEnv -> Bare.ModSpecs ->
-               Bare.Lookup Bare.MeasEnv
+deferredLiftedMeasure :: ModName -> S.HashSet F.Symbol -> ModName -> Measure ty ctor -> Bool
+deferredLiftedMeasure local deferred owner declaration
+    | msKind declaration /= MsLifted = False
+    | owner == local = lhNameToResolvedSymbol (val (msName declaration)) `S.member` deferred
+    | otherwise = True
+
+makeMeasEnv
+  :: (Ghc.CoreExpr -> (F.Expr, LogicSupport))
+  -> (SpecType -> Ghc.TcRn SpecType)
+  -> Bare.Env
+  -> Bare.TycEnv
+  -> Bare.SigEnv
+  -> Bare.ModSpecs
+  -> Ms.MSpec SpecType Ghc.DataCon
+  -> Ms.MSpec SpecType Ghc.DataCon
+  -> Ghc.TcRn ((Diagnostics, Bare.MeasEnv), LogicSupport)
 -------------------------------------------------------------------------------------------
-makeMeasEnv env tycEnv sigEnv specs = do
-  (cls, mts)  <- Bare.makeClasses        env sigEnv name specs
+makeMeasEnv interpret elaborate env tycEnv sigEnv specs measures formationMeasures = do
+  let (diagnostics, (cls, mts)) = withDiagnostics $ Bare.makeClasses env sigEnv name specs
+  -- The complete constructor arrow retains superclass evidence and every
+  -- method's quantified scope. Detached fields cannot elaborate those uses.
+  classResults <-
+    forM
+        [val (Bare.makePluggedDataCon (typeclass (getConfig env)) embs (Bare.tcTyConMap tycEnv) (F.atLoc declaration declaration)) | declaration <- cls]
+        ( \declaration ->
+            TcMonad.setSrcSpan (GM.sourcePos2SrcSpan (dcpLoc declaration) (dcpLocE declaration)) $
+              do
+                let (rows, support) = dataConPSpecType interpret (Bare.tcConstructorBoxes tycEnv) (typeclass (getConfig env)) declaration
+                checked <- forM rows $ \(owner, contract) -> (owner,) <$> elaborate contract
+                pure (checked, retainLogicSupport (S.unions $ map (F.syms . snd) checked) support)
+        )
+  let (classRows, classSupport) = unzip classResults
+      classConstructors = concat classRows
   let dms      = Bare.makeDefaultMethods env mts
-  measures0   <- mapM (Bare.makeMeasureSpec env sigEnv name) (M.toList specs)
-  let measures = mconcat (Ms.mkMSpec' dcSelectors : measures0)
-  let (cs, ms) = Bare.makeMeasureSpec'  (typeclass $ getConfig env)   measures
+  -- Constructor formation sees only original non-deferred contributions.
+  -- Complete definitions remain available for independent measure checking.
+  let ((cs, ms), measureSupport) = Bare.makeMeasureSpec' interpret (Bare.tcConstructorBoxes tycEnv) (typeclass $ getConfig env) formationMeasures
   let cms      = Bare.makeClassMeasureSpec measures
   let cms'     = [ (val l, cSort t <$ l)  | (l, t) <- cms ]
-  let ms'      = [ (lhNameToResolvedSymbol (F.val lx), F.atLoc lx t)
-                 | (lx, t) <- ms
-                 , Mb.isNothing (lookup (val lx) cms')
-                 ]
-  let cs'      = [ (v, txRefs v t) | (v, t) <- Bare.meetDataConSpec (typeclass (getConfig env)) embs cs (datacons ++ cls)]
-  return Bare.MeasEnv
-    { meMeasureSpec = measures
-    , meClassSyms   = map (first lhNameToResolvedSymbol) cms'
-    , meSyms        = ms'
-    , meDataCons    = cs'
-    , meClasses     = cls
-    , meMethods     = mts ++ dms
-    , meOpaqueRefl  = mempty
-    }
+  let ms' =
+        [ (lhNameToResolvedSymbol (F.val lx), F.atLoc lx t)
+        | (lx, t) <- ms
+        , Mb.isNothing (lookup (val lx) cms')
+        ]
+  let (constructors, constructorSupport) = Bare.meetDataConSpec interpret (Bare.tcConstructorBoxes tycEnv) (typeclass (getConfig env)) embs (cs ++ classConstructors) datacons
+      cs' = [(v, txRefs v t) | (v, t) <- constructors]
+  return $
+    ((diagnostics,
+      Bare.MeasEnv
+        { meMeasureSpec = measures
+        , meClassSyms = map (first lhNameToResolvedSymbol) cms'
+        , meSyms = ms'
+        , meDataCons = cs'
+        , meClasses = cls
+        , meMethods = mts ++ dms
+        , meOpaqueRefl = mempty
+        }), concat classSupport ++ measureSupport ++ constructorSupport)
   where
-    txRefs v t    = Bare.txRefSort tyi embs (t <$ GM.locNamedThing v)
-    tyi           = Bare.tcTyConMap    tycEnv
-    dcSelectors   = Bare.tcSelMeasures tycEnv
-    datacons      = Bare.tcDataCons    tycEnv
-    embs          = Bare.tcEmbs        tycEnv
-    name          = Bare.tcName        tycEnv
+    txRefs v t = Bare.txRefSort tyi embs (t <$ GM.locNamedThing v)
+    tyi = Bare.tcTyConMap tycEnv
+    datacons = Bare.tcDataCons tycEnv
+    embs = Bare.tcEmbs tycEnv
+    name = Bare.tcName tycEnv
 
+{- | Adds the opaque reflections to the measure environment
 
--- | Adds the opaque reflections to the measure environment
---
--- Returns a new environment that is the old one enhanced with the opaque
--- reflections.
---
--- At the moment this function also has the effect of adding selector and
--- checker measures for data constructors that are needed by reflected
--- functions. This even adds measures that are needed by functions reflected
--- from unfoldings (public and private), whose datatypes come from imported
--- modules. This overlaps a bit with 'makeTycEnv0', which also adds measures for
--- selectors and checkers, but only for datatypes mentioned in the type
--- signatures of functions defined in the current module.
+Returns a new environment that is the old one enhanced with the opaque
+reflections.
+
+At the moment this function also has the effect of adding selector and
+checker measures for data constructors that are needed by reflected
+functions. This even adds measures that are needed by functions reflected
+from unfoldings (public and private), whose datatypes come from imported
+modules. This overlaps a bit with 'makeTycEnv0', which also adds measures for
+selectors and checkers, but only for datatypes mentioned in the type
+signatures of functions defined in the current module.
+-}
 -------------------------------------------------------------------------------------------
-addOpaqueReflMeas :: Config -> Bare.TycEnv -> Bare.Env -> Ms.BareSpec -> Bare.MeasEnv -> Bare.ModSpecs ->
-               [(Ghc.Var, LocSpecType, F.Equation)] ->
-               Bare.Lookup Bare.MeasEnv
+addOpaqueReflMeas :: (Ghc.CoreExpr -> (F.Expr, LogicSupport)) -> Config -> Bare.TycEnv -> Bare.Env -> Ms.BareSpec -> Bare.MeasEnv -> Bare.ModSpecs ->
+               [(Ghc.Var, LocSpecType, F.Equation)] -> LogicSupport ->
+               Bare.Lookup (Bare.MeasEnv, LogicSupport)
 ----------------------- --------------------------------------------------------------------
-addOpaqueReflMeas cfg tycEnv env spec measEnv specs eqs = do
+addOpaqueReflMeas interpret cfg tycEnv env spec measEnv specs eqs reflectionSupport = do
   dcs   <- snd <$> Bare.makeConTypes'' env name spec dataDecls []
   let datacons      = Bare.makePluggedDataCon (typeclass cfg) embs tyi <$> concat dcs
   let dcSelectors   = concatMap (Bare.makeMeasureSelectors cfg dm) datacons
   -- Rest of the code is the same idea as for makeMeasEnv, only we just care on how to get
   -- `meSyms` (no class, data constructor or other stuff here).
   let measures = mconcat (Ms.mkMSpec' dcSelectors : measures0)
-  let (cs, ms) = Bare.makeMeasureSpec'  (typeclass $ getConfig env)   measures
+  let ((cs, ms), measureSupport) = Bare.makeMeasureSpec' interpret (Bare.tcConstructorBoxes tycEnv) (typeclass $ getConfig env) measures
   let ms'      = [ (lhNameToResolvedSymbol (F.val lx), F.atLoc lx t) | (lx, t) <- ms ]
-  let cs'      = [ (v, txRefs v t) | (v, t) <- Bare.meetDataConSpec (typeclass (getConfig env)) embs cs (val <$> datacons)]
-  return $ measEnv <> mempty
+  let (constructors, constructorSupport) = Bare.meetDataConSpec interpret (Bare.tcConstructorBoxes tycEnv) (typeclass (getConfig env)) embs cs (val <$> datacons)
+      cs' = [(v, txRefs v t) | (v, t) <- constructors]
+  return (measEnv <> mempty
     { Bare.meMeasureSpec = measures
     , Bare.meSyms        = ms'
     , Bare.meDataCons    = cs'
     , Bare.meOpaqueRefl  = opaqueRefl
-    }
+    }, measureSupport ++ constructorSupport)
   where
     -- We compute things in the same way as in makeMeasEnv
     txRefs v t    = Bare.txRefSort tyi embs (t <$ GM.locNamedThing v)
-    (measures0, opaqueRefl) = Bare.makeOpaqueReflMeasures env measEnv specs eqs
+    (measures0, opaqueRefl) = Bare.makeOpaqueReflMeasures env measEnv specs eqs reflectionSupport
     -- Note: it is important to do toList after applying `dataConTyCon` because
     -- obviously several data constructors can refer to the same `TyCon` so we
     -- could have duplicates
@@ -1646,7 +2096,10 @@ makeLiftedSpec name src env refl sData sig qual myRTE lSpec0 = lSpec0
   , Ms.qualifiers = filter (isLocInFile srcF) (gsQualifiers qual)
   }
   where
-    myDCs         = filter (isLocalName . val . fst) $ mkSigs (gsCtors sData)
+    myDCs         = filter (isLocalName . val . fst)
+      [toBare (v,t) | (v,t) <- gsCtors sData, Just dc <- [Ghc.isDataConId_maybe v]
+                   , v == Ghc.dataConWrapId dc
+                   , isExportedVar (toTargetSrc src) (Ghc.dataConWorkId dc)]
     mkSigs xts    = [ toBare (x, t) | (x, t) <- xts
                     , not (S.member x reflVars) && isExportedVar (toTargetSrc src) x
                     ]
@@ -1661,6 +2114,42 @@ makeLiftedSpec name src env refl sData sig qual myRTE lSpec0 = lSpec0
         Just (Ghc.tcg_mod (Bare.reTcGblEnv env)) == Ghc.nameModule_maybe n
       _ ->
         False
+
+-- Preserve the actual local measure's admissible input at the final export
+-- assignment. Imported definitions keep their already retained input domains.
+exportMeasureInputs :: GhcSrc -> GhcSpecSig -> [BareMeasure] -> [BareMeasure]
+exportMeasureInputs source signatures = map attach
+  where
+    local = S.fromList (_giDefVars source)
+    inputs =
+        M.fromList
+            [ (F.symbol owner, Bare.specToBare . Ms.measureInputType <$> signature)
+            | (owner, signature) <- gsInSigs signatures ++ gsTySigs signatures
+            , owner `S.member` local
+            ]
+    attach measure
+        | msKind measure == MsLifted
+        , Just input <- M.lookup (lhNameToResolvedSymbol (val (msName measure))) inputs =
+            measure{msSort = input}
+        | otherwise = measure
+
+-- Opaque declarations name the original source owner, not the companion
+-- module. Retain its complete selected input contract without publishing
+-- output guarantees as logical axioms.
+exportOpaqueInputs :: GhcSpecSig -> [BareMeasure] -> [BareMeasure]
+exportOpaqueInputs signatures = map attach
+  where
+    inputs =
+        Map.fromList
+            [ (Ghc.getName owner, Bare.specToBare . Ms.sourceInputType <$> signature)
+            | (owner, signature) <- gsAsmSigs signatures ++ gsInSigs signatures ++ gsTySigs signatures
+            ]
+    attach declaration
+        | msKind declaration == MsReflect
+        , Just owner <- maybeReflectedLHName (val $ msName declaration)
+        , Just input <- Map.lookup owner inputs =
+            declaration{msSort = input}
+        | otherwise = declaration
 
 -- | Returns 'True' if the input determines a location within the input file. Due to the fact we might have
 -- Haskell sources which have \"companion\" specs defined alongside them, we also need to account for this

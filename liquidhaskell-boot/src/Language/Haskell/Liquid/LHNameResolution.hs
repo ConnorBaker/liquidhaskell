@@ -53,6 +53,7 @@
 module Language.Haskell.Liquid.LHNameResolution
   ( resolveLHNames
   , resolveSymbolToTcName
+  , mkLookupGRE
   , exprArg
   , fromBareSpecLHName
   , toBareSpecLHName
@@ -363,7 +364,7 @@ resolveLHNames cfg thisModule localVars impMods globalRdrEnv bareSpec0 dependenc
       LHLogicNameBinder -> "logic name binder"
       LHLogicName -> "logic name"
 
-    isDataCon s = case Text.uncons (Text.takeWhileEnd (/= '.') (symbolText s)) of
+    isDataCon s = case Text.uncons (symbolText (LH.dropModuleNames s)) of
       Just (c, _) -> Char.isUpper c || c == ':'
       Nothing -> False
 
@@ -549,6 +550,7 @@ fixExpressionArgsOfTypeAliases taliases = mapMBareTypes go
     go (RRTy e r o t)      = RRTy  e r o  <$> go t
     go t@RHole{}           = pure t
     go t@RVar{}            = pure t
+    go t@RLit{}            = pure t
     go t@RExprArg{}        = pure t
     goRef (RProp ss t)     = RProp ss <$> go t
 
@@ -845,7 +847,7 @@ resolveLogicNames cfg thisModule env globalRdrEnv lmap0 localVars lnameEnv priva
     imeasures <- mapM (mapMeasureNamesM resolveIMeasLogicName) (imeasures sp)
     emapSpecM
       (bscope cfg)
-      (map localVarToSymbol . maybe [] lvdLclEnv . (GHC.lookupNameEnv (lvNames localVars) <=< getLHGHCName))
+      (map fst . maybe [] lvdLclEnv . (GHC.lookupNameEnv (lvNames localVars) <=< getLHGHCName))
       resolveLogicName
       (emapBareTypeVM (bscope cfg) resolveLogicName)
       sp {imeasures}
@@ -854,8 +856,6 @@ resolveLogicNames cfg thisModule env globalRdrEnv lmap0 localVars lnameEnv priva
       case val lx of
         LHNUnresolved LHLogicName s -> (<$ lx) <$> resolveLogicName [] (s <$ lx)
         _ -> panic (Just $ LH.fSrcSpan lx) $ "unexpected name: " ++ show lx
-
-    localVarToSymbol = F.symbol . GHC.occNameString . GHC.nameOccName . GHC.varName
 
     resolveLogicName :: [Symbol] -> LocSymbol -> State RenameOutput LHName
     resolveLogicName ss ls

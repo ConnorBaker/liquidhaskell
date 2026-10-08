@@ -40,6 +40,8 @@ import           Language.Haskell.Liquid.Types.RType
 import           Language.Haskell.Liquid.Types.RTypeOp
 import           Language.Haskell.Liquid.Types.Types
 import           Language.Haskell.Liquid.Types.RefType
+import           GHC.Core.Type (typeKind)
+import           Liquid.GHC.API (isTYPEorCONSTRAINT)
 
 
 class (Applicative m, Monad m) => Freshable m a where
@@ -91,8 +93,9 @@ trueRefType allowTC (RFun _ _ t t' _)
   -- YL: attaching rfinfo here is crucial
   = rFun' (classRFInfo allowTC) <$> fresh <*> true allowTC t <*> true allowTC t'
 
-trueRefType allowTC (RApp c ts _  _) | if allowTC then isEmbeddedDict c else isClass c
-  = rRCls c <$> mapM (true allowTC) ts
+trueRefType allowTC (RApp c ts _ _)
+    | isEmbeddedDict c =
+        rRCls c <$> mapM (true allowTC) ts
 
 trueRefType allowTC (RApp c ts rs r)
   = RApp c <$> mapM (true allowTC) ts <*> mapM (trueRef allowTC) rs <*> true allowTC r
@@ -109,6 +112,8 @@ trueRefType allowTC (RRTy e o r t)
 trueRefType allowTC (REx _ t t')
   = REx <$> fresh <*> true allowTC t <*> true allowTC t'
 
+trueRefType _ t@(RLit _)
+  = return t
 trueRefType _ t@(RExprArg _)
   = return t
 
@@ -134,23 +139,30 @@ refreshRefType allowTC (RFun sym i t t' _)
   | sym == F.dummySymbol = (\b t1 t2 -> RFun b i t1 t2 trueReft) <$> fresh <*> refresh allowTC t <*> refresh allowTC t'
   | otherwise          = (\t1 t2 -> RFun sym i t1 t2 trueReft)   <$> refresh allowTC t <*> refresh allowTC t'
 
-refreshRefType _ (RApp rc ts _ _) | isClass rc
-  = return $ rRCls rc ts
+-- Runtime dictionaries have ordinary field variance and inferred parameters;
+-- only erased primitive evidence has no refinement inference obligations.
+refreshRefType _ (RApp rc ts _ _)
+    | isEmbeddedDict rc =
+        return $ rRCls rc ts
 
-refreshRefType allowTC (RApp rc ts rs r)
-  = RApp rc <$> mapM (refresh allowTC) ts <*> mapM (refreshRef allowTC) rs <*> refresh allowTC r
+refreshRefType allowTC t@(RApp rc ts rs r) =
+    RApp rc <$> mapM (refresh allowTC) ts <*> mapM (refreshRef allowTC) rs <*> refreshValueReft allowTC t r
+refreshRefType allowTC t@(RVar a r) =
+    RVar a <$> refreshValueReft allowTC t r
+refreshRefType allowTC ty@(RAppTy t t' r) =
+    RAppTy <$> refresh allowTC t <*> refresh allowTC t' <*> refreshValueReft allowTC ty r
+refreshRefType allowTC (RRTy e o r t) =
+    RRTy e o r <$> refreshRefType allowTC t
+refreshRefType _ t =
+    return t
 
-refreshRefType allowTC (RVar a r)
-  = RVar a <$> refresh allowTC r
-
-refreshRefType allowTC (RAppTy t t' r)
-  = RAppTy <$> refresh allowTC t <*> refresh allowTC t' <*> refresh allowTC r
-
-refreshRefType allowTC (RRTy e o r t)
-  = RRTy e o r <$> refreshRefType allowTC t
-
-refreshRefType _ t
-  = return t
+-- Only value-kinded nodes have term values to refine. In particular, a
+-- constructor head's KVar must not migrate to a different value carrier when
+-- that constructor is applied. Preserve existing non-value annotations.
+refreshValueReft :: (Freshable m r) => Bool -> RRType r -> r -> m r
+refreshValueReft allowTC t r
+    | isTYPEorCONSTRAINT (typeKind (toType False (toRSort t))) = refresh allowTC r
+    | otherwise = return r
 
 refreshRef :: (Freshable f Integer, Freshable f r, IsReft r, F.Subable r, F.Variable r ~ F.Symbol, ReftBind r ~ F.Symbol, ReftVar r ~ F.Symbol)
            => Bool -> Ref τ (RType RTyCon RTyVar r) -> f (Ref τ (RRType r))

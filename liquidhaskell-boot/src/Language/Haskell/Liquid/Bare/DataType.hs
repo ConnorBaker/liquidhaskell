@@ -24,6 +24,7 @@ module Language.Haskell.Liquid.Bare.DataType
 import qualified Control.Exception                      as Ex
 import           Control.Monad (forM, unless)
 import           Control.Monad.Reader
+import           Data.Generics (everythingBut, mkQ)
 import qualified Data.List                              as L
 import qualified Data.HashMap.Strict                    as M
 import qualified Data.HashSet                           as S
@@ -35,7 +36,7 @@ import qualified Liquid.GHC.API        as Ghc
 import           Language.Haskell.Liquid.Types.DataDecl
 import           Language.Haskell.Liquid.Types.Errors
 import           Language.Haskell.Liquid.Types.Names
-import           Language.Haskell.Liquid.Types.PredType (dataConPSpecType)
+import           Language.Haskell.Liquid.Types.PredType (dataConPSpecType, dataConRuntimeFields)
 import qualified Language.Haskell.Liquid.Types.RefType  as RT
 import           Language.Haskell.Liquid.Types.RType
 import           Language.Haskell.Liquid.Types.RTypeOp
@@ -56,15 +57,18 @@ import           Text.Printf                     (printf)
 import Text.PrettyPrint ((<+>))
 
 --------------------------------------------------------------------------------
--- | 'DataConMap' stores the names of those ctor-fields that have been declared
---   as SMT ADTs so we don't make up new names for them.
+{- | 'DataConMap' stores declared SMT constructor names at index zero and
+  their field selectors at indices one onwards. Consumers never invent
+  constructor/checker names for an unrepresented source datatype.
+-}
+
 --------------------------------------------------------------------------------
 dataConMap :: [F.DataDecl] -> Bare.DataConMap
 dataConMap ds = M.fromList $ do
-  d     <- ds
-  c     <- F.ddCtors d
+  d <- ds
+  c <- F.ddCtors d
   let fs = F.symbol <$> F.dcFields c
-  zip ((F.symbol c,) <$> [1..]) fs
+  zip ((F.symbol c,) <$> [0 ..]) (F.symbol c : fs)
 
 
 --------------------------------------------------------------------------------
@@ -93,7 +97,7 @@ makeDataConSelector' d i
   = symbolMeasure "$select" (dcSymbol d) (Just i)
 
 dcSymbol :: Ghc.DataCon -> F.Symbol
-dcSymbol = {- simpleSymbolVar -} F.symbol . Ghc.dataConWorkId
+dcSymbol = F.symbol
 
 symbolMeasure :: String -> F.Symbol -> Maybe Int -> F.Symbol
 symbolMeasure f d iMb = foldr1 F.suffixSymbol (dcPrefix : F.symbol f : d : rest)
@@ -117,12 +121,15 @@ addClassEmbeds instenv fiTcs = makeFamInstEmbeds fiTcs . makeNumEmbeds instenv
 makeFamInstEmbeds :: [Ghc.TyCon] -> F.TCEmb Ghc.TyCon -> F.TCEmb Ghc.TyCon
 makeFamInstEmbeds cs0 embeds = L.foldl' embed embeds famInstSorts
   where
-    famInstSorts          = F.notracepp "famInstTcs"
-                            [ (c, RT.typeSort embeds ty)
-                                | c   <- cs
-                                , ty  <- Mb.maybeToList (RT.famInstTyConType c) ]
-    embed embs (c, t)     = F.tceInsert c t F.NoArgs embs
-    cs                    = F.notracepp "famInstTcs-all" cs0
+    famInstSorts =
+        F.notracepp
+            "famInstTcs"
+            [ (c, RT.typeSort embeds (Ghc.mkTyConApp family arguments))
+            | c <- cs
+            , (family, arguments) <- Mb.maybeToList (Ghc.tyConFamInst_maybe c)
+            ]
+    embed embs (c, t) = F.tceInsert c t F.WithArgs embs
+    cs = F.notracepp "famInstTcs-all" cs0
 
 {-
 famInstTyConType :: Ghc.TyCon -> Maybe Ghc.Type
@@ -165,9 +172,12 @@ famInstType n c ts = Ghc.mkTyConApp c (take (length ts - n) ts)
 
      SOLUTION: To address the above, we create an "embedding"
 
-        R$58$EntityFieldBlobdog :-> EntityField Blob
+        R$58$EntityFieldBlobdog dog :-> EntityField Blob dog
 
-     So that all occurrences of the (2) are treated as (1) by the sort checker.
+     Substitute the representation tycon's formal variables into the complete
+     family application. A fixed-prefix encoding is insufficient for patterns
+     such as F (Maybe a), whose representation parameter is nested in the index.
+     Thus all occurrences of (2) have the same carrier as (1).
 
  -}
 
@@ -213,21 +223,37 @@ instanceTyCon = go . Ghc.is_tys
 
 type DataPropDecl = (DataDecl, Maybe SpecType)
 
-makeDataDecls :: F.TCEmb Ghc.TyCon -> ModName
-              -> [(ModName, Ghc.TyCon, DataPropDecl)]
-              -> [Located DataConP]
-              -> (Diagnostics, [F.DataDecl])
+makeDataDecls ::
+    F.TCEmb Ghc.TyCon ->
+    ModName ->
+    [(ModName, Ghc.TyCon, DataPropDecl)] ->
+    [Located DataConP] ->
+    (Diagnostics, [F.DataDecl])
 makeDataDecls tce name tds ds = (mkDiagnostics warns [], okDecs)
   where
-    warns            =
-      (mkWarnDecl . fmap pprint . dataNameSymbol . tycName . fst . fst . snd <$> badTcs) ++
-      (mkWarnDecl . (\d -> F.atLoc d (pprint $ F.symbol d)) <$> badDecs)
-    tds'             = resolveTyCons name tds
-    tcDds            = filter ((/= Ghc.listTyCon) . fst)
-                     $ groupDataCons tds' ds
-    (okTcs, badTcs)  = L.partition isVanillaTc tcDds
-    decs             = [ makeFDataDecls tce tc dd ctors | (tc, (dd, ctors)) <- okTcs]
-    (okDecs,badDecs) = checkRegularData decs
+    warns =
+        (mkWarnDecl . fmap pprint . dataNameSymbol . tycName . fst . fst . snd <$> badTcs)
+            ++ (mkWarnDecl . (\d -> F.atLoc d (pprint $ F.symbol d)) <$> badDecs)
+    tds' = resolveTyCons name tds
+    tcDds =
+        filter (nativeCarrier . fst) $
+            groupDataCons tds' ds
+    (okTcs, badTcs) = L.partition isVanillaTc tcDds
+    decs = [makeFDataDecls tce tc dd ctors | (tc, (dd, ctors)) <- okTcs]
+    (okDecs, badDecs) = checkRegularData decs
+
+    -- Native constructors must return the same carrier as source contracts.
+    -- An embedding may replace that carrier; a nominal SMT datatype may not
+    -- redeclare its constructors with the unembedded result.
+    nativeCarrier tc =
+        tc /= Ghc.listTyCon && RT.typeSort tce applied == nominal
+      where
+        arguments = Ghc.mkTyVarTy <$> GM.tyConTyVarsDef tc
+        applied = Ghc.mkTyConApp tc arguments
+        nominal =
+            F.fApp
+                (F.FTC (F.symbolFTycon (F.dummyLoc (F.symbol tc))))
+                (RT.typeSort tce <$> arguments)
 
 isVanillaTc :: (a, (b, [(Ghc.DataCon, c)])) -> Bool
 isVanillaTc (_, (_, ctors)) = all (Ghc.isVanillaDataCon . fst) ctors
@@ -337,14 +363,15 @@ tyConLocSymbol tc dd = F.atLoc (tycName dd) (F.symbol tc)
 --    (i.e. without any type applications.)
 
 makeDataCtor :: F.TCEmb Ghc.TyCon -> F.FTycon -> (Ghc.DataCon, DataConP) -> F.DataCtor
-makeDataCtor tce c (d, dp) = F.DCtor
-  { F.dcName    = GM.namedLocSymbol d
-  , F.dcFields  = makeDataFields tce c as xts
-  }
-  where
-    as          = dcpFreeTyVars dp
-    xts         = [ (fld $ lhNameToResolvedSymbol x, t) | (x, t) <- reverse (dcpTyArgs dp) ]
-    fld         = F.atLoc dp . fieldName d dp
+makeDataCtor tce c (d, dp) =
+  F.DCtor
+    { F.dcName = GM.namedLocSymbol d
+    , F.dcFields = makeDataFields tce c as xts
+    }
+ where
+  as = dcpFreeTyVars dp
+  xts = [(fld $ lhNameToResolvedSymbol x, t) | (x, t) <- dataConRuntimeFields dp]
+  fld = F.atLoc dp . fieldName d dp
 
 fieldName :: Ghc.DataCon -> DataConP -> F.Symbol -> F.Symbol
 fieldName d dp x
@@ -368,26 +395,54 @@ muSort c n  = V.mapSort tx
 -}
 
 --------------------------------------------------------------------------------
-meetDataConSpec :: Bool -> F.TCEmb Ghc.TyCon -> [(Ghc.Var, SpecType)] -> [DataConP]
-                -> [(Ghc.Var, SpecType)]
+meetDataConSpec :: (Ghc.CoreExpr -> (F.Expr, LogicSupport)) -> M.HashMap Ghc.DataCon ConstructorBox -> Bool -> F.TCEmb Ghc.TyCon -> [(Ghc.Var, SpecType)] -> [DataConP]
+                -> ([(Ghc.Var, SpecType)], LogicSupport)
 --------------------------------------------------------------------------------
-meetDataConSpec allowTC emb xts dcs  = M.toList $ snd <$> L.foldl' upd dcm0 xts
+meetDataConSpec interpret boxes allowTC emb xts dcs = (result, retainLogicSupport (S.unions $ map (F.syms . snd) result) support)
   where
-    dcm0                     = M.fromListWith meetM (dataConSpec' allowTC dcs)
+    result                   = M.toList $ snd <$> L.foldl' upd dcm0 xts
+    (rows, support)          = dataConSpec' interpret boxes allowTC dcs
+    dcm0                     = M.fromListWith meetM rows
     upd dcm (x, t)           = M.insert x (Ghc.getSrcSpan x, tx') dcm
                                 where
                                   tx' = maybe t (meetX x t) (M.lookup x dcm)
-    meetM (l,t) (_,t')       = (l, t `meet` t')
-    meetX x t (sp', t')      = F.notracepp (_msg x t t') $ meetVarTypes emb (pprint x) (Ghc.getSrcSpan x, t) (sp', t')
+    meetM (l,t) (_,t')       = (l, t `meet` nameAnonymousArguments t t')
+    meetX x t (sp', t')      = F.notracepp (_msg x t t') $ meetVarTypes emb (pprint x) (Ghc.getSrcSpan x, t) (sp', nameAnonymousArguments t t')
     _msg x t t'              = "MEET-VAR-TYPES: " ++ showpp (x, t, t')
 
-dataConSpec' :: Bool -> [DataConP] -> [(Ghc.Var, (Ghc.SrcSpan, SpecType))]
-dataConSpec' allowTC = concatMap tx
+-- Product expansion introduces anonymous constructor arrows. Before meeting
+-- their contract, give these positions distinct names outside both operands:
+-- otherwise the meet identifies independent fields with LIQUID$dummy. The
+-- anonymous marker owns no occurrences, so do not substitute it in refinements.
+nameAnonymousArguments :: SpecType -> SpecType -> SpecType
+nameAnonymousArguments other ty = snd (go occupied ty)
   where
-    tx dcp   =  [ (x, res) | (x, t0) <- dataConPSpecType allowTC dcp
-                          , let t    = RT.expandProductType x t0
+    occupied =
+      S.insert F.dummySymbol $
+        everythingBut S.union (mkQ (S.empty, False) (\s -> (S.singleton s, True) :: (S.HashSet F.Symbol, Bool))) (other, ty)
+    go names (RAllT a body r) =
+      let (names', body') = go names body
+      in (names', RAllT a body' r)
+    go names (RAllP p body) =
+      let (names', body') = go names body
+      in (names', RAllP p body')
+    go names (RFun x i arg body r) =
+      let (names', x') = if x == F.dummySymbol
+            then F.freshInNS x names
+            else (names, x)
+          (names'', body') = go names' body
+      in (names'', RFun x' i arg body' r)
+    go names body = (names, body)
+
+dataConSpec' :: (Ghc.CoreExpr -> (F.Expr, LogicSupport)) -> M.HashMap Ghc.DataCon ConstructorBox -> Bool -> [DataConP] -> ([(Ghc.Var, (Ghc.SrcSpan, SpecType))], LogicSupport)
+dataConSpec' interpret boxes allowTC dcs = (concat rows, concat support)
+  where
+    (rows, support) = unzip $ map tx dcs
+    tx dcp   =  ([ (x, res) | (x, t0) <- values
+                          , let t    = t0
                           , let res  = (GM.fSrcSpan dcp, t)
-                ]
+                ], dependencies)
+      where (values, dependencies) = dataConPSpecType interpret boxes allowTC dcp
 --------------------------------------------------------------------------------
 -- | Bare Predicate: DataCon Definitions ---------------------------------------
 --------------------------------------------------------------------------------
@@ -731,6 +786,8 @@ getPsSig m pos (RFun _ _ t1 t2 r)
   = addps m pos r ++ getPsSig m pos t2 ++ getPsSig m (not pos) t1
 getPsSig m pos (RHole r)
   = addps m pos r
+getPsSig _ _ (RLit _)
+  = []
 getPsSig _ _ z
   = panic Nothing $ "getPsSig" ++ showpp z
 

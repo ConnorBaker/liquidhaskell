@@ -243,6 +243,8 @@ pprRtype bb p (RApp c ts rs r)
 
 pprRtype bb p t@REx{}
   = ppExists bb p t
+pprRtype _ _ (RLit l)
+  = text (show l)
 pprRtype _ _ (RExprArg e)
   = braces $ pprint e
 pprRtype bb p (RAppTy t t' r)
