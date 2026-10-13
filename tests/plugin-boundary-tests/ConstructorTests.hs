@@ -55,4 +55,8 @@ tests fixture compiler optimization =
                , ("neg", "ConstructorWholeSource", UnsafeAt [14])
                , ("neg", "InterleavedMethodEvidence", UnsafeAt [28])
                , ("neg", "MeasureUnrelatedScrutinee", FormationRefusal 11 "Case scrutinee is not the selected measure argument")
+               , ("plugin-boundary-tests/fixtures/projection-admission", "PartialProjectionGood", Safe)
+               , ("plugin-boundary-tests/fixtures/projection-admission", "PartialProjectionFalse", UnsafeAt [21])
+               , ("plugin-boundary-tests/fixtures/projection-admission", "ImportedProjectionGood", Safe)
+               , ("plugin-boundary-tests/fixtures/projection-admission", "ImportedProjectionFalse", UnsafeAt [19])
                ]
