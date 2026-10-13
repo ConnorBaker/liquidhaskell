@@ -3,20 +3,24 @@ module ConstraintGenerationTests (tests, emptyTarget) where
 import Control.DeepSeq (rnf)
 import Control.Exception (ErrorCall, displayException, evaluate, try)
 import Control.Monad (void)
-import Control.Monad.State (evalState)
+import Control.Monad.State (evalState, runState)
 import qualified Data.HashMap.Strict as M
 import qualified Data.HashSet as S
-import Data.List (foldl', isInfixOf)
+import Data.List (isInfixOf)
 import qualified Data.Store as Store
 import qualified DefaultSchemaSharingTests
+import GHC.Builtin.Types (mkListTy)
 import GHC.Conc (getAllocationCounter)
 import GHC.Core.Type (mkVisFunTyMany)
 import qualified Language.Fixpoint.SortCheck as SortCheck
 import qualified Language.Fixpoint.Types as F
 import qualified Language.Fixpoint.Types.Config as FC
 import Language.Haskell.Liquid.Bare.Check (checkTargetSpec)
-import Language.Haskell.Liquid.Constraint.Generate (generateConstraints)
+import Language.Haskell.Liquid.Bare.Elaborate (alignQueryTelescope)
+import Language.Haskell.Liquid.Constraint.Env (lookupREnv)
+import Language.Haskell.Liquid.Constraint.Generate (ConstraintObligations (..), generateConstraints)
 import Language.Haskell.Liquid.Constraint.Init (initCGI, initEnv)
+import Language.Haskell.Liquid.Constraint.Monad (freshPredRef)
 import Language.Haskell.Liquid.Constraint.Publication (publicationAdmissible)
 import Language.Haskell.Liquid.Constraint.Qualifier (giQuals)
 import Language.Haskell.Liquid.Constraint.Split (splitC)
@@ -27,11 +31,12 @@ import Language.Haskell.Liquid.Liquid (checkTargetInfo)
 import Language.Haskell.Liquid.Types.Errors (Oblig (OCons), TError (..))
 import Language.Haskell.Liquid.Types.Names (LHName (..), LHNameSpace (LHLogicName), LHResolvedName (..), LogicName (..), selfSymbol)
 import Language.Haskell.Liquid.Types.PredType (replacePreds)
-import Language.Haskell.Liquid.Types.RType (PVarBV (..), PredicateBV (..), RTypeBV (..), RefB (..), SpecType, UReftBV (..))
+import Language.Haskell.Liquid.Types.RType (PVarBV (..), PredicateBV (..), RPVar, RTVInfo (..), RTVar (..), RTyCon (..), RTypeBV (..), RefB (..), SpecType, TyConInfo (..), UReftBV (..))
 import Language.Haskell.Liquid.Types.RTypeOp (rTypeReft, toRSort)
 import Language.Haskell.Liquid.Types.RefType (applySolution, ofType, strengthen, toType, uPVar, uTop)
 import Language.Haskell.Liquid.Types.Specs
-import Language.Haskell.Liquid.Types.Types (AnnInfo (..), Cinfo (..), Error, ModName (..), ModType (..), Output (..), RTAlias (..), TyConMap (..), allErrors)
+import Language.Haskell.Liquid.Types.Types (AnnInfo (..), CheckedPredicate (..), Cinfo (..), Error, ModName (..), ModType (..), Output (..), QueryTelescope (..), RTAlias (..), TyConMap (..), allErrors)
+import Language.Haskell.Liquid.Types.Variance (Variance (..))
 import Language.Haskell.Liquid.Types.Visitors (letVars)
 import qualified Language.Haskell.Liquid.UX.CmdLine as CmdLine
 import qualified Language.Haskell.Liquid.UX.Config as LH
@@ -39,6 +44,7 @@ import Language.Haskell.Liquid.UX.Tidy (cinfoError)
 import Liquid.GHC.API (mkModuleName)
 import qualified Liquid.GHC.API as G
 import qualified MethodAdmissionTests
+import qualified SplitJudgmentTests
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertBool, assertFailure, testCase, testCaseInfo, (@?=))
 
@@ -48,17 +54,24 @@ tests compileToCore =
         "constraint generation"
         [ qualifierConfiguration
         , qualifierPreparation
-        , diagnosticDemand
         , initializationSharing compileToCore
         , DefaultSchemaSharingTests.tests emptyTarget compileToCore
+        , diagnosticDemand
         , authoredGoalPreservation
+        , SplitJudgmentTests.tests emptyTarget
         , publicationSupport
         , solutionInstantiation
-        , concretePredicateArguments compileToCore
-        , MethodAdmissionTests.tests emptyTarget compileToCore
         , authoredPresentation compileToCore
         , sourceDependencyIndexing compileToCore
         , bareScopeChecks compileToCore
+        , predicateScopeJudgments compileToCore
+        , higherKindedPredicateJudgments compileToCore
+        , MethodAdmissionTests.tests emptyTarget compileToCore
+        , predicateCarrierSubstitution compileToCore
+        , concretePredicateArguments compileToCore
+        , predicateCarrierPresentation
+        , predicateCarrierMetadata
+        , freshPredicateGeneration
         , testCase "unsigned callable retains its complete inferred telescope" $ do
             program <-
                 compileToCore "UnsignedCallable" $
@@ -71,7 +84,8 @@ tests compileToCore =
                 [(owner, body)] -> do
                     let empty = emptyTarget CmdLine.defConfig{LH.notruetypes = True, LH.checkDerived = True}
                         info = empty{giSrc = (giSrc empty){giCbs = [G.NonRec owner body], giDefVars = [owner]}}
-                        (callables, _) = generateConstraints (initCGI (LH.getConfig info) info) (DefaultSchemaSharingTests.schemas info info) [] info (giCbs (giSrc info))
+                        obligations = ConstraintObligations (giCbs (giSrc info)) (gsMethods $ gsSig $ giSpec info) mempty []
+                        (callables, _) = generateConstraints (initCGI (LH.getConfig info) info) (DefaultSchemaSharingTests.schemas info info) [] info obligations
                     map fst callables @?= [owner]
                     case lookup owner callables of
                         Just inferred -> do
@@ -85,220 +99,6 @@ tests compileToCore =
                         Nothing -> assertFailure "constraint generation omitted the unsigned source owner"
                 _ -> assertFailure "expected one unsigned source definition"
         ]
-
-authoredGoalPreservation :: TestTree
-authoredGoalPreservation =
-    testGroup
-        "authored subtype conclusions"
-        [ testCase label $ do
-            let direct = conclusions [] predicate
-                inherited = conclusions [([F.vv_], predicate)] predicate
-            length direct @?= 1
-            inherited @?= direct
-        | (label, predicate) <-
-            [ ("matching ill-sorted equation metadata cannot erase a goal", F.PAtom F.Eq (F.EVar F.vv_) F.PTrue)
-            , ("matching well-sorted equation metadata retains the same goal", F.PAtom F.Eq (F.EVar F.vv_) (F.ECon (F.I 0)))
-            ]
-        ]
-  where
-    conclusions templates predicate =
-        let cfg = CmdLine.defConfig
-            empty = emptyTarget cfg
-            spec = giSpec empty
-            names = gsName spec
-            embeds = F.tceInsert G.intTyCon F.intSort F.NoArgs mempty
-            info = empty{giSpec = spec{gsData = (gsData spec){gsUnsorted = templates}, gsName = names{gsTcEmbeds = embeds}}}
-            integer = ofType G.intTy :: SpecType
-            expected = strengthen integer (MkUReft (F.Reft (F.vv_, predicate)) mempty)
-         in evalState
-                ( do
-                    environment <- initEnv (DefaultSchemaSharingTests.schemas info info) [] info
-                    map F.crhs <$> splitC False (CG.SubC environment integer expected)
-                )
-                (initCGI cfg info info)
-
-sourceDependencyIndexing :: (String -> String -> IO G.CoreProgram) -> TestTree
-sourceDependencyIndexing compileToCore =
-    testGroup
-        "source dependency indexing"
-        ( [ testCase label $ do
-                program <-
-                    compileToCore "QueryDependency" $
-                        unlines
-                            [ "module QueryDependency where"
-                            , "helper :: Bool -> Bool"
-                            , "helper x = x"
-                            , "checked :: Bool -> Bool"
-                            , if nested then "checked x = let { {-# NOINLINE nested #-}; nested y = y } in nested x" else "checked x = x"
-                            , "query :: Bool -> Bool"
-                            , "query x = helper x"
-                            ]
-                case (named "helper" program, named "checked" program, named "query" program) of
-                    ([(helper, helperBody)], [(checked, checkedBody)], [(_, queryBody)]) ->
-                        case (identityType checked, identityType helper) of
-                            (Just signature, Just helperType) -> do
-                                let source = [G.NonRec helper helperBody, G.NonRec checked checkedBody]
-                                    info = targetInfo "QueryDependency" source [(checked, signature), (helper, helperType)]
-                                    spec = giSpec info
-                                    checkOwners = if nested then filter ((== "nested") . G.getOccString) (letVars checkedBody) else [checked]
-                                case checkOwners of
-                                    [owner] -> do
-                                        let checks = [RefinementCheck owner queryBody (F.dummyLoc signature) mempty]
-                                        assertSafe info{giSpec = spec{gsSig = (gsSig spec){gsReftChecks = checks}}}
-                                    _ -> assertFailure ("expected the exact lexical declaration owner: " ++ show (map G.getOccString (letVars checkedBody)))
-                            _ -> assertFailure "expected Boolean source arrows"
-                    _ -> assertFailure "expected the actual query and source owners"
-          | (label, nested) <- [("a query-only Core dependency precedes its declaration owner", False), ("a nested declaration's query-only dependency retains its enclosing group", True)]
-          ]
-            ++ [ testCase "recursive Core edges retain their checked metric scope" $ do
-                    program <-
-                        compileToCore "MetricDependency" $
-                            unlines
-                                [ "module MetricDependency where"
-                                , "loop :: Bool -> Bool"
-                                , "loop True = other False"
-                                , "loop False = False"
-                                , "other :: Bool -> Bool"
-                                , "other True = loop False"
-                                , "other False = False"
-                                ]
-                    case (named "loop" program, named "other" program) of
-                        ([loop@(loopOwner, _)], [other@(otherOwner, _)]) ->
-                            case (plainType loopOwner, plainType otherOwner) of
-                                (Just loopType, Just otherType) -> do
-                                    let signatures = [(loopOwner, loopType), (otherOwner, otherType)]
-                                        info = targetInfo "MetricDependency" [G.Rec [other, loop]] signatures
-                                        spec = giSpec info
-                                        metric = F.EIte (F.EVar (F.symbol ("input" :: String))) (F.ECon (F.I 1)) (F.ECon (F.I 0))
-                                        names = (gsName spec){gsTcEmbeds = F.tceFromList [(G.boolTyCon, (F.boolSort, F.NoArgs))]}
-                                        literals = [(F.symbol (G.dataConWorkId constructor), F.boolSort) | constructor <- [G.trueDataCon, G.falseDataCon]]
-                                        constructors = [(G.dataConWorkId constructor, F.dummyLoc (strengthen (ofType G.boolTy) (uTop (F.exprReft (truth :: F.Expr))))) | (constructor, truth) <- [(G.trueDataCon, F.PTrue), (G.falseDataCon, F.PFalse)]]
-                                    assertSafe info{giSpec = spec{gsSig = (gsSig spec){gsTexprs = [(owner, F.dummyLoc ty, [F.dummyLoc metric]) | (owner, ty) <- signatures]}, gsName = names, gsImps = literals, gsData = (gsData spec){gsCtors = constructors}}}
-                                _ -> assertFailure "expected Boolean recursive arrows"
-                        _ -> assertFailure "expected both actual recursive owners"
-               ]
-        )
-  where
-    named name program = [(owner, body) | (owner, body) <- G.flattenBinds program, G.getOccString owner == name]
-    identityType owner = case ofType (G.varType owner) of
-        RFun _ info input output refinement ->
-            let argument = F.symbol ("input" :: String)
-             in Just $ RFun argument info input (strengthen output (uTop (F.exprReft (F.EVar argument :: F.Expr)))) refinement
-        _ -> Nothing
-    plainType owner = case ofType (G.varType owner) of
-        RFun _ info input output refinement -> Just $ RFun (F.symbol ("input" :: String)) info input output refinement
-        _ -> Nothing
-    targetInfo name source signatures =
-        let empty = emptyTarget CmdLine.defConfig{LH.checkDerived = True, LH.checkRefinements = True, LH.totalHaskell = True, LH.noannotations = True, LH.smtsolver = Just FC.Z3}
-            spec = giSpec empty
-         in empty
-                { giSrc = (giSrc empty){giTarget = name ++ ".hs", giTargetMod = ModName Target (mkModuleName name), giCbs = source, giDefVars = concatMap G.bindersOf source}
-                , giSpec = spec{gsSig = (gsSig spec){gsTySigs = [(owner, F.dummyLoc ty) | (owner, ty) <- signatures]}}
-                }
-    assertSafe info = do
-        (output, _, publication) <- checkTargetInfo info
-        case (o_result output, publication) of
-            (F.Safe _, Just (F.Safe _)) -> pure ()
-            other -> assertFailure ("source dependency judgment was not established: " ++ show other)
-
-initializationSharing :: (String -> String -> IO G.CoreProgram) -> TestTree
-initializationSharing compileToCore =
-    testGroup
-        "query initialization sharing"
-        [ testCase "prepared initialization retains stage owners, templates and target" $ do
-            let initialize = initCGI cfg base
-            mapM_ (checkStage initialize) [stage False, stage True]
-        , testCase "unselected base obligations and templates are not demanded" $ do
-            let spec = giSpec base
-                poisoned =
-                    base
-                        { giSpec =
-                            spec
-                                { gsSig = (gsSig spec){gsReftChecks = [error "unselected base owner"]}
-                                , gsData = (gsData spec){gsUnsorted = [([], error "unselected base template")]}
-                                }
-                        }
-            checkStage (initCGI cfg poisoned) (stage True)
-        , testCase "preparing an initializer does not demand its source or configuration" $
-            void (evaluate (initCGI (error "unused configuration") (error "unused source")))
-        , testCase "authored and filtered Core views retain separate literal inventories" $ do
-            program <- compileToCore "SeedLiterals" "module SeedLiterals where\nliteral = \"seed-literal\"\n"
-            let authored = base{giSrc = (giSrc base){giCbs = program}}
-                authoredState = initCGI cfg authored authored
-                sourceState = initCGI cfg base base
-            assertBool "Core literal inventory was accidentally shared between views" (CG.cgLits authoredState /= CG.cgLits sourceState)
-        ]
-  where
-    cfg = CmdLine.defConfig
-    owner = G.dataConWorkId G.falseDataCon
-    other = G.dataConWorkId G.trueDataCon
-    boolean = ofType G.boolTy :: SpecType
-    name = F.symbol ("seed-literal-sort" :: String)
-    template = F.PAtom F.Eq (F.EVar name) F.PTrue
-    base =
-        let empty = emptyTarget cfg
-            spec = giSpec empty
-         in empty{giSpec = spec{gsData = (gsData spec){gsMeas = [(name, F.dummyLoc boolean)]}}}
-    stage valid =
-        let spec = giSpec base
-            selected = if valid then other else owner
-            check = RefinementCheck selected (G.Var selected) (F.dummyLoc boolean) mempty
-         in base
-                { giSrc = (giSrc base){giTarget = if valid then "checking" else "admission"}
-                , giSpec =
-                    spec
-                        { gsSig = (gsSig spec){gsReftChecks = [check], gsTySigs = [(selected, F.dummyLoc boolean)]}
-                        , gsData = (gsData spec){gsUnsorted = if valid then [([], template)] else []}
-                        }
-                }
-    checkStage initialize info = do
-        let shared = initialize info
-            direct = initCGI cfg info info
-            ownerKeys = M.keysSet . CG.refinementChecksByOwner
-        ownerKeys shared @?= ownerKeys direct
-        F.isEmptyTemplates (CG.unsorted shared) @?= F.isEmptyTemplates (CG.unsorted direct)
-        F.matchesTemplates (CG.unsorted shared) template @?= F.matchesTemplates (CG.unsorted direct) template
-        giTarget (giSrc (CG.ghcI shared)) @?= giTarget (giSrc info)
-        CG.cgLits shared @?= CG.cgLits direct
-        CG.cgConsts shared @?= CG.cgConsts direct
-        CG.cgADTs shared @?= CG.cgADTs direct
-        CG.freshIndex shared @?= 0
-        F.bindEnvSize (CG.binds shared) @?= 0
-        S.null (CG.visitedRefinementOwners shared) @?= True
-
-concretePredicateArguments :: (String -> String -> IO G.CoreProgram) -> TestTree
-concretePredicateArguments compileToCore = testCase "concrete predicate arguments use one simultaneous substitution" $ do
-    program <- compileToCore "ConcretePredicateArguments" "module ConcretePredicateArguments where\nidentity :: a -> a\nidentity x = x\n"
-    case [ofType (G.varType owner) | (owner, _) <- G.flattenBinds program, G.getOccString owner == "identity"] of
-        [RAllT _ (RFun _ _ carrier@RVar{} _ _) _] -> do
-            let symbol = F.symbol :: String -> F.Symbol
-                declared = [symbol "first", symbol "second"]
-                fresh = [symbol "freshFirst", symbol "freshSecond"]
-                boolean = toRSort (ofType G.boolTy :: SpecType)
-                p = PV (symbol "concretePredicate") (toRSort carrier) [(boolean, name, F.EVar name) | name <- declared]
-                use actuals = (uPVar p){pargs = [(mempty, name, actual) | (name, actual) <- zip declared actuals]}
-                apply formals actuals =
-                    let input = strengthen carrier (MkUReft mempty (Pr [use actuals]))
-                        range = strengthen carrier (uTop (F.Reft (symbol "VV", F.pAnd (F.EVar <$> formals))))
-                     in replacePreds "concrete argument control" input [(p, RProp [(name, boolean) | name <- formals] range)]
-                checks =
-                    [ ("identity", declared, F.EVar <$> declared, F.EVar <$> declared)
-                    , ("fresh replacement formals", fresh, F.EVar <$> declared, F.EVar <$> declared)
-                    , ("mixed actuals", fresh, [F.EVar (symbol "first"), F.EVar (symbol "other")], [F.EVar (symbol "first"), F.EVar (symbol "other")])
-                    , ("expression actuals", fresh, [F.PTrue, F.PFalse], [F.PTrue, F.PFalse])
-                    , ("all defaults", fresh, [], F.EVar <$> declared)
-                    , ("suffix default", fresh, [F.EVar (symbol "other")], [F.EVar (symbol "other"), F.EVar (symbol "second")])
-                    ]
-            mapM_
-                ( \(label, formals, actuals, expected) -> case apply formals actuals of
-                    RVar kept root -> do
-                        assertBool (label ++ ": carrier changed") (G.eqType (toType False (RVar kept mempty :: SpecType)) (toType False carrier))
-                        ur_pred root @?= Pr []
-                        F.reftPred (ur_reft root) @?= F.pAnd expected
-                    _ -> assertFailure (label ++ ": substitution changed the carrier representation")
-                )
-                checks
-        _ -> assertFailure "expected a polymorphic variable carrier"
 
 solutionInstantiation :: TestTree
 solutionInstantiation =
@@ -464,6 +264,191 @@ qualifierPreparation =
         qualifiers @?= [integerQualifier (getSourcePos owner) index | index <- [1 .. count]]
         pure (toInteger before - toInteger after)
 
+authoredGoalPreservation :: TestTree
+authoredGoalPreservation =
+    testGroup
+        "authored subtype conclusions"
+        [ testCase label $ do
+            let direct = conclusions [] predicate
+                inherited = conclusions [([F.vv_], predicate)] predicate
+            length direct @?= 1
+            inherited @?= direct
+        | (label, predicate) <-
+            [ ("matching ill-sorted equation metadata cannot erase a goal", F.PAtom F.Eq (F.EVar F.vv_) F.PTrue)
+            , ("matching well-sorted equation metadata retains the same goal", F.PAtom F.Eq (F.EVar F.vv_) (F.ECon (F.I 0)))
+            ]
+        ]
+  where
+    conclusions templates predicate =
+        let cfg = CmdLine.defConfig
+            empty = emptyTarget cfg
+            spec = giSpec empty
+            names = gsName spec
+            embeds = F.tceInsert G.intTyCon F.intSort F.NoArgs mempty
+            info = empty{giSpec = spec{gsData = (gsData spec){gsUnsorted = templates}, gsName = names{gsTcEmbeds = embeds}}}
+            integer = ofType G.intTy :: SpecType
+            expected = strengthen integer (MkUReft (F.Reft (F.vv_, predicate)) mempty)
+         in evalState
+                ( do
+                    environment <- initEnv (DefaultSchemaSharingTests.schemas info info) [] info
+                    map F.crhs <$> splitC False (CG.SubC environment integer expected)
+                )
+                (initCGI cfg info info)
+
+sourceDependencyIndexing :: (String -> String -> IO G.CoreProgram) -> TestTree
+sourceDependencyIndexing compileToCore =
+    testGroup
+        "source dependency indexing"
+        ( [ testCase label $ do
+                program <-
+                    compileToCore "QueryDependency" $
+                        unlines
+                            [ "module QueryDependency where"
+                            , "helper :: Bool -> Bool"
+                            , "helper x = x"
+                            , "checked :: Bool -> Bool"
+                            , if nested then "checked x = let { {-# NOINLINE nested #-}; nested y = y } in nested x" else "checked x = x"
+                            , "query :: Bool -> Bool"
+                            , "query x = helper x"
+                            ]
+                case (named "helper" program, named "checked" program, named "query" program) of
+                    ([(helper, helperBody)], [(checked, checkedBody)], [(_, queryBody)]) ->
+                        case (identityType checked, identityType helper) of
+                            (Just signature, Just helperType) -> do
+                                let source = [G.NonRec helper helperBody, G.NonRec checked checkedBody]
+                                    info = targetInfo "QueryDependency" source [(checked, signature), (helper, helperType)]
+                                    spec = giSpec info
+                                    checkOwners = if nested then filter ((== "nested") . G.getOccString) (letVars checkedBody) else [checked]
+                                case checkOwners of
+                                    [owner] -> do
+                                        telescope <- either (\message -> assertFailure message >> fail message) pure (alignQueryTelescope signature queryBody)
+                                        let definitions = [(identifier, F.EVar name) | (name, identifier) <- queryValueOwners telescope, not (G.isCoVar identifier)]
+                                            meaning = F.eApps (F.EVar (F.symbol helper)) [F.EVar name | (name, _) <- queryValueOwners telescope]
+                                            predicate = CheckedPredicate queryBody signature telescope meaning definitions mempty [] []
+                                            checks = [RefinementCheck owner queryBody (F.dummyLoc predicate)]
+                                        assertSafe info{giSpec = spec{gsSig = (gsSig spec){gsReftChecks = checks}}}
+                                    _ -> assertFailure ("expected the exact lexical declaration owner: " ++ show (map G.getOccString (letVars checkedBody)))
+                            _ -> assertFailure "expected Boolean source arrows"
+                    _ -> assertFailure "expected the actual query and source owners"
+          | (label, nested) <- [("a query-only Core dependency precedes its declaration owner", False), ("a nested declaration's query-only dependency retains its enclosing group", True)]
+          ]
+            ++ [ testCase "recursive Core edges retain their checked metric scope" $ do
+                    program <-
+                        compileToCore "MetricDependency" $
+                            unlines
+                                [ "module MetricDependency where"
+                                , "loop :: Bool -> Bool"
+                                , "loop True = other False"
+                                , "loop False = False"
+                                , "other :: Bool -> Bool"
+                                , "other True = loop False"
+                                , "other False = False"
+                                ]
+                    case (named "loop" program, named "other" program) of
+                        ([loop@(loopOwner, _)], [other@(otherOwner, _)]) ->
+                            case (plainType loopOwner, plainType otherOwner) of
+                                (Just loopType, Just otherType) -> do
+                                    let signatures = [(loopOwner, loopType), (otherOwner, otherType)]
+                                        info = targetInfo "MetricDependency" [G.Rec [other, loop]] signatures
+                                        spec = giSpec info
+                                        metric = F.EIte (F.EVar (F.symbol ("input" :: String))) (F.ECon (F.I 1)) (F.ECon (F.I 0))
+                                        names = (gsName spec){gsTcEmbeds = F.tceFromList [(G.boolTyCon, (F.boolSort, F.NoArgs))]}
+                                        literals = [(F.symbol (G.dataConWorkId constructor), F.boolSort) | constructor <- [G.trueDataCon, G.falseDataCon]]
+                                        constructors = [(G.dataConWorkId constructor, F.dummyLoc (strengthen (ofType G.boolTy) (uTop (F.exprReft (truth :: F.Expr))))) | (constructor, truth) <- [(G.trueDataCon, F.PTrue), (G.falseDataCon, F.PFalse)]]
+                                    assertSafe info{giSpec = spec{gsSig = (gsSig spec){gsTexprs = [(owner, F.dummyLoc ty, [F.dummyLoc metric]) | (owner, ty) <- signatures]}, gsName = names, gsImps = literals, gsData = (gsData spec){gsCtors = constructors}}}
+                                _ -> assertFailure "expected Boolean recursive arrows"
+                        _ -> assertFailure "expected both actual recursive owners"
+               ]
+        )
+  where
+    named name program = [(owner, body) | (owner, body) <- G.flattenBinds program, G.getOccString owner == name]
+    identityType owner = case ofType (G.varType owner) of
+        RFun _ info input output refinement ->
+            let argument = F.symbol ("input" :: String)
+             in Just $ RFun argument info input (strengthen output (uTop (F.exprReft (F.EVar argument :: F.Expr)))) refinement
+        _ -> Nothing
+    plainType owner = case ofType (G.varType owner) of
+        RFun _ info input output refinement -> Just $ RFun (F.symbol ("input" :: String)) info input output refinement
+        _ -> Nothing
+    targetInfo name source signatures =
+        let empty = emptyTarget CmdLine.defConfig{LH.checkDerived = True, LH.checkRefinements = True, LH.totalHaskell = True, LH.noannotations = True, LH.smtsolver = Just FC.Z3}
+            spec = giSpec empty
+         in empty
+                { giSrc = (giSrc empty){giTarget = name ++ ".hs", giTargetMod = ModName Target (mkModuleName name), giCbs = source, giDefVars = concatMap G.bindersOf source}
+                , giSpec = spec{gsSig = (gsSig spec){gsTySigs = [(owner, F.dummyLoc ty) | (owner, ty) <- signatures]}}
+                }
+    assertSafe info = do
+        (output, _, publication) <- checkTargetInfo info
+        case (o_result output, publication) of
+            (F.Safe _, Just (F.Safe _)) -> pure ()
+            other -> assertFailure ("source dependency judgment was not established: " ++ show other)
+
+initializationSharing :: (String -> String -> IO G.CoreProgram) -> TestTree
+initializationSharing compileToCore =
+    testGroup
+        "query initialization sharing"
+        [ testCase "prepared initialization retains stage owners, templates and target" $ do
+            let initialize = initCGI cfg base
+            mapM_ (checkStage initialize) [stage False, stage True]
+        , testCase "unselected base obligations and templates are not demanded" $ do
+            let spec = giSpec base
+                poisoned =
+                    base
+                        { giSpec =
+                            spec
+                                { gsSig = (gsSig spec){gsReftChecks = [error "unselected base owner"]}
+                                , gsData = (gsData spec){gsUnsorted = [([], error "unselected base template")]}
+                                }
+                        }
+            checkStage (initCGI cfg poisoned) (stage True)
+        , testCase "preparing an initializer does not demand its source or configuration" $
+            void (evaluate (initCGI (error "unused configuration") (error "unused source")))
+        , testCase "authored and filtered Core views retain separate literal inventories" $ do
+            program <- compileToCore "SeedLiterals" "module SeedLiterals where\nliteral = \"seed-literal\"\n"
+            let authored = base{giSrc = (giSrc base){giCbs = program}}
+                authoredState = initCGI cfg authored authored
+                sourceState = initCGI cfg base base
+            assertBool "Core literal inventory was accidentally shared between views" (CG.cgLits authoredState /= CG.cgLits sourceState)
+        ]
+  where
+    cfg = CmdLine.defConfig
+    owner = G.dataConWorkId G.falseDataCon
+    other = G.dataConWorkId G.trueDataCon
+    boolean = ofType G.boolTy :: SpecType
+    name = F.symbol ("seed-literal-sort" :: String)
+    template = F.PAtom F.Eq (F.EVar name) F.PTrue
+    base =
+        let empty = emptyTarget cfg
+            spec = giSpec empty
+         in empty{giSpec = spec{gsData = (gsData spec){gsMeas = [(name, F.dummyLoc boolean)]}}}
+    stage valid =
+        let spec = giSpec base
+            selected = if valid then other else owner
+            predicate = CheckedPredicate (G.Var selected) boolean (QueryTelescope [] []) (if valid then F.PTrue else F.PFalse) [] mempty [] []
+            check = RefinementCheck selected (G.Var selected) (F.dummyLoc predicate)
+         in base
+                { giSrc = (giSrc base){giTarget = if valid then "checking" else "admission"}
+                , giSpec =
+                    spec
+                        { gsSig = (gsSig spec){gsReftChecks = [check], gsTySigs = [(selected, F.dummyLoc boolean)]}
+                        , gsData = (gsData spec){gsUnsorted = if valid then [([], template)] else []}
+                        }
+                }
+    checkStage initialize info = do
+        let shared = initialize info
+            direct = initCGI cfg info info
+            ownerKeys = M.keysSet . CG.refinementChecksByOwner
+        ownerKeys shared @?= ownerKeys direct
+        F.isEmptyTemplates (CG.unsorted shared) @?= F.isEmptyTemplates (CG.unsorted direct)
+        F.matchesTemplates (CG.unsorted shared) template @?= F.matchesTemplates (CG.unsorted direct) template
+        giTarget (giSrc (CG.ghcI shared)) @?= giTarget (giSrc info)
+        CG.cgLits shared @?= CG.cgLits direct
+        CG.cgConsts shared @?= CG.cgConsts direct
+        CG.cgADTs shared @?= CG.cgADTs direct
+        CG.freshIndex shared @?= 0
+        F.bindEnvSize (CG.binds shared) @?= 0
+        S.null (CG.visitedRefinementOwners shared) @?= True
+
 qualifierTarget :: LH.Config -> TargetInfo
 qualifierTarget cfg =
     let empty = emptyTarget cfg
@@ -610,6 +595,31 @@ bareScopeChecks compileToCore =
                         -- A function argument scopes over its result, not over its own domain.
                         accepted "function result scope" (check contraryArgument owner (arrow argument domain (strengthen result (predicate argument))) [])
                         rejected "function own-domain scope" typeError (check contraryArgument owner (arrow argument (strengthen domain (predicate argument)) result) [])
+                        let p = PV (F.symbol ("p#1#1" :: String)) (toRSort domain) []
+                            q = p{pname = F.symbol ("p#1#40" :: String)}
+                            abstract :: SpecType -> RPVar -> SpecType
+                            abstract ty pv = strengthen ty (MkUReft mempty (Pr [uPVar pv]))
+                            nested pv = arrow argument domain (RAllP pv (abstract result pv))
+                        accepted "predicate binder scopes over a nested result" (check mempty owner (nested p) [])
+                        accepted
+                            "outer predicate remains in a nested predicate body"
+                            (check mempty owner (RAllP p (arrow argument domain (RAllP q (abstract result p)))) [])
+                        accepted
+                            "distinct predicate binders retain their lexical scopes"
+                            (check mempty owner (RAllP p (arrow argument (abstract domain p) (RAllP q (abstract result q)))) [])
+                        -- Raw internal types need lexical lookup even without parser hygiene.
+                        let shadowed = p{ptype = toRSort (ofType G.intTy :: SpecType)}
+                        accepted
+                            "nearest raw predicate binder shadows its outer sort"
+                            (check mempty owner (RAllP shadowed (nested p)) [])
+                        rejected
+                            "predicate domain binder does not escape to result"
+                            typeError
+                            (check mempty owner (arrow argument (RAllP p (abstract domain p)) (abstract result p)) [])
+                        rejected
+                            "predicate result binder does not escape to domain"
+                            typeError
+                            (check mempty owner (arrow argument (abstract domain p) (RAllP p (abstract result p))) [])
                         -- Obligation entries form a sequential telescope, separate from its body.
                         let entries = [(argument, domain), (second, strengthen domain (predicate argument))]
                         accepted "sequential obligation entries" (check contraryArgument owner (obligation entries original) [])
@@ -617,6 +627,246 @@ bareScopeChecks compileToCore =
                         rejected "obligation entries do not escape" typeError (check contraryArgument owner (obligation entries (arrow second domain (strengthen result (predicate argument)))) [])
                     _ -> assertFailure "expected the Bool -> Bool checking telescope"
             _ -> assertFailure "expected the source owner, its lambda, and its local function"
+
+predicateScopeJudgments :: (String -> String -> IO G.CoreProgram) -> TestTree
+predicateScopeJudgments compileToCore =
+    testGroup
+        "nested predicate source judgments"
+        [ testCase label $ do
+            program <- compileToCore moduleName (unlines ["module " ++ moduleName ++ " where", "checked :: Bool -> Bool -> Bool", "checked outer inner = " ++ selected])
+            case [(owner, body) | (owner, body) <- G.flattenBinds program, G.getOccString owner == "checked"] of
+                [(owner, body)] ->
+                    case ofType (G.varType owner) of
+                        RFun _ outerInfo domain (RFun _ innerInfo input result innerReft) outerReft -> do
+                            let p = PV (F.symbol ("p#1#1" :: String)) (toRSort domain) []
+                                q = if shadow then p else p{pname = F.symbol ("p#1#40" :: String)}
+                                abstract :: SpecType -> RPVar -> SpecType
+                                abstract ty pv = strengthen ty (MkUReft mempty (Pr [uPVar pv]))
+                                declared = RAllP p (RFun (F.symbol ("outer" :: String)) outerInfo (abstract domain p) (RAllP q (RFun (F.symbol ("inner" :: String)) innerInfo (abstract input q) (abstract result q) innerReft)) outerReft)
+                                empty = emptyTarget CmdLine.defConfig{LH.checkDerived = True, LH.checkRefinements = True, LH.totalHaskell = True, LH.noannotations = True, LH.smtsolver = Just FC.Z3}
+                                source = (giSrc empty){giTarget = moduleName ++ ".hs", giTargetMod = ModName Target (mkModuleName moduleName), giCbs = [G.NonRec owner body], giDefVars = [owner]}
+                                spec = giSpec empty
+                                info = empty{giSrc = source, giSpec = spec{gsSig = (gsSig spec){gsTySigs = [(owner, F.dummyLoc declared)]}}}
+                            (output, _, _) <- checkTargetInfo info
+                            case (accepts, o_result output) of
+                                (True, F.Safe _) -> pure ()
+                                (False, F.Unsafe _ _) -> pure ()
+                                _ -> assertFailure (label ++ ": " ++ show (o_result output))
+                        _ -> assertFailure "expected a Bool -> Bool -> Bool source telescope"
+                _ -> assertFailure "expected one checked source owner"
+        | (label, moduleName, selected, accepts, shadow) <-
+            [ ("a nested universally quantified callback returns its own input", "NestedPredicateIdentity", "inner", True, False)
+            , ("an outer predicate cannot establish an independent inner result", "NestedPredicateCapture", "outer", False, False)
+            , ("raw same-name nested predicates retain the inner identity", "RawNestedPredicateIdentity", "inner", True, True)
+            , ("raw same-name nested predicates cannot capture an outer input", "RawNestedPredicateCapture", "outer", False, True)
+            ]
+        ]
+
+concretePredicateArguments :: (String -> String -> IO G.CoreProgram) -> TestTree
+concretePredicateArguments compileToCore = testCase "concrete predicate arguments use one simultaneous substitution" $ do
+    program <- compileToCore "ConcretePredicateArguments" "module ConcretePredicateArguments where\nidentity :: a -> a\nidentity x = x\n"
+    case [ofType (G.varType owner) | (owner, _) <- G.flattenBinds program, G.getOccString owner == "identity"] of
+        [RAllT _ (RFun _ _ carrier@RVar{} _ _) _] -> do
+            let symbol = F.symbol :: String -> F.Symbol
+                declared = [symbol "first", symbol "second"]
+                fresh = [symbol "freshFirst", symbol "freshSecond"]
+                boolean = toRSort (ofType G.boolTy :: SpecType)
+                p = PV (symbol "concretePredicate") (toRSort carrier) [(boolean, name, F.EVar name) | name <- declared]
+                use actuals = (uPVar p){pargs = [(mempty, name, actual) | (name, actual) <- zip declared actuals]}
+                apply formals actuals =
+                    let input = strengthen carrier (MkUReft mempty (Pr [use actuals]))
+                        range = strengthen carrier (uTop (F.Reft (symbol "VV", F.pAnd (F.EVar <$> formals))))
+                     in replacePreds "concrete argument control" input [(p, RProp [(name, boolean) | name <- formals] range)]
+                checks =
+                    [ ("identity", declared, F.EVar <$> declared, F.EVar <$> declared)
+                    , ("fresh replacement formals", fresh, F.EVar <$> declared, F.EVar <$> declared)
+                    , ("mixed actuals", fresh, [F.EVar (symbol "first"), F.EVar (symbol "other")], [F.EVar (symbol "first"), F.EVar (symbol "other")])
+                    , ("expression actuals", fresh, [F.PTrue, F.PFalse], [F.PTrue, F.PFalse])
+                    , ("all defaults", fresh, [], F.EVar <$> declared)
+                    , ("suffix default", fresh, [F.EVar (symbol "other")], [F.EVar (symbol "other"), F.EVar (symbol "second")])
+                    ]
+            mapM_
+                ( \(label, formals, actuals, expected) -> case apply formals actuals of
+                    RVar kept root -> do
+                        assertBool (label ++ ": carrier changed") (G.eqType (toType False (RVar kept mempty :: SpecType)) (toType False carrier))
+                        ur_pred root @?= Pr []
+                        F.reftPred (ur_reft root) @?= F.pAnd expected
+                    _ -> assertFailure (label ++ ": substitution changed the carrier representation")
+                )
+                checks
+        _ -> assertFailure "expected a polymorphic variable carrier"
+
+predicateCarrierPresentation :: TestTree
+predicateCarrierPresentation = testCase "predicate substitution refuses unsupported equal-carrier presentations" $
+    case ofType (mkListTy G.boolTy) :: SpecType of
+        canonical@(RApp c [argument] [] _) -> do
+            let applied = RAppTy (RApp c [] [] mempty) argument mempty
+                p = PV (F.symbol ("presentationPredicate" :: String)) (toRSort canonical) []
+                input = strengthen applied (MkUReft mempty (Pr [uPVar p]))
+                replacement = strengthen canonical (uTop (F.Reft (F.symbol ("vv" :: String), F.PFalse)))
+                substituted = replacePreds "presentation control" input [(p, RProp [] replacement)]
+            assertBool "the presentations must have equal GHC carriers" (G.eqType (toType False applied) (toType False canonical))
+            case replacePreds "atomic presentation control" input [(p, RProp [] (RHole (uTop (F.Reft (F.symbol ("vv" :: String), F.PFalse)))))] of
+                RAppTy keptHead keptArgument root -> do
+                    keptHead @?= RApp c [] [] mempty
+                    keptArgument @?= argument
+                    ur_pred root @?= Pr []
+                    F.reftPred (ur_reft root) @?= F.PFalse
+                _ -> assertFailure "atomic substitution changed the application presentation"
+            outcome <- try (evaluate (rnf substituted)) :: IO (Either ErrorCall ())
+            case outcome of
+                Left diagnostic -> assertBool "must explain the unsupported carrier" ("carrier" `isInfixOf` displayException diagnostic)
+                Right () -> assertFailure ("unsupported carrier was silently admitted: " ++ F.showpp substituted)
+        _ -> assertFailure "expected a canonical list carrier"
+
+predicateCarrierMetadata :: TestTree
+predicateCarrierMetadata = testCase "atomic predicate instantiation preserves owned metadata and dependent formals" $
+    case ofType (mkListTy G.boolTy) :: SpecType of
+        canonical@(RApp c [argument] [] r) -> do
+            let formal = F.symbol ("declaredFormal" :: String)
+                freshFormal = F.symbol ("freshFormal" :: String)
+                actual = F.symbol ("actualArgument" :: String)
+                sort = toRSort argument
+                p = PV (F.symbol ("atomicPredicate" :: String)) (toRSort canonical) [(sort, formal, F.EVar formal)]
+                ownedInfo = TyConInfo [Contravariant] [Invariant] Nothing
+                owned = RTyCon (rtc_tc c) [p] ownedInfo
+                child = strengthen argument (uTop (F.Reft (F.symbol ("child" :: String), F.PFalse)))
+                property = RProp [(formal, sort)] child
+                carrier = RApp owned [child] [property] r
+                root = uTop (F.Reft (F.symbol ("atomicValue" :: String), F.EVar freshFormal))
+                apply used = replacePreds "atomic metadata control" (strengthen carrier (MkUReft mempty (Pr [used]))) [(p, RProp [(freshFormal, sort)] (RHole root))]
+                check used expected = case apply used of
+                    RApp (RTyCon _ retainedPredicates retainedInfo) [keptChild] [keptProperty] instantiated -> do
+                        show retainedPredicates @?= show [p]
+                        show retainedInfo @?= show ownedInfo
+                        keptChild @?= child
+                        keptProperty @?= property
+                        ur_pred instantiated @?= Pr []
+                        F.reftPred (ur_reft instantiated) @?= F.EVar expected
+                    _ -> assertFailure "atomic substitution changed the owned carrier"
+            check (uPVar p) formal
+            check (uPVar p){pargs = [(mempty, formal, F.EVar actual)]} actual
+            check (uPVar p){pargs = []} formal
+            let rejects label replacement used = do
+                    outcome <- try (evaluate (rnf (replacePreds label (strengthen carrier (MkUReft mempty (Pr [used]))) [(p, replacement)]))) :: IO (Either ErrorCall ())
+                    case outcome of
+                        Left diagnostic -> assertBool label ("carrier" `isInfixOf` displayException diagnostic || "arity" `isInfixOf` displayException diagnostic)
+                        Right () -> assertFailure (label ++ ": malformed atomic instantiation admitted")
+            rejects "formal arity" (RProp [] (RHole root)) (uPVar p)
+            rejects "formal carrier" (RProp [(freshFormal, toRSort (ofType G.intTy :: SpecType))] (RHole root)) (uPVar p)
+            rejects "actual arity" (RProp [(freshFormal, sort)] (RHole root)) (uPVar p){pargs = [(mempty, formal, F.EVar actual), (mempty, actual, F.EVar actual)]}
+        _ -> assertFailure "expected a canonical list carrier"
+
+freshPredicateGeneration :: TestTree
+freshPredicateGeneration = testCase "fresh predicate inference uses one scoped root KVar and fresh dependent formals" $ do
+    let info = emptyTarget CmdLine.defConfig
+        carrier = ofType (mkListTy G.boolTy) :: SpecType
+        boolean = ofType G.boolTy :: SpecType
+        formal = F.symbol ("sourceFormal" :: String)
+        p = PV (F.symbol ("freshPredicate" :: String)) (toRSort carrier) [(toRSort boolean, formal, F.EVar formal)]
+        action = do
+            environment <- initEnv (DefaultSchemaSharingTests.schemas info info) [] info
+            freshPredRef environment p
+        (property, state) = runState action (initCGI (LH.getConfig info) info info)
+    case property of
+        RProp [(freshFormal, _)] (RHole root) -> do
+            assertBool "the dependent formal must be fresh" (freshFormal /= formal)
+            case CG.hsWfs state of
+                [CG.WfC environment (RApp _ [child] [] checkedRoot)] -> do
+                    checkedRoot @?= root
+                    assertBool "child contracts must not be inferred for a Boolean predicate" (F.isTautoReft (rTypeReft child))
+                    case lookupREnv freshFormal (CG.renv environment) of
+                        Just binding -> do
+                            assertBool "fresh formal has its declared carrier" (G.eqType (toType False binding) G.boolTy)
+                            assertBool "fresh formal must have a trivial checking type" (F.isTautoReft (rTypeReft binding))
+                        Nothing -> assertFailure "fresh formal escaped its wellformedness scope"
+                _ -> assertFailure "missing root-only predicate wellformedness constraint"
+            assertBool "predicate KVar profiling must be retained" ("PredInstE" `isInfixOf` F.showpp (CG.kvProf state))
+            case F.reftPred (ur_reft root) of
+                F.PKVar kvar _ _ -> do
+                    let instantiated = replacePreds "fresh formal control" (strengthen carrier (MkUReft mempty (Pr [uPVar p]))) [(p, property)]
+                    case M.lookup kvar (F.exprKVars (F.reftPred (rTypeReft instantiated))) of
+                        Just [substitution] -> M.lookup freshFormal (F.fromKVarSubst substitution) @?= Just (F.EVar formal)
+                        _ -> assertFailure "the root KVar changed or was duplicated"
+                _ -> assertFailure "fresh predicate is not one atomic root KVar"
+        _ -> assertFailure "fresh predicate inference produced a structural contract"
+
+predicateCarrierSubstitution :: (String -> String -> IO G.CoreProgram) -> TestTree
+predicateCarrierSubstitution compileToCore = testCase "predicate instantiation preserves compound carriers and obligation roots" $ do
+    program <- compileToCore "PredicateCarrierSubstitution" "module PredicateCarrierSubstitution where\npoly :: f Bool -> f Bool\npoly x = x\n"
+    case [ofType (G.varType owner) | (owner, _) <- G.flattenBinds program, G.getOccString owner == "poly"] of
+        [original@(RAllT variable body@(RFun _ _ carrier _ _) outerRef)] -> do
+            let abstract :: SpecType -> RPVar -> SpecType
+                abstract ty pv = strengthen ty (MkUReft mempty (Pr [uPVar pv]))
+                falseRef :: UReftBV F.Symbol F.Symbol
+                falseRef = uTop (F.Reft (F.symbol ("vv" :: String), F.PFalse))
+                instantiate :: SpecType -> SpecType -> SpecType
+                instantiate target replacement =
+                    let p = PV (F.symbol ("carrierPredicate" :: String)) (toRSort replacement) []
+                     in replacePreds "carrier substitution control" (abstract target p) [(p, RProp [] (RHole falseRef))]
+                checkRoot :: String -> SpecType -> IO ()
+                checkRoot label instantiated = do
+                    let root = case instantiated of
+                            RAppTy _ _ r -> r
+                            RAllT _ _ r -> r
+                            _ -> mempty
+                    ur_pred root @?= Pr []
+                    assertBool (label ++ ": replacement refinement disappeared") (F.reftPred (ur_reft root) == F.PFalse)
+                boolType = ofType G.boolTy :: SpecType
+            let metadata = ty_var_info variable
+                changed = RAllT variable{ty_var_info = metadata{rtv_is_pol = not (rtv_is_pol metadata)}} body outerRef
+            case instantiate changed changed of
+                RAllT retained keptBody _ -> do
+                    ty_var_info retained @?= metadata{rtv_is_pol = not (rtv_is_pol metadata)}
+                    keptBody @?= body
+                _ -> assertFailure "atomic substitution changed the quantified carrier"
+            checkRoot "higher-kinded application" (instantiate carrier carrier)
+            checkRoot "type-quantified carrier" (instantiate original original)
+            let p = PV (F.symbol ("obligationPredicate" :: String)) (toRSort boolType) []
+                obligation = RRTy [] (MkUReft mempty (Pr [uPVar p])) OCons boolType
+                instantiated = replacePreds "obligation substitution control" obligation [(p, RProp [] (RHole falseRef))]
+            case instantiated of
+                RRTy [] root OCons _ -> do
+                    ur_pred root @?= Pr []
+                    F.reftPred (ur_reft root) @?= F.PFalse
+                _ -> assertFailure "obligation structure changed"
+        _ -> assertFailure "expected a higher-kinded carrier under a type quantifier"
+
+higherKindedPredicateJudgments :: (String -> String -> IO G.CoreProgram) -> TestTree
+higherKindedPredicateJudgments compileToCore =
+    testGroup
+        "higher-kinded predicate source judgments"
+        [ testCase label $ do
+            program <- compileToCore moduleName (unlines ["module " ++ moduleName ++ " where", "checked :: (f Bool -> Bool) -> f Bool -> Bool", "checked selector container = selector container"])
+            case [(owner, body) | (owner, body) <- G.flattenBinds program, G.getOccString owner == "checked"] of
+                [(owner, body)] -> case ofType (G.varType owner) of
+                    RAllT tv (RFun x i (RFun y j carrier result cr) (RFun z k _ _ ar) rr) tr -> do
+                        let p = PV (F.symbol ("p#1#1" :: String)) (toRSort result) []
+                            q = p{pname = F.symbol ("q#1#1" :: String)}
+                            abstract :: SpecType -> RPVar -> SpecType
+                            abstract ty pv = strengthen ty (MkUReft mempty (Pr [uPVar pv]))
+                            member pv = case carrier of
+                                RAppTy headType argument r -> RAppTy headType (abstract argument pv) r
+                                _ -> carrier
+                            callback = RAllP p (RFun y j (member p) (abstract result p) cr)
+                            outcome = if accepts then abstract result q else strengthen result (uTop (F.Reft (F.symbol ("vv" :: String), F.PFalse)))
+                            input = if accepts then member q else carrier
+                            arrow = RFun x i callback (RFun z k input outcome ar) rr
+                            declared = RAllT tv (if accepts then RAllP q arrow else arrow) tr
+                            empty = emptyTarget CmdLine.defConfig{LH.checkDerived = True, LH.checkRefinements = True, LH.totalHaskell = True, LH.noannotations = True, LH.smtsolver = Just FC.Z3}
+                            source = (giSrc empty){giTarget = moduleName ++ ".hs", giTargetMod = ModName Target (mkModuleName moduleName), giCbs = [G.NonRec owner body], giDefVars = [owner]}
+                            spec = giSpec empty
+                            info = empty{giSrc = source, giSpec = spec{gsSig = (gsSig spec){gsTySigs = [(owner, F.dummyLoc declared)]}}}
+                        assertBool "control requires an RAppTy carrier" (case carrier of RAppTy{} -> True; _ -> False)
+                        (output, _, _) <- checkTargetInfo info
+                        case (accepts, o_result output) of
+                            (True, F.Safe _) -> pure ()
+                            (False, F.Unsafe _ _) -> pure ()
+                            _ -> assertFailure (label ++ ": " ++ show (o_result output))
+                    _ -> assertFailure "expected a higher-kinded callback source telescope"
+                _ -> assertFailure "expected one checked source owner"
+        | (label, moduleName, accepts) <- [("preserves the member predicate", "HigherKindedPredicateIdentity", True), ("cannot produce a false result from an unrefined container", "HigherKindedPredicateCapture", False)]
+        ]
 
 authoredPresentation :: (String -> String -> IO G.CoreProgram) -> TestTree
 authoredPresentation compileToCore =

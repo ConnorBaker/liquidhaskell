@@ -7,6 +7,7 @@ import Control.Exception (evaluate, throw, try)
 import Control.Monad (void)
 import Control.Monad.IO.Class (liftIO)
 import Data.Either (isLeft)
+import Data.Foldable (toList)
 import Data.Generics (everywhere, mkT)
 import Data.IORef (newIORef, readIORef, writeIORef)
 import Data.List (find)
@@ -14,11 +15,14 @@ import Data.String (fromString)
 import Data.Time (getCurrentTime)
 import qualified GHC
 import qualified GHC.Builtin.Types as G (integerTy)
+import qualified GHC.Data.Bag as Bag (isEmptyBag)
 import qualified GHC.Data.FastString as G (fsLit)
 import qualified GHC.Data.StringBuffer as G (stringToStringBuffer)
+import qualified GHC.Driver.Session as Session
 import qualified GHC.Hs as G (mkHsLam, nlHsVar, nlVarPat)
 import GHC.Paths (libdir)
-import qualified GHC.Tc.Utils.Monad as Tc (initTcWithGbl)
+import qualified GHC.Tc.Utils.Monad as Tc (initTcWithGbl, tryTc)
+import qualified GHC.Types.Error as Diagnostic (errorsFound, getMessages)
 import qualified GHC.Types.Name.Occurrence as G (mkDataOcc, mkVarOcc)
 import qualified GHC.Types.Name.Reader as G (mkRdrUnqual)
 import qualified GHC.Types.SrcLoc as G (mkRealSrcLoc, mkRealSrcSpan)
@@ -30,10 +34,10 @@ import qualified Language.Haskell.Liquid.Bare.Types as Bare
 import qualified Language.Haskell.Liquid.GHC.Misc as GM
 import qualified Language.Haskell.Liquid.Transforms.CoreToLogic as Logic
 import Language.Haskell.Liquid.Types.Errors (Oblig (OCons), TError (ErrOther, ErrTySpec), UserError)
-import Language.Haskell.Liquid.Types.RType (PVarBV (PV), PredicateBV (Pr), RTyCon (RTyCon), RTyVar (RTV), RTypeBV (RAllP, RApp, RHole, RRTy), SpecType, pattern MkUReft)
+import Language.Haskell.Liquid.Types.RType (PVarBV (PV), PredicateBV (Pr), RTyCon (RTyCon), RTyVar (RTV), RTypeBV (RAllP, RAllT, RApp, RFun, RHole, RRTy), SpecType, pattern MkUReft)
 import Language.Haskell.Liquid.Types.RTypeOp
 import Language.Haskell.Liquid.Types.RefType (ofType, strengthen, toType)
-import Language.Haskell.Liquid.Types.Types (Error, MeasureKind (MsMeasure), ModName (..), ModType (..), TyConMap (..))
+import Language.Haskell.Liquid.Types.Types (CheckedPredicate (..), CheckedRefinement (..), Error, MeasureKind (MsMeasure), ModName (..), ModType (..), QueryTelescope (..), TyConMap (..), checkedOrdinary, ordinarySpecType)
 import Language.Haskell.Liquid.UX.CmdLine (defConfig)
 import qualified Liquid.GHC.API as G
 import Test.Tasty (TestTree, testGroup, withResource)
@@ -68,8 +72,8 @@ tests compileToCore = withResource prepare (const (pure ())) $ \fixture ->
             program <- fixture
             (owner, core) <- binding "one" program
             let source = named ["evidence", "$dordinary"] owner
-            (owners, _) <- either (\message -> assertFailure message >> pure ([], [])) pure (alignQueryTelescope source core)
-            map snd owners @?= [F.EVar "evidence", F.EVar "$dordinary"]
+            telescope <- either (\message -> assertFailure message >> pure (QueryTelescope [] [])) pure (alignQueryTelescope source core)
+            map fst (queryValueOwners telescope) @?= ["evidence", "$dordinary"]
         , testCase "distinct nominal inputs cannot share an embedding" $ do
             program <- fixture
             (owner, core) <- binding "ordinary" program
@@ -91,8 +95,8 @@ tests compileToCore = withResource prepare (const (pure ())) $ \fixture ->
             program <- fixture
             (owner, core) <- binding "two" program
             let source = named ["first", "second", "left", "right"] owner
-            (owners, _) <- either (\message -> assertFailure message >> pure ([], [])) pure (alignQueryTelescope source core)
-            map snd owners @?= map F.EVar ["first", "second", "left", "right"]
+            telescope <- either (\message -> assertFailure message >> pure (QueryTelescope [] [])) pure (alignQueryTelescope source core)
+            map fst (queryValueOwners telescope) @?= ["first", "second", "left", "right"]
         , testCase "anonymous owners are distinct and avoid the source catalog" $ do
             program <- fixture
             (owner, _) <- binding "two" program
@@ -149,7 +153,7 @@ tests compileToCore = withResource prepare (const (pure ())) $ \fixture ->
             (_, core) <- binding "two" program
             case alignQueryTelescope (fromRTypeRep refreshed) core of
                 Left message -> assertFailure message
-                Right (owners, _) -> map snd owners @?= map F.EVar (ty_binds refreshed)
+                Right telescope -> map fst (queryValueOwners telescope) @?= ty_binds refreshed
         , testCase "a value shadowing dictionary evidence keeps distinct checked owners" $ do
             program <- fixture
             (owner, core) <- binding "one" program
@@ -164,7 +168,7 @@ tests compileToCore = withResource prepare (const (pure ())) $ \fixture ->
                 _ -> assertFailure "value shadowing changed the telescope"
             case alignQueryTelescope (fromRTypeRep refreshed) core of
                 Left message -> assertFailure message
-                Right (owners, _) -> map snd owners @?= map F.EVar (ty_binds refreshed)
+                Right telescope -> map fst (queryValueOwners telescope) @?= ty_binds refreshed
         , testCase "subtype endpoints do not bind each other's owner labels" $ do
             program <- fixture
             (owner, _) <- binding "two" program
@@ -229,6 +233,11 @@ tests compileToCore = withResource prepare (const (pure ())) $ \fixture ->
             case alignQueryTelescope source core of
                 Left message -> assertFailure message
                 Right _ -> pure ()
+        , testCase "a local forall does not change the predicate body's result carrier" $
+            void $
+                checkedSourceQuery $ \program -> do
+                    (owner, _) <- binding "localQuery" program
+                    pure (localResult (ofType $ G.varType owner), [], [])
         , testCase "normalized primitive query still refuses a nominal source mismatch" $ do
             (source, core) <- checkedStorableQuery False
             let representation = toRTypeRep source
@@ -241,9 +250,9 @@ tests compileToCore = withResource prepare (const (pure ())) $ \fixture ->
             (source, core) <- checkedStorableQuery True
             case alignQueryTelescope source core of
                 Left message -> assertFailure message
-                Right (owners, _) -> do
-                    let names = map snd owners
-                    assertBool "represented value reused the enclosing input owner" (length (filter (== F.EVar "input") names) == 1)
+                Right telescope -> do
+                    let names = map fst (queryValueOwners telescope)
+                    assertBool "represented value reused the enclosing input owner" (length (filter (== "input") names) == 1)
         , testCase "source catalog duplicates retain their last declaration" $
             void $
                 checkedSourceQuery (const (pure (catalogType, duplicateCatalog, [])))
@@ -282,6 +291,7 @@ tests compileToCore = withResource prepare (const (pure ())) $ \fixture ->
         compileToCore "QueryTelescope" $
             unlines
                 [ "{-# LANGUAGE ExplicitForAll #-}"
+                , "{-# LANGUAGE RankNTypes #-}"
                 , "module QueryTelescope where"
                 , "class K a where k :: a -> Bool"
                 , "class L a where l :: a -> Bool"
@@ -354,13 +364,19 @@ assertQueryRefusal action = do
         Left other -> assertFailure ("unexpected source-query error: " ++ show other)
         Right () -> assertFailure "ill-sorted source query was admitted"
 
+localResult :: SpecType -> SpecType
+localResult (RFun owner info domain result reft) = RFun owner info domain (localResult result) reft
+localResult (RAllT variable result reft) = RAllT variable (localResult result) reft
+localResult ty = strengthen ty (MkUReft (F.Reft ("localResult", F.PNot F.PFalse)) mempty)
+
 checkedSourceQuery ::
     (G.CoreProgram -> IO (SpecType, [(F.Symbol, MeasureKind, SpecType)], [(F.Symbol, G.Var)])) ->
     IO (SpecType, SpecType, G.CoreExpr)
 checkedSourceQuery inputs = GHC.runGhc (Just libdir) $ do
     now <- liftIO getCurrentTime
     flags <- GHC.getSessionDynFlags
-    void $ GHC.setSessionDynFlags flags{GHC.backend = GHC.interpreterBackend}
+    let generatedWarnings = [Session.Opt_WarnNameShadowing, Session.Opt_WarnUnusedLocalBinds, Session.Opt_WarnUnusedMatches]
+    void $ GHC.setSessionDynFlags (foldl Session.wopt_set flags{GHC.backend = GHC.interpreterBackend} generatedWarnings)
     let source =
             unlines
                 [ "{-# LANGUAGE ExplicitForAll #-}"
@@ -373,6 +389,8 @@ checkedSourceQuery inputs = GHC.runGhc (Just libdir) $ do
                 , "plen _ = 0"
                 , "identity :: forall a. a -> a"
                 , "identity x = x"
+                , "localQuery :: Int -> forall a. a -> Bool"
+                , "localQuery _ _ = True"
                 ]
         target =
             GHC.Target
@@ -397,9 +415,18 @@ checkedSourceQuery inputs = GHC.runGhc (Just libdir) $ do
     captured <- liftIO $ newIORef Nothing
     let Just (integerConstructor, _) = G.splitTyConApp_maybe G.integerTy
         embeddings = F.tceInsert integerConstructor F.FInt F.WithArgs (F.tceInsert G.boolTyCon F.boolSort F.WithArgs (F.tceInsert G.intTyCon F.FInt F.WithArgs mempty))
-        collect _ core ty _ = liftIO $ writeIORef captured (Just (ty, core))
+        collect query = liftIO $ writeIORef captured (Just (predicateSignature query, predicateCore query))
     (_, result) <- liftIO $ Tc.initTcWithGbl environment global (G.mkRealSrcSpan location location) $ do
-        _ <- GM.elabRnExprWithType body (G.varType owner)
+        before <- G.getDynFlags
+        (valid, generatedDiagnostics) <- Tc.tryTc (GM.elabRnExprWithType body (G.varType owner))
+        (invalid, diagnostics) <- Tc.tryTc (GM.elabRnExprWithType body G.intTy)
+        after <- G.getDynFlags
+        liftIO $ do
+            assertBool "valid generated query was rejected" (case valid of Just _ -> True; Nothing -> False)
+            assertBool "generated-only warnings escaped" (Bag.isEmptyBag (Diagnostic.getMessages generatedDiagnostics))
+            assertBool "generated query type errors were suppressed" (case invalid of Nothing -> Diagnostic.errorsFound diagnostics; Just _ -> False)
+            map (`Session.wopt` before) generatedWarnings @?= replicate 3 True
+            map (`Session.wopt` after) generatedWarnings @?= replicate 3 True
         elaborateSpecTypeWithPrimitives
             False
             (FC.ElabFlags False False)
@@ -416,5 +443,8 @@ checkedSourceQuery inputs = GHC.runGhc (Just libdir) $ do
     liftIO $ case result of
         Nothing -> assertFailure "query elaboration failed" >> fail "query elaboration"
         Just readback -> do
+            let attached = [(checkedOrdinary refinement, query) | refinement <- toList readback, query <- checkedPredicates refinement]
+            assertBool "source queries were detached from the represented type tree" (not $ null attached)
+            mapM_ (\(MkUReft concrete _, query) -> F.reftPred concrete @?= predicateReadback query) attached
             (source, core) <- readIORef captured >>= maybe (assertFailure "query not collected" >> fail "query collection") pure
-            pure (readback, source, core)
+            pure (ordinarySpecType readback, source, core)

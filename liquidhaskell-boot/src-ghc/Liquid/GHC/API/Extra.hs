@@ -15,6 +15,8 @@ module Liquid.GHC.API.Extra (
   , isPatErrorAlt
   , minus_RDR
   , qualifiedNameFS
+  , displayNameFS
+  , qualifiedModuleFS
   , renderWithStyle
   , showPprQualified
   , showPprDebug
@@ -29,6 +31,7 @@ module Liquid.GHC.API.Extra (
 
 import Control.Monad
 import Control.Monad.IO.Class
+import qualified Data.ByteString.Char8 as ByteString
 import GHC.Conc (getAllocationCounter)
 import Debug.Trace
 import GHC.Clock (getMonotonicTimeNSec)
@@ -59,6 +62,7 @@ import GHC.Types.Unique               (getUnique, hasKey)
 
 import GHC.Utils.Error                as Ghc
 import GHC.Utils.Logger               as Ghc
+import GHC.Utils.Encoding (zEncodeString)
 import GHC.Utils.Outputable           as Ghc hiding ((<>))
 import qualified GHC.Utils.Outputable as Ghc
 
@@ -215,12 +219,27 @@ isPatErrorAlt (Alt _ _ exprCoreBndr) = hasPatErrorCall exprCoreBndr
    unTick e = e
 
 
+-- | Canonical module identity includes the complete unit, not its display name.
+qualifiedModuleFS :: Module -> FastString
+qualifiedModuleFS m = concatFS
+    [ mkFastString $ "U" ++ zEncodeString (ByteString.unpack $ bytesFS $ unitFS $ moduleUnit m)
+    , fsLit "."
+    , moduleNameFS (moduleName m)
+    ]
+
 qualifiedNameFS :: Name -> FastString
-qualifiedNameFS n = concatFS [modFS, occFS, uniqFS]
+qualifiedNameFS = nameFSWith qualifiedModuleFS
+
+-- | Source-facing spelling omits the unit; semantic identity never does.
+displayNameFS :: Name -> FastString
+displayNameFS = nameFSWith (moduleNameFS . moduleName)
+
+nameFSWith :: (Module -> FastString) -> Name -> FastString
+nameFSWith moduleFS n = concatFS [modFS, occFS, uniqFS]
   where
   modFS = case nameModule_maybe n of
             Nothing -> fsLit ""
-            Just m  -> concatFS [moduleNameFS (moduleName m), fsLit "."]
+            Just m  -> concatFS [moduleFS m, fsLit "."]
 
   occFS = occNameFS (getOccName n)
   uniqFS

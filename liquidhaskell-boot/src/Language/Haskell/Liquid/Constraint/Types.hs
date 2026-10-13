@@ -9,6 +9,7 @@ module Language.Haskell.Liquid.Constraint.Types
 
     -- * Constraint information
   , CGInfo (..)
+  , AdmittedInterfaces (..)
 
     -- * Constraint Generation Environment
   , CGEnv (..)
@@ -28,7 +29,7 @@ module Language.Haskell.Liquid.Constraint.Types
   , elemHEnv
 
    -- * Subtyping Constraints
-  , SubC (..)
+  , SubC, SubCWith (..)
   , FixSubC
 
   , subVar
@@ -86,6 +87,17 @@ import           Language.Haskell.Liquid.Types.Types hiding (binds)
 
 type CG = State CGInfo
 
+-- A completed source judgment, not a declaration inventory. The source driver
+-- supplies a row only after both its body and interface inclusion are proved.
+-- Located ordinary endpoints are the scoped solution of that same catalog row.
+newtype AdmittedInterfaces = AdmittedInterfaces [(Var, MethodType LocSpecType)]
+
+instance Semigroup AdmittedInterfaces where
+    AdmittedInterfaces left <> AdmittedInterfaces right = AdmittedInterfaces (left <> right)
+
+instance Monoid AdmittedInterfaces where
+    mempty = AdmittedInterfaces []
+
 data CGEnv = CGE
   { cgLoc    :: !SpanStack         -- ^ Location in original source file
   , renv     :: !REnv              -- ^ SpecTypes for Bindings in scope
@@ -137,9 +149,11 @@ getLocation = srcSpan . cgLoc
 
 -- RJ: what is the difference between these two?
 
-data SubC     = SubC { senv  :: !CGEnv
-                     , lhs   :: !SpecType
-                     , rhs   :: !SpecType
+type SubC = SubCWith UReft
+
+data SubCWith r = SubC { senv  :: !CGEnv
+                     , lhs   :: !(RRType r)
+                     , rhs   :: !(RRType r)
                      }
               | SubR { senv  :: !CGEnv
                      , oblig :: !Oblig
@@ -235,6 +249,8 @@ data CGInfo = CGInfo
   , allowHO       :: !Bool
   , ghcI          :: !TargetInfo
   , dataConTys    :: ![(Var, SpecType)]                  -- ^ Refined Types of Data Constructors
+  , admittedInterfaces :: !AdmittedInterfaces          -- ^ Completed source interface judgments
+  , interfaceEndpoints :: ![(Var, MethodType LocSpecType)] -- ^ Exact generated inclusion endpoints
   , unsorted      :: !F.Templates                        -- ^ Potentially unsorted expressions
   , hsHoles       :: !(M.HashMap (Var, SrcSpan) (HoleInfo (CGInfo, CGEnv) SpecType)) -- Information about holes in terms
   , hsANFHoles    :: !(M.HashMap Var  (Var, SrcSpan))

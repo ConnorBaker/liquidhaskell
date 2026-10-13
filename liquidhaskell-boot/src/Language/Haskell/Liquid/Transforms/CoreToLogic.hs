@@ -39,6 +39,9 @@ import           Data.Maybe                            (listToMaybe)
 import qualified Data.Text                             as T
 import qualified Data.Char
 import qualified Text.Printf as Printf
+import qualified Language.Haskell.TH.Syntax as TH
+import qualified GHC.Types.Name.Occurrence as Occ
+import qualified GHC.List as List
 import           Data.Text.Encoding
 import           Data.Text.Encoding.Error
 import           Control.Monad (forM, unless, zipWithM)
@@ -50,7 +53,7 @@ import           Language.Fixpoint.Types               hiding (panic, Error, R, 
 import qualified Language.Fixpoint.Types               as F
 import qualified Language.Fixpoint.Types.Visitor       as Vis
 import qualified Language.Haskell.Liquid.GHC.Misc      as GM
-import Language.Haskell.Liquid.GHC.PrimitiveContract (dataTagPrefix, dataTagInterpretation)
+import Language.Haskell.Liquid.GHC.PrimitiveContract (dataTagPrefix, dataTagInterpretation, wiredBoolean)
 
 
 import           Language.Haskell.Liquid.Bare.Types
@@ -403,8 +406,9 @@ coreToLg' (C.Let C.Rec{} _) =
     throw "Cannot make Logical Substitution of Recursive Definitions"
 coreToLg' (C.Tick _ e) = coreToLg e
 coreToLg' (C.Var x)
-    | x == falseDataConId = return PFalse
-    | x == trueDataConId = return PTrue
+    | x == falseDataConId || x == trueDataConId = do
+        embeddings <- reader lsEmb
+        maybe (throw "A native Boolean constructor requires the built-in logical Boolean sort") return (wiredBoolean embeddings (C.Var x))
     | ignoreVar x = do
         embeddings <- reader lsEmb
         case typeSort embeddings (varType x) of
@@ -635,38 +639,41 @@ toPredApp p = do
   allowTC <- reader (typeclass . lsConfig)
   go . first opSym . splitArgs allowTC $ p
   where
-    opSym = tomaybesymbol
+    opSym (C.Var owner) = Just owner
+    opSym _ = Nothing
     go (Just f, [e])
-      | f == symbol (show 'not)
+      | quotedOwner f 'not
       = PNot <$>  coreToLg e
     go (Just f, [e1, e2])
-        | f == symbol (show '(||)) =
+        | quotedOwner f '(||) =
             preserveDemand . POr <$> mapM coreToLg [e1, e2]
-        | f == symbol (show '(&&)) =
+        | quotedOwner f '(&&) =
             preserveDemand . PAnd <$> mapM coreToLg [e1, e2]
-        | f == symbol ("Language.Haskell.Liquid.Prelude.==>" :: String) =
-            preserveDemand <$> (PImp <$> coreToLg e1 <*> coreToLg e2)
-        | f == symbol ("Language.Haskell.Liquid.Prelude.<=>" :: String) =
-            PIff <$> coreToLg e1 <*> coreToLg e2
-        | f == symbol (show 'const) =
+        | quotedOwner f 'const =
             coreToLg e1
     go (Just f, [es])
-        | f == symbol (show 'or) =
-            preserveDemand . POr . deList <$> coreToLg es
-        | f == symbol (show 'and) =
-            preserveDemand . PAnd . deList <$> coreToLg es
+        | quotedOwner f 'List.or =
+            listPredicate POr es
+        | quotedOwner f 'List.and =
+            listPredicate PAnd es
     go (_, _) =
         toLogicApp p
 
-    deList :: Expr -> [Expr]
+    listPredicate combine es = do
+        (meaning, support) <- Writer.censor (const []) (Writer.listen (coreToLg es))
+        case deList meaning of
+            Just operands -> Writer.tell support >> pure (preserveDemand (combine operands))
+            Nothing -> toLogicApp p
+
+    deList :: Expr -> Maybe [Expr]
     deList (EApp (EApp (EVar cons) e) es)
-      | cons == symbol (show '(:))
-      = e:deList es
+      | cons == symbol Ghc.consDataCon
+      = (e:) <$> deList es
     deList (EVar nil)
-        | nil == symbol (show '[]) =
-            []
-    deList e =
-        [e]
+        | nil == symbol Ghc.nilDataCon =
+            Just []
+    deList _ =
+        Nothing
 
 -- The logical value is unchanged, but source short-circuit order is retained
 -- for formation and PLE equation demand. Do not use pIte: it emits implications.
@@ -796,9 +803,20 @@ splitArgs _allowTC exprt = (exprt', reverse args)
     go (C.App f e) = (f', e:es) where (f', es) = go f
     go f           = (f, [])
 
-tomaybesymbol :: C.CoreExpr -> Maybe Symbol
-tomaybesymbol (C.Var x) = Just $ symbol x
-tomaybesymbol _         = Nothing
+-- Quoted names retain the compiler's package unit and namespace. Pretty
+-- printing discards both; matching that text grants a different owner the
+-- primitive's meaning. Library-defined operations instead use LogicMap's
+-- explicit, resolved owner declarations through ordinaryLogicApp.
+quotedOwner :: Var -> TH.Name -> Bool
+quotedOwner owner (TH.Name (TH.OccName occurrence) (TH.NameG TH.VarName (TH.PkgName unit) (TH.ModName moduleName)))
+  | Just origin <- nameModule_maybe name =
+      unitString (moduleUnit origin) == unit
+        && moduleNameString (Ghc.moduleName origin) == moduleName
+        && occNameString (nameOccName name) == occurrence
+        && nameNameSpace name == Occ.varName
+  where
+    name = getName owner
+quotedOwner _ _ = False
 
 
 mkLit :: Literal -> Maybe Expr

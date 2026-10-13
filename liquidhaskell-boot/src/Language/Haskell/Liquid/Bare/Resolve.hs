@@ -323,8 +323,9 @@ ofBareType env l ps t = either fail' id (ofBareTypeE env l ps t)
 
 ofBareTypeE :: HasCallStack => Env -> F.SourcePos -> Maybe [PVar BSort] -> BareType -> Lookup SpecType
 ofBareTypeE env l ps t =
-    ofBRType env rebindUReftBV (const (resolveReft l ps t)) l t
+    ofBRType env rebindUReftBV resolve l t
   where
+    resolve predicates _ = resolveReft l (Mb.fromMaybe [] ps ++ predicates) t
     rebindUReftBV (x, y) (MkUReft (F.Reft (v, e)) p) =
       let su = (x, F.EVar y)
           e' = F.subst1 e su
@@ -332,13 +333,12 @@ ofBareTypeE env l ps t =
        in
           MkUReft (F.Reft (v, e')) p'
 
-resolveReft :: F.SourcePos -> Maybe [PVar BSort] -> BareType -> RReft -> RReft
+resolveReft :: F.SourcePos -> [PVar BSort] -> BareType -> RReft -> RReft
 resolveReft l ps t
-        = txParam l RT.subvUReft (RT.uPVar <$> πs) t
+        = RT.subvUReft (txPvar l predicates)
         . fixReftTyVars t       -- same as fixCoercions
   where
-    πs  = Mb.fromMaybe tπs ps
-    tπs = ty_preds (toRTypeRep t)
+    predicates = M.fromList [(pname p, RT.uPVar p) | p <- ps]
 
 fixReftTyVars :: BareType -> RReft -> RReft
 fixReftTyVars bt  = coSubRReft coSub
@@ -358,29 +358,24 @@ ofBSort :: HasCallStack => Env -> F.SourcePos -> BSort -> RSort
 ofBSort env l t = either (Misc.errorP "error-ofBSort" . F.showpp) id (ofBSortE env l t)
 
 ofBSortE :: HasCallStack => Env -> F.SourcePos -> BSort -> Lookup RSort
-ofBSortE env l t = ofBRType env (const id) (const id) l t
+ofBSortE env l t = ofBRType env (const id) (\_ _ -> id) l t
 
 ofBPVar :: Env -> F.SourcePos -> BPVar -> RPVar
 ofBPVar env l = fmap (ofBSort env l)
 
 --------------------------------------------------------------------------------
-txParam :: F.SourcePos -> ((UsedPVar -> UsedPVar) -> t) -> [UsedPVar] -> RType c tv r -> t
-txParam l f πs t = f (txPvar l (predMap πs t))
-
 txPvar :: F.SourcePos -> M.HashMap F.Symbol UsedPVar -> UsedPVar -> UsedPVar
 txPvar l m π = π { pargs = args' }
   where
-    args' | not (null (pargs π)) = zipWith (\(_,x ,_) (t,_,y) -> (t, x, y)) (pargs π') (pargs π)
+    args' | length (pargs π) > length (pargs π') = uError $ ErrOther sp $
+              PJ.text "Abstract predicate" PJ.<+> pprint (pname π)
+              PJ.<+> PJ.text "expects at most" PJ.<+> pprint (length (pargs π'))
+              PJ.<+> PJ.text "arguments, but is given" PJ.<+> pprint (length (pargs π))
+          | not (null (pargs π)) = zipWith (\(_,x ,_) (t,_,y) -> (t, x, y)) (pargs π') (pargs π)
           | otherwise            = pargs π'
     π'    = Mb.fromMaybe err $ M.lookup (pname π) m
     err   = uError $ ErrUnbPred sp (pprint π)
     sp    = GM.sourcePosSrcSpan l
-
-predMap :: [UsedPVar] -> RType c tv r -> M.HashMap F.Symbol UsedPVar
-predMap πs t = M.fromList [(pname π, π) | π <- πs ++ rtypePredBinds t]
-
-rtypePredBinds :: RType c tv r -> [UsedPVar]
-rtypePredBinds = map RT.uPVar . ty_preds . toRTypeRep
 
 
 
@@ -399,45 +394,47 @@ ofBRType
   :: (Expandable r)
   => Env
   -> ((F.Symbol, F.Symbol) -> r -> r)
-  -> ([F.Symbol] -> r -> r)
+  -> ([BPVar] -> [F.Symbol] -> r -> r)
   -> F.SourcePos
   -> BRType r
   -> Lookup (RRType r)
-ofBRType env rebindR f l = go []
+ofBRType env rebindR f l = go [] []
   where
-    goReft bs r             = return (f bs r)
-    goRFun bs x i t1 t2 r  =
+    goReft predicates bs r = return (f predicates bs r)
+    goRFun predicates bs x i t1 t2 r =
       RFun x i{permitTC = Just (typeclass (getConfig env))}
-        <$> (rebind x <$> go bs t1)
-        <*> go (x:bs) t2
-        <*> goReft bs r
+        <$> (rebind x <$> go predicates bs t1)
+        <*> go predicates (x:bs) t2
+        <*> goReft predicates bs r
     -- See the documentation of 'RFun' for what rebind accomplishes.
     rebind x t =
       let su = (x, rTypeValueVar t)
        in mapReftRecs (`F.subst1` (F.EVar <$> su)) (`F.subst1` (F.EVar <$> su)) (mapRBase (rebindR su) t)
-    go bs (RAppTy t1 t2 r)  = RAppTy <$> go bs t1 <*> go bs t2 <*> goReft bs r
-    go bs (RApp tc ts rs r) = goRApp bs tc ts rs r
-    go bs (RFun x i t1 t2 r) = goRFun bs x i t1 t2 r
-    go bs (RVar a r)        = RVar (RT.bareRTyVar a) <$> goReft bs r
-    go bs (RAllT (RTVar v i) t r)     = RAllT <$> a' <*> go bs t <*> goReft bs r
+    go predicates bs (RAppTy t1 t2 r) = RAppTy <$> go predicates bs t1 <*> go predicates bs t2 <*> goReft predicates bs r
+    go predicates bs (RApp tc ts rs r) = goRApp predicates bs tc ts rs r
+    go predicates bs (RFun x i t1 t2 r) = goRFun predicates bs x i t1 t2 r
+    go predicates bs (RVar a r) = RVar (RT.bareRTyVar a) <$> goReft predicates bs r
+    go predicates bs (RAllT (RTVar v i) t r) = RAllT <$> a' <*> go predicates bs t <*> goReft predicates bs r
       where a' = case i of
                    RTVInfo{} -> do
                      k' <- ofBSortE env l (rtv_kind i)
                      pure $ RTVar (RT.bareRTyVar v) i {rtv_kind = k'}
                    RTVNoInfo is_pol ->
                      pure $ RTVar (RT.bareRTyVar v) (RTVNoInfo is_pol)
-    go bs (RAllP a t)       = RAllP a' <$> go bs t
+    -- Predicate binders scope over their body, not sibling types. Keep the
+    -- source binder for occurrence arguments; its resolved sort is stored in a'.
+    go predicates bs (RAllP a t) = RAllP a' <$> go (predicates ++ [a]) bs t
       where a'              = ofBPVar env l a
-    go bs (REx x t1 t2)     = REx   x  <$> go bs t1    <*> go (x:bs) t2
-    go bs (RRTy xts r o t)  = RRTy  <$> xts' <*> goReft bs r <*> pure o <*> go bs t
-      where xts'            = mapM (traverse (go bs)) xts
-    go bs (RHole r)         = RHole    <$> goReft bs r
-    go _ (RLit l)          = pure (RLit l)
-    go _ (RExprArg le)      = return    $ RExprArg le
-    goRef bs (RProp ss (RHole r)) = rPropP <$> mapM goSyms ss <*> goReft bs r
-    goRef bs (RProp ss t)         = RProp  <$> mapM goSyms ss <*> go bs t
+    go predicates bs (REx x t1 t2) = REx x <$> go predicates bs t1 <*> go predicates (x:bs) t2
+    go predicates bs (RRTy xts r o t) = RRTy <$> xts' <*> goReft predicates bs r <*> pure o <*> go predicates bs t
+      where xts' = mapM (traverse (go predicates bs)) xts
+    go predicates bs (RHole r) = RHole <$> goReft predicates bs r
+    go _ _ (RLit l) = pure (RLit l)
+    go _ _ (RExprArg le) = return $ RExprArg le
+    goRef predicates bs (RProp ss (RHole r)) = rPropP <$> mapM goSyms ss <*> goReft predicates bs r
+    goRef predicates bs (RProp ss t) = RProp <$> mapM goSyms ss <*> go predicates bs t
     goSyms (x, t)                 = (x,) <$> ofBSortE env l t
-    goRApp bs tc ts rs r          = bareTCApp <$> goReft bs r <*> lc' <*> mapM (goRef bs) rs <*> mapM (go bs) ts
+    goRApp predicates bs tc ts rs r = bareTCApp <$> goReft predicates bs r <*> lc' <*> mapM (goRef predicates bs) rs <*> mapM (go predicates bs) ts
       where
         lc'                    = F.atLoc lc <$> lookupGhcTyConLHName (reTyLookupEnv env) lc
         lc                     = btc_tc tc
@@ -511,7 +508,6 @@ bareTCApp r (Loc l _ c) rs ts | Just rhs <- Ghc.synTyConRhs_maybe c
 bareTCApp r (Loc _ _ c) rs ts
   = RT.rApp c ts rs r
 
-
 tyApp :: (Meet r, IsReft r, Eq (ReftVar r)) => RType c tv r -> [RType c tv r] -> [RTProp c tv r] -> r
       -> RType c tv r
 tyApp (RApp c ts rs r) ts' rs' r' = RApp c (ts ++ ts') (rs ++ rs') (r `meet` r')
@@ -529,18 +525,21 @@ txRefSort :: TyConMap -> F.TCEmb Ghc.TyCon -> LocSpecType -> LocSpecType
 txRefSort tyi tce t = F.atLoc t $ mapBot (addSymSort (GM.fSrcSpan t) tce tyi) (val t)
 
 addSymSort :: Ghc.SrcSpan -> F.TCEmb Ghc.TyCon -> TyConMap -> SpecType -> SpecType
-addSymSort sp tce tyi (RApp rc@RTyCon{} ts rs rr)
-  = RApp rc ts (zipWith3 (addSymSortRef sp rc) pvs rargs [1..]) r2
+addSymSort sp tce tyi (RApp rc@RTyCon{} ts rs rr) =
+    RApp rc ts (zipWith3 (addSymSortRef sp rc) pvs rargs [1 ..]) r2
   where
-    (_, pvs)           = RT.appRTyCon tce tyi rc ts
+    (_, pvs) = RT.appRTyCon tce tyi rc ts
     -- pvs             = rTyConPVs rc'
-    (rargs, rrest)     = splitAt (length pvs) rs
-    r2                 = L.foldl' go rr rrest
-    go r (RProp _ (RHole r')) = r' `meet` r
-    go r (RProp  _ t' )       = let r' = Mb.fromMaybe mempty (stripRTypeBase t') in r `meet` r'
-
-addSymSort _ _ _ t
-  = t
+    (rargs, rrest) = splitAt (length pvs) rs
+    r2 = L.foldl' go rr rrest
+    -- Extra predicate arguments are already authored in the enclosing value
+    -- scope. Open their local value coordinate there before conjunction;
+    -- meeting independent roots would instead freshen this shared binder.
+    go r (RProp _ (RHole r')) = promote r r' `meet` r
+    go r (RProp _ t') = let r' = Mb.fromMaybe mempty (stripRTypeBase t') in r `meet` promote r r'
+    promote r r' = renameReftRoot r' (F.reftBind $ ur_reft r)
+addSymSort _ _ _ t =
+    t
 
 addSymSortRef :: (PPrint s) => Ghc.SrcSpan -> s -> RPVar -> SpecProp -> Int -> SpecProp
 addSymSortRef sp rc p r i = addSymSortRef' sp rc i p r

@@ -43,7 +43,7 @@ import           Language.Haskell.Liquid.Types.Types hiding     ( binds )
 sourceNativeEnv :: Config -> [F.DataDecl] -> Maybe F.SymEnv
 sourceNativeEnv cfg declarations = do
     _ <- smtsolver cfg
-    pure $ F.symEnv (fixConfig "" cfg) mempty mempty nativeDeclarations mempty []
+    pure $ F.symEnv (fixConfig "" cfg) mempty mempty nativeDeclarations mempty
   where
     nativeDeclarations = if adtFlag cfg then declarations else []
 

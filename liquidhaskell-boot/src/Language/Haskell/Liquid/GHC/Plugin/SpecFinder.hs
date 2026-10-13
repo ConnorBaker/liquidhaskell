@@ -34,11 +34,13 @@ import           Language.Haskell.Liquid.UX.Config
 import           Liquid.GHC.API         as GHC
 import qualified GHC.Data.Maybe as MaybeErr
 import           GHC.Driver.Session (ghcMode, isOneShot)
+import           GHC.Driver.Env (hsc_units)
 import           GHC.Unit.Module (getModuleInstantiation)
+import           GHC.Unit.Info (unitPackageNameString)
+import           GHC.Unit.State (lookupUnit)
 import qualified GHC.Unit.Home.Graph as HUG
 
 import           Data.Bifunctor
-import qualified Data.Char
 import           Data.Maybe
 import           Control.Monad (foldM, unless)
 import qualified Data.HashMap.Strict as HM
@@ -60,9 +62,9 @@ data LoadedSpec = LoadedSpec
 -- | Load any relevant spec for the input list of 'Module's, by querying both the 'ExternalPackageState'
 -- and the 'HomePackageTable'.
 --
--- Specs come from the interface files of the given modules or their matching
--- _LHAssumptions modules. A module @M@ only matches with a module named
--- @M_LHAssumptions@.
+-- Specs come from the defining modules' interfaces or companions of the
+-- source import names. A written import @M@ only matches with a module named
+-- @M_LHAssumptions@, even when the package re-exports another defining module.
 --
 -- Assumptions are taken from _LHAssumptions modules only if the interface
 -- file of the matching module contains no spec.
@@ -72,11 +74,13 @@ data LoadedSpec = LoadedSpec
 -- entry keeps the specification and its reference together, so the caller can
 -- filter configuration-dependent exclusions once before extracting the
 -- verification specifications and the references to export.
-findRelevantSpecs :: Config -- ^ Assumption exclusions for this module
-                  -> HscEnv
-                  -> [Module]
-                  -- ^ Any relevant module fetched during dependency-discovery.
-                  -> TcM (HM.HashMap StableModule LoadedSpec)
+findRelevantSpecs ::
+    -- | Assumption exclusions for this module
+    Config ->
+    HscEnv ->
+    -- | Resolved defining owners and their source import names.
+    [(Module, ModuleName)] ->
+    TcM (HM.HashMap StableModule LoadedSpec)
 findRelevantSpecs cfg hscEnv mods = foldM loadAndMerge HM.empty mods
   where
     -- Load an input module's library (or its matching assumptions), resolve its
@@ -91,7 +95,7 @@ findRelevantSpecs cfg hscEnv mods = foldM loadAndMerge HM.empty mods
     -- external package state. Force each updated map before the next input.
     loadAndMerge
       :: HM.HashMap StableModule LoadedSpec
-      -> Module
+      -> (Module, ModuleName)
       -> TcM (HM.HashMap StableModule LoadedSpec)
     loadAndMerge entries currentModule = do
       found <- loadRelevantSpec currentModule
@@ -148,16 +152,16 @@ findRelevantSpecs cfg hscEnv mods = foldM loadAndMerge HM.empty mods
         text "LiquidHaskell: stale dependency specification; rebuild the importing module:" <+>
         ppr (unStableModule $ specModule ref)
 
-    loadRelevantSpec :: Module -> TcM (Maybe (SpecReference, LiquidLib))
-    loadRelevantSpec currentModule = do
-      res <- liftIO $ Serialisation.deserialiseLiquidLib hscEnv currentModule
-      case res of
-        Nothing -> loadModuleLHAssumptionsIfAny currentModule
-        Just _ -> pure res
+    loadRelevantSpec :: (Module, ModuleName) -> TcM (Maybe (SpecReference, LiquidLib))
+    loadRelevantSpec (currentModule, sourceName) = do
+        res <- liftIO $ Serialisation.deserialiseLiquidLib hscEnv currentModule
+        case res of
+            Nothing -> loadModuleLHAssumptionsIfAny currentModule sourceName
+            Just _ -> pure res
 
-    loadModuleLHAssumptionsIfAny m | isImportExcluded m = return Nothing
+    loadModuleLHAssumptionsIfAny m sourceName | isImportExcluded m = return Nothing
                                    | otherwise = do
-      let assumptionsModName = assumptionsModuleName m
+      let assumptionsModName = assumptionsModuleName sourceName
       -- loadInterface might mutate the EPS if the module is
       -- not already loaded.
       --
@@ -168,6 +172,7 @@ findRelevantSpecs cfg hscEnv mods = foldM loadAndMerge HM.empty mods
         r <- findImportedModule hscEnv assumptionsModName NoPkgQual
         case r of
           Found{} -> pure r
+          FoundMultiple{} -> pure r
           _       -> findPluginModule hscEnv assumptionsModName
       case res of
         Found _ assumptionsMod -> do
@@ -189,11 +194,11 @@ findRelevantSpecs cfg hscEnv mods = foldM loadAndMerge HM.empty mods
         _ -> return Nothing
 
     isImportExcluded m =
-      let s = takeWhile Data.Char.isAlphaNum $ unitString (moduleUnit m)
-       in elem s (excludeAutomaticAssumptionsFor cfg)
+      maybe False ((`elem` excludeAutomaticAssumptionsFor cfg) . unitPackageNameString) $
+        lookupUnit (hsc_units hscEnv) (moduleUnit m)
 
-    assumptionsModuleName m =
-      mkModuleNameFS $ moduleNameFS (moduleName m) <> "_LHAssumptions"
+    assumptionsModuleName sourceName =
+        mkModuleNameFS $ moduleNameFS sourceName <> "_LHAssumptions"
 
 -- Totality is a checking policy, independent of importing Prelude or the
 -- facade through which a client obtains a partial primitive.

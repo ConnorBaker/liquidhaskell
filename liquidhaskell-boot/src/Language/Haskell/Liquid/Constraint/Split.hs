@@ -27,6 +27,10 @@ module Language.Haskell.Liquid.Constraint.Split (
 
   -- * Split Subtyping Constraints
     splitC
+  , splitCWith
+  , splitCheckedCWith
+  , substCheckedTyVar
+  , bsplitC
 
   -- * Split Well-formedness Constraints
   , splitW
@@ -50,6 +54,7 @@ import           Control.Monad.State (gets)
 import qualified Control.Exception as Ex
 
 import qualified Language.Fixpoint.Types            as F
+import qualified Data.HashSet as S
 import           Language.Fixpoint.Misc hiding (errorstar)
 import           Language.Fixpoint.SortCheck (pruneUnsortedReft)
 
@@ -70,7 +75,7 @@ import           Language.Haskell.Liquid.UX.Tidy ()
 import           Language.Haskell.Liquid.Constraint.Types
 import           Language.Haskell.Liquid.Constraint.Env
 import           Language.Haskell.Liquid.Constraint.Constraint
-import           Language.Haskell.Liquid.Constraint.Monad (envToSub)
+import           Language.Haskell.Liquid.Constraint.Monad (envToSub, freshPredRef, addPToEnv)
 
 --------------------------------------------------------------------------------
 splitW ::  WfC -> CG [FixWfC]
@@ -167,108 +172,220 @@ updateEnv γ a
 ------------------------------------------------------------
 splitC :: Bool -> SubC -> CG [FixSubC]
 ------------------------------------------------------------
+splitC = splitCWith bsplitC
 
-splitC allowTC (SubC γ (REx x tx t1) (REx x2 _ t2)) | x == x2
-  = do γ' <- γ += ("addExBind 0", x, forallExprRefType γ tx)
-       splitC allowTC (SubC γ' t1 t2)
+-- The emitter observes the judgment at the same leaf, in the same oriented
+-- environment, as ordinary refinement subtyping. In particular, callback
+-- domains reverse the endpoints and result environments retain RHS domains.
+splitCWith :: (CGEnv -> SpecType -> SpecType -> CG [FixSubC]) -> Bool -> SubC -> CG [FixSubC]
+splitCWith emit allowTC constraint = splitCheckedCWith (\_ environment left right -> emit environment (ordinarySpecType left) (ordinarySpecType right)) allowTC paired
+  where
+    paired = case constraint of
+        SubC environment left right -> SubC environment (logicalSpecType left) (logicalSpecType right)
+        SubR environment obligation refinement -> SubR environment obligation refinement
 
-splitC allowTC (SubC γ t1 (REx x tx t2))
-  = do y <- fresh
-       γ' <- γ += ("addExBind 1", y, forallExprRefType γ tx)
-       splitC allowTC (SubC γ' t1 (F.subst1 t2 (x, F.EVar y)))
+-- Source formation interprets concrete terms, not abstract Pr applications.
+-- Keep those term denotations unchanged while transporting the owned Pr
+-- contracts; the actual native leaf lowers them after query composition.
+renamePredicate :: RPVar -> RPVar -> CheckedRefinement -> CheckedRefinement
+renamePredicate source destination refinement = refinement{checkedLogical = renameLogical (checkedLogical refinement), checkedPredicates = map renameQuery (checkedPredicates refinement)}
+  where
+    renameLogical logical = logical{ur_pred = Pr (map rename applications)}
+      where
+        Pr applications = ur_pred logical
+    rename application
+        | pname application == pname source = application{pname = pname destination}
+        | otherwise = application
+    renameQuery query =
+        query
+            { predicateSignature = mapScopedPredicateWith scopeBinder source (const renameLogical) (predicateSignature query)
+            }
+    scopeBinder binder
+        | pname binder == pname source = Just (binder{pname = pname destination}, pname destination)
+        | otherwise = Just (binder, pname binder)
+
+instantiatePredicateQueries :: RPVar -> [(F.Symbol, RSort)] -> UReft -> CheckedRefinement -> CheckedRefinement
+instantiatePredicateQueries predicate formals replacement refinement =
+    refinement{checkedPredicates = map instantiateQuery (checkedPredicates refinement)}
+  where
+    instantiateQuery query =
+        query
+            { predicateSignature = substPredAtomicWith scopeBinder id id (\logical _ -> logical) meet "splitC query" predicate formals replacement (predicateSignature query)
+            }
+    scopeBinder binder
+        | pname binder == pname predicate = Nothing
+        | otherwise = Just (binder, pname binder)
+
+concretizePredicate :: RPVar -> CheckedRefinement -> CheckedRefinement
+concretizePredicate predicate refinement =
+    refinement
+        { checkedLogical = concrete (checkedLogical refinement)
+        }
+  where
+    concrete = replacePredsWithRefs (uPVar predicate, pVartoRConc predicate)
+
+shiftCheckedVV :: CheckedSpecType -> F.Symbol -> CheckedSpecType
+shiftCheckedVV = shiftVVWith (F.reftBind . ur_reft . checkedOrdinary . rootRefinement) renameCheckedRoot types props
+  where
+    rootRefinement ty = case stripRTypeBase ty of
+        Just refinement -> refinement
+        Nothing -> CheckedRefinement mempty []
+    types tys binding = map (rTypeSubstWith (Just . F.reftBind . ur_reft . checkedOrdinary) names action) tys
+      where
+        action = F.mkSubst [binding]
+        names = F.substSymbolsSet action `S.union` S.unions (map checkedTypeSyms tys)
+    props refinements binding = map (refSubstWith (rTypeSubstWith (Just . F.reftBind . ur_reft . checkedOrdinary)) names action) refinements
+      where
+        action = F.mkSubst [binding]
+        names = F.substSymbolsSet action `S.union` S.unions (map (checkedTypeSyms . rf_body) refinements)
+
+substCheckedTyVar :: (RTyVar, RTyVar) -> CheckedSpecType -> CheckedSpecType
+substCheckedTyVar (source, destination) = subsFreeWith Nothing preserveBound transport meetCheckedRefinement (const checkedTop) (isTauto . checkedOrdinary) True S.empty (source, RVar destination NoReft, RVar destination checkedTop)
+  where
+    checkedTop = CheckedRefinement mempty []
+    preserveBound substitution binder = (subt substitution binder, ty_var_value binder)
+    transport substitution@(variable, replacement) refinement = case replacement of
+        RVar (RTV target) _ ->
+            refinement{checkedLogical = subt substitution (checkedLogical refinement), checkedPredicates = map (renameType variable target) (checkedPredicates refinement)}
+        _ -> CheckedRefinement (subt substitution (checkedOrdinary refinement)) []
+    renameType variable@(RTV original) target checked =
+        checked
+            { predicateSignature = renameQueryCoordinate variable (RTV target) (predicateSignature checked)
+            , predicateReadback = subt (variable, RVar (RTV target) NoReft :: RSort) (predicateReadback checked)
+            , predicateTelescope = (predicateTelescope checked){queryTypeOwners = [(transportOwner owner, native) | (owner, native) <- queryTypeOwners (predicateTelescope checked)]}
+            , predicateDefinitions = [(owner, subt (variable, RVar (RTV target) NoReft :: RSort) meaning) | (owner, meaning) <- predicateDefinitions checked]
+            , predicateSupport = [(owner, subt (variable, RVar (RTV target) NoReft :: RSort) sort) | (owner, sort) <- predicateSupport checked]
+            }
+      where
+        transportOwner owner
+            | owner == original = target
+            | RTV transported <- subt (variable, RVar (RTV target) NoReft :: RSort) (RTV owner) = transported
+    renameQueryCoordinate :: RTyVar -> RTyVar -> SpecType -> SpecType
+    renameQueryCoordinate variable target =
+        subsFreeWith Nothing renameBound subt meet top isTauto True S.empty (variable, RVar target NoReft, RVar target mempty)
+      where
+        renameBound substitution@(coordinate, replacement) binder =
+            let transported = subt substitution binder
+             in case replacement of
+                    RVar renamed _
+                        | ty_var_value binder == coordinate ->
+                            (transported{ty_var_value = renamed}, renamed)
+                    _ -> (transported, ty_var_value binder)
+
+-- The emitter receives only rigid owners introduced in this lexical split.
+-- Capturing introductions in its continuation preserves their branch scope.
+splitCheckedCWith :: ([RPVar] -> CGEnv -> CheckedSpecType -> CheckedSpecType -> CG [FixSubC]) -> Bool -> SubCWith CheckedRefinement -> CG [FixSubC]
+splitCheckedCWith emit allowTC (SubC γ (REx x tx t1) (REx x2 _ t2)) | x == x2 =
+    do
+        γ' <- γ += ("addExBind 0", x, forallExprRefType γ (ordinarySpecType tx))
+        splitCheckedCWith emit allowTC (SubC γ' t1 t2)
+splitCheckedCWith emit allowTC (SubC γ t1 (REx x tx t2)) =
+    do
+        y <- fresh
+        γ' <- γ += ("addExBind 1", y, forallExprRefType γ (ordinarySpecType tx))
+        splitCheckedCWith emit allowTC (SubC γ' t1 (substCheckedType (F.mkSubst [(x, F.EVar y)]) t2))
 
 -- existential at the left hand side is treated like forall
-splitC allowTC (SubC γ (REx x tx t1) t2)
-  = do -- let tx' = traceShow ("splitC allowTC: " ++ showpp z) tx
-       y <- fresh
-       γ' <- γ += ("addExBind 2", y, forallExprRefType γ tx)
-       splitC allowTC (SubC γ' (F.subst1 t1 (x, F.EVar y)) t2)
-
-splitC allowTC (SubC cgenv (RRTy env _ OCons t1) t2)
-  = do γ' <- foldM (\γ (x, t) -> γ `addSEnv` ("splitS", x,t)) cgenv xts
-       c1 <- splitC allowTC (SubC γ' t1' t2')
-       c2 <- splitC allowTC (SubC cgenv  t1  t2 )
-       return $ c1 ++ c2
+splitCheckedCWith emit allowTC (SubC γ (REx x tx t1) t2) =
+    do
+        -- let tx' = traceShow ("splitC allowTC: " ++ showpp z) tx
+        y <- fresh
+        γ' <- γ += ("addExBind 2", y, forallExprRefType γ (ordinarySpecType tx))
+        splitCheckedCWith emit allowTC (SubC γ' (substCheckedType (F.mkSubst [(x, F.EVar y)]) t1) t2)
+splitCheckedCWith emit allowTC (SubC cgenv (RRTy env _ OCons t1) t2) =
+    do
+        γ' <- foldM (\γ (x, t) -> γ `addSEnv` ("splitS", x, ordinarySpecType t)) cgenv xts
+        c1 <- splitCheckedCWith emit allowTC (SubC γ' t1' t2')
+        c2 <- splitCheckedCWith emit allowTC (SubC cgenv t1 t2)
+        return $ c1 ++ c2
   where
     (xts, t1', t2') = envToSub env
-
-splitC allowTC (SubC cgenv (RRTy e r o t1) t2)
-  = do γ' <- foldM (\γ (x, t) -> γ `addSEnv` ("splitS", x,t)) cgenv e
-       c1 <- splitC allowTC (SubR γ' o  r)
-       c2 <- splitC allowTC (SubC cgenv t1 t2)
-       return $ c1 ++ c2
-
-splitC allowTC (SubC γ (RFun x1 i1 t1 t1' r1) (RFun x2 i2 t2 t2' r2))
-  =  do cs'      <- splitC allowTC  (SubC γ t2 t1)
-        γ'       <- γ+= ("splitC allowTC", x2, t2)
-        cs       <- bsplitC γ (RFun x1 i1 t1 t1' (r1 `F.subst1` (x1, F.EVar x2)))
-                              (RFun x2 i2 t2 t2'  r2)
-        let t1x2' = t1' `F.subst1` (x1, F.EVar x2)
-        cs''     <- splitC allowTC  (SubC γ' t1x2' t2')
-        return    $ cs ++ cs' ++ cs''
-
-splitC allowTC (SubC γ t1@(RAppTy r1 r1' _) t2@(RAppTy r2 r2' _))
-  =  do cs    <- bsplitC γ t1 t2
-        cs'   <- splitC allowTC  (SubC γ r1 r2)
-        cs''  <- splitC allowTC  (SubC γ r1' r2')
-        cs''' <- splitC allowTC  (SubC γ r2' r1')
+splitCheckedCWith emit allowTC (SubC cgenv (RRTy e r o t1) t2) =
+    do
+        γ' <- foldM (\γ (x, t) -> γ `addSEnv` ("splitS", x, ordinarySpecType t)) cgenv e
+        c1 <- splitCheckedCWith emit allowTC (SubR γ' o (checkedOrdinary r))
+        c2 <- splitCheckedCWith emit allowTC (SubC cgenv t1 t2)
+        return $ c1 ++ c2
+splitCheckedCWith emit allowTC (SubC γ (RFun x1 i1 t1 t1' r1) (RFun x2 i2 t2 t2' r2)) =
+    do
+        cs' <- splitCheckedCWith emit allowTC (SubC γ t2 t1)
+        γ' <- γ += ("splitC allowTC", x2, ordinarySpecType t2)
+        cs <-
+            emit
+                []
+                γ
+                (RFun x1 i1 t1 t1' (r1 `F.subst1` (x1, F.EVar x2)))
+                (RFun x2 i2 t2 t2' r2)
+        let t1x2' = substCheckedType (F.mkSubst [(x1, F.EVar x2)]) t1'
+        cs'' <- splitCheckedCWith emit allowTC (SubC γ' t1x2' t2')
+        return $ cs ++ cs' ++ cs''
+splitCheckedCWith emit allowTC (SubC γ t1@(RAppTy r1 r1' _) t2@(RAppTy r2 r2' _)) =
+    do
+        cs <- emit [] γ t1 t2
+        cs' <- splitCheckedCWith emit allowTC (SubC γ r1 r2)
+        cs'' <- splitCheckedCWith emit allowTC (SubC γ r1' r2')
+        cs''' <- splitCheckedCWith emit allowTC (SubC γ r2' r1')
         return $ cs ++ cs' ++ cs'' ++ cs'''
-
-splitC allowTC (SubC γ t1 (RAllP p t))
-  = splitC allowTC $ SubC γ t1 t'
+splitCheckedCWith emit allowTC (SubC γ t1 (RAllP p t)) =
+    do
+        name <- fresh
+        let rigid = p{pname = name}
+            renamed = mapScopedPredicate p (const (renamePredicate p rigid)) t
+            t' = fmap (concretizePredicate rigid) renamed
+        γ' <- addPToEnv γ rigid
+        splitCheckedCWith (emit . (rigid :)) allowTC $ SubC γ' t1 t'
+splitCheckedCWith emit allowTC (SubC γ (RAllP p t1) t2) =
+    do
+        r <- freshPredRef γ p
+        let RProp formals (RHole replacement) = r
+            substituted = substPredAtomicWith (\binder -> Just (binder, pname binder)) ordinarySpecType checkedLogical (\logical refinement -> refinement{checkedLogical = logical}) (\refinement logical -> meetCheckedRefinement refinement (CheckedRefinement logical [])) "splitC" p formals replacement t1
+            replaced = mapScopedPredicate p (const (instantiatePredicateQueries p formals replacement)) substituted
+        splitCheckedCWith emit allowTC $ SubC γ replaced t2
+splitCheckedCWith emit allowTC (SubC γ t1'@(RAllT α1 t1 _) t2'@(RAllT α2 t2 _))
+    | α1 == α2 =
+        do
+            γ' <- updateEnv γ α2
+            cs <- emit [] γ t1' t2'
+            cs' <- splitCheckedCWith emit allowTC $ SubC γ' t1 (substCheckedType su t2)
+            return (cs ++ cs')
+    | otherwise =
+        do
+            γ' <- updateEnv γ α2
+            cs <- emit [] γ t1' t2'
+            cs' <- splitCheckedCWith emit allowTC $ SubC γ' t1 (substCheckedType su t2'')
+            return (cs ++ cs')
   where
-    t' = fmap (replacePredsWithRefs su) t
-    su = (uPVar p, pVartoRConc p)
-
-splitC _ (SubC γ t1@(RAllP _ _) t2)
-  = panic (Just $ getLocation γ) $ "Predicate in lhs of constraint:" ++ showpp t1 ++ "\n<:\n" ++ showpp t2
-
-splitC allowTC (SubC γ t1'@(RAllT α1 t1 _) t2'@(RAllT α2 t2 _))
-  |  α1 ==  α2
-  = do γ'  <- updateEnv γ α2
-       cs  <- bsplitC γ t1' t2'
-       cs' <- splitC allowTC $ SubC γ' t1 (F.subst su t2)
-       return (cs ++ cs')
-  | otherwise
-  = do γ'  <- updateEnv γ α2
-       cs  <- bsplitC γ t1' t2'
-       cs' <- splitC allowTC $ SubC γ' t1 (F.subst su t2'')
-       return (cs ++ cs')
-  where
-    t2'' = subsTyVarMeet' (ty_var_value α2, RVar (ty_var_value α1) mempty) t2
+    t2'' = substCheckedTyVar (ty_var_value α2, ty_var_value α1) t2
     su = case (rTVarToBind α1, rTVarToBind α2) of
-          (Just (x1, _), Just (x2, _)) -> F.mkSubst [(x1, F.EVar x2)]
-          _                            -> F.mkSubst []
+        (Just (x1, _), Just (x2, _)) -> F.mkSubst [(x1, F.EVar x2)]
+        _ -> F.mkSubst []
 
 -- Primitive equality keeps its kind arguments, but its endpoints are invariant.
-splitC _ (SubC γ (RApp c1 [_, _, l1, r1] _ _) (RApp c2 [_, _, l2, r2] _ _))
-  | isEmbeddedDict c1 && c1 == c2 =
-      splitsCWithVariance γ [l1, r1] [l2, r2] [Invariant, Invariant]
-
-splitC _ (SubC γ t1@RApp{} t2@RApp{})
-  = do (t1',t2') <- unifyVV t1 t2
-       cs    <- bsplitC γ t1' t2'
-       γ'    <- if bscope (getConfig γ) then γ `extendEnvWithVV` t1' else return γ
-       let RApp c t1s r1s _ = t1'
-       let RApp _ t2s r2s _ = t2'
-       let isapplied = True -- TC.tyConArity (rtc_tc c) == length t1s
-       let tyInfo = rtc_info c
-       csvar  <-  splitsCWithVariance           γ' t1s t2s $ varianceTyArgs tyInfo
-       csvar' <- rsplitsCWithVariance isapplied γ' r1s r2s $ variancePsArgs tyInfo
-       return $ cs ++ csvar ++ csvar'
-
-splitC _ (SubC γ t1@(RVar a1 _) t2@(RVar a2 _))
-  | a1 == a2
-  = bsplitC γ t1 t2
-
-splitC _ (SubC _ (RLit l) (RLit l'))
-  | l == l'
-  = return []
-
-splitC _ (SubC γ t1 t2)
-  = panic (Just $ getLocation γ) $ "(Another Broken Test!!!) splitc unexpected:\n" ++ traceTy t1 ++ "\n  <:\n" ++ traceTy t2
-
-splitC _ (SubR γ o r) =
+splitCheckedCWith emit _ (SubC γ (RApp c1 [_, _, l1, r1] _ _) (RApp c2 [_, _, l2, r2] _ _))
+    | isEmbeddedDict c1 && c1 == c2 =
+        splitsCWithVariance emit γ [l1, r1] [l2, r2] [Invariant, Invariant]
+splitCheckedCWith emit _ (SubC γ t1@RApp{} t2@RApp{}) =
+    do
+        vv <- F.vv . Just <$> fresh
+        let (t1', t2') = (shiftCheckedVV t1 vv, shiftCheckedVV t2 vv)
+        cs <- emit [] γ t1' t2'
+        γ' <- if bscope (getConfig γ) then γ `extendEnvWithVV` (ordinarySpecType t1') else return γ
+        let RApp c t1s r1s _ = t1'
+        let RApp _ t2s r2s _ = t2'
+        let isapplied = True -- TC.tyConArity (rtc_tc c) == length t1s
+        let tyInfo = rtc_info c
+        csvar <- splitsCWithVariance emit γ' t1s t2s $ varianceTyArgs tyInfo
+        csvar' <- rsplitsCWithVariance emit isapplied γ' r1s r2s $ variancePsArgs tyInfo
+        return $ cs ++ csvar ++ csvar'
+splitCheckedCWith emit _ (SubC γ t1@(RVar a1 _) t2@(RVar a2 _))
+    | a1 == a2 =
+        emit [] γ t1 t2
+splitCheckedCWith _ _ (SubC _ (RLit l) (RLit l'))
+    | l == l' =
+        return []
+splitCheckedCWith _ _ (SubC γ t1 t2) =
+    panic (Just $ getLocation γ) $ "(Another Broken Test!!!) splitc unexpected:\n" ++ traceTy (ordinarySpecType t1) ++ "\n  <:\n" ++ traceTy (ordinarySpecType t2)
+splitCheckedCWith _ _ (SubR γ o r) =
     do
         ts <- getTemplates
         let r1' = pruneUnsortedReft γ'' ts r1
@@ -306,25 +423,28 @@ rHole :: F.Reft -> SpecType
 rHole = RHole . uTop
 
 
-splitsCWithVariance :: CGEnv
-                    -> [SpecType]
-                    -> [SpecType]
-                    -> [Variance]
-                    -> CG [FixSubC]
-splitsCWithVariance γ t1s t2s variants
-  = concatMapM (\(t1, t2, v) -> splitfWithVariance (\s1 s2 -> splitC (typeclass (getConfig γ)) (SubC γ s1 s2)) t1 t2 v) (zip3 t1s t2s variants)
+splitsCWithVariance ::
+    ([RPVar] -> CGEnv -> CheckedSpecType -> CheckedSpecType -> CG [FixSubC]) ->
+    CGEnv ->
+    [CheckedSpecType] ->
+    [CheckedSpecType] ->
+    [Variance] ->
+    CG [FixSubC]
+splitsCWithVariance emit γ t1s t2s variants =
+    concatMapM (\(t1, t2, v) -> splitfWithVariance (\s1 s2 -> splitCheckedCWith emit (typeclass (getConfig γ)) (SubC γ s1 s2)) t1 t2 v) (zip3 t1s t2s variants)
 
-rsplitsCWithVariance :: Bool
-                     -> CGEnv
-                     -> [SpecProp]
-                     -> [SpecProp]
-                     -> [Variance]
-                     -> CG [FixSubC]
-rsplitsCWithVariance False _ _ _ _
-  = return []
-
-rsplitsCWithVariance _ γ t1s t2s variants
-  = concatMapM (\(t1, t2, v) -> splitfWithVariance (rsplitC γ) t1 t2 v) (zip3 t1s t2s variants)
+rsplitsCWithVariance ::
+    ([RPVar] -> CGEnv -> CheckedSpecType -> CheckedSpecType -> CG [FixSubC]) ->
+    Bool ->
+    CGEnv ->
+    [RTProp RTyCon RTyVar CheckedRefinement] ->
+    [RTProp RTyCon RTyVar CheckedRefinement] ->
+    [Variance] ->
+    CG [FixSubC]
+rsplitsCWithVariance _ False _ _ _ _ =
+    return []
+rsplitsCWithVariance emit _ γ t1s t2s variants =
+    concatMapM (\(t1, t2, v) -> splitfWithVariance (rsplitC emit γ) t1 t2 v) (zip3 t1s t2s variants)
 
 bsplitC :: CGEnv
         -> SpecType
@@ -391,27 +511,20 @@ replaceReft rr (F.RR _ r) = rr {ur_reft = F.Reft (v, F.subst1  p (vr, F.EVar v) 
     F.Reft (v, _)         = ur_reft rr
     F.Reft (vr,p)         = r
 
-unifyVV :: SpecType -> SpecType -> CG (SpecType, SpecType)
-unifyVV t1@RApp{} t2@RApp{}
-  = do vv <- F.vv . Just <$> fresh
-       return (shiftVV t1 vv, shiftVV t2 vv)
-
-unifyVV _ _
-  = panic Nothing "Constraint.Generate.unifyVV called on invalid inputs"
-
-rsplitC :: CGEnv
-        -> SpecProp
-        -> SpecProp
+rsplitC :: ([RPVar] -> CGEnv -> CheckedSpecType -> CheckedSpecType -> CG [FixSubC])
+        -> CGEnv
+        -> RTProp RTyCon RTyVar CheckedRefinement
+        -> RTProp RTyCon RTyVar CheckedRefinement
         -> CG [FixSubC]
-rsplitC _ _ (RProp _ (RHole _))
+rsplitC _ _ _ (RProp _ (RHole _))
   = panic Nothing "RefTypes.rsplitC on RProp _ (RHole _)"
 
-rsplitC _ (RProp _ (RHole _)) _
+rsplitC _ _ (RProp _ (RHole _)) _
   = panic Nothing "RefTypes.rsplitC on RProp _ (RHole _)"
 
-rsplitC γ (RProp s1 r1) (RProp s2 r2)
+rsplitC emit γ (RProp s1 r1) (RProp s2 r2)
   = do γ'  <-  foldM (+=) γ [("rsplitC1", x, ofRSort s) | (x, s) <- s2]
-       splitC (typeclass (getConfig γ)) (SubC γ' (F.subst su r1) r2)
+       splitCheckedCWith emit (typeclass (getConfig γ)) (SubC γ' (substCheckedType su r1) r2)
   where su = F.mkSubst [(x, F.EVar y) | ((x,_), (y,_)) <- zip s1 s2]
 
 

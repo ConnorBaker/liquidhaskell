@@ -188,32 +188,32 @@ refTypeAtoms :: TCEmb TyCon -> SEnv Sort -> SourcePos -> SpecType -> QualifierAt
 --------------------------------------------------------------------------------
 refTypeAtoms tce = scrapeType
   where
-    scrapeType initialEnv l t0 = go initialEnv t0
+    scrapeType initialEnv l t0 = go [] initialEnv t0
       where
-        scrape = refTopAtoms l tce t0
+        scrape = refTopAtoms l tce
         add x t γ = insertSEnv x (rTypeSort tce t) γ
-        goBind x t γ t' = go (add x t γ) t'
-        go γ t@(RVar _ _) = scrape γ t
-        go γ (RAllT _ t _) = go γ t
-        go γ (RAllP p t) = go (insertSEnv (pname p) (rTypeSort tce (pvarRType p :: RSort)) γ) t
-        go γ t@(RAppTy t1 t2 _) = go γ t1 ++ go γ t2 ++ scrape γ t
-        go γ (RFun x _ t t' _) = go γ t ++ goBind x t γ t'
-        go γ t@(RApp c ts rs _) = scrape γ t ++ concatMap (go γ') ts ++ goRefs c γ' rs
+        goBind ps x t γ t' = go ps (add x t γ) t'
+        go ps γ t@(RVar _ _) = scrape ps γ t
+        go ps γ (RAllT _ t _) = go ps γ t
+        go ps γ (RAllP p t) = go (p : ps) (insertSEnv (pname p) (rTypeSort tce (pvarRType p :: RSort)) γ) t
+        go ps γ t@(RAppTy t1 t2 _) = go ps γ t1 ++ go ps γ t2 ++ scrape ps γ t
+        go ps γ (RFun x _ t t' _) = go ps γ t ++ goBind ps x t γ t'
+        go ps γ t@(RApp c ts rs _) = scrape ps γ t ++ concatMap (go ps γ') ts ++ goRefs ps c γ' rs
           where
             γ' = add (rTypeValueVar t) t γ
-        go γ (REx x t t') = go γ t ++ goBind x t γ t'
-        go _ _ = []
-        goRefs c g rs = concat $ zipWith (goRef g) rs (rTyConPVs c)
-        goRef _ (RProp _ (RHole _)) _ = []
-        goRef g (RProp s t) _ = go (insertsSEnv' g s) t
+        go ps γ (REx x t t') = go ps γ t ++ goBind ps x t γ t'
+        go _ _ _ = []
+        goRefs ps c g rs = concat $ zipWith (goRef ps g) rs (rTyConPVs c)
+        goRef _ _ (RProp _ (RHole _)) _ = []
+        goRef ps g (RProp s t) _ = go ps (insertsSEnv' g s) t
         insertsSEnv' = foldr (\(x, t) γ -> insertSEnv x (rTypeSort tce t) γ)
 
-refTopAtoms :: SourcePos -> TCEmb TyCon -> SpecType -> SEnv Sort -> SpecType -> QualifierAtoms
-refTopAtoms l tce t0 γ rrt =
+refTopAtoms :: SourcePos -> TCEmb TyCon -> [RPVar] -> SEnv Sort -> SpecType -> QualifierAtoms
+refTopAtoms l tce predicates γ rrt =
     [(l, γ, v, so, Left [pa | pa <- conjuncts ra, V.isConc pa])]
         ++ [ (l, insertSEnv v so γ, v, so, Right [PAtom Eq (EVar v) e])
            | let MkUReft _ (Pr ps) = fromMaybe (msg rrt) (stripRTypeBase rrt)
-           , p <- findPVar (ty_preds (toRTypeRep t0)) <$> ps
+           , p <- findPVar predicates <$> ps
            , (s, _, e) <- pargs p
            , V.isConc e
            , let v = "vv"

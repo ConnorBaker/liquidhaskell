@@ -8,7 +8,7 @@
 -- | This module contains the code that DOES reflection; i.e. converts Haskell
 --   definitions into refinements.
 
-module Language.Haskell.Liquid.Bare.Axiom ( makeHaskellAxioms, strengthenSpecWithMeasure, makeAssumeReflectAxioms, addSingletonApp, AxiomType(..) ) where
+module Language.Haskell.Liquid.Bare.Axiom ( makeHaskellAxioms, strengthenSpecWithMeasure, makeAssumeReflectAxioms, addSingletonApp, AxiomType(..), resolvePrivateReflect ) where
 
 import Prelude hiding (error)
 import Prelude hiding (mapM)
@@ -23,6 +23,7 @@ import Control.Monad.Trans.State.Lazy (runState, get, put)
 
 import qualified Language.Haskell.Liquid.Measure as Ms
 import qualified Language.Fixpoint.Types as F
+import qualified Language.Fixpoint.Types.Visitor as FV
 import qualified Liquid.GHC.API as Ghc
 import qualified Language.Haskell.Liquid.GHC.Misc as GM
 import           Language.Haskell.Liquid.Types.RefType
@@ -210,7 +211,11 @@ getReflectDefs src sig spec env =
     -- disjoint.
     --
     -- Base case: No symbols left to resolve - we're good
-    searchInTransitiveClosure [] _ acc = acc
+    searchInTransitiveClosure [] fvMap acc =
+      -- A later unfolding can expose another unit with the same source spelling.
+      -- Recheck against the completed discovery set, not only the first match.
+      foldr (\x rest -> lookupPrivate x fvMap `seq` rest) acc
+        (S.toList (Ms.privateReflects spec))
     -- Recursive case: there are some left.
     searchInTransitiveClosure toResolve fvMap acc = if null found
          then case newToResolve of
@@ -298,7 +303,7 @@ findVarDefType cbs sigs env _defs (Left x) =
           ]
 
 findVarDefType _cbs sigs _env defs (Right x) = do
-    var <- M.lookup x defs
+    var <- lookupPrivate x defs
     let info = Ghc.idInfo var
     let unfolding = getExprFromUnfolding . Ghc.realUnfoldingInfo $ info
     case unfolding of
@@ -309,6 +314,27 @@ findVarDefType _cbs sigs _env defs (Right x) = do
           [ "Symbol exists but is not defined in the current file,"
           , "and no unfolding is available in the interface files"
           ]
+
+{- | Resolve authored private-reflect spelling without changing the selected
+actual identity. Candidates come only from discovered unfolding dependencies.
+-}
+resolvePrivateReflect :: (Ghc.NamedThing a) => F.Symbol -> [a] -> Either [a] (Maybe a)
+resolvePrivateReflect spelling candidates =
+    case L.nubBy ((==) `on` Ghc.getName) $
+        filter ((spelling ==) . F.symbol . Ghc.displayNameFS . Ghc.getName) candidates of
+        [] -> Right Nothing
+        [actual] -> Right (Just actual)
+        ambiguous -> Left ambiguous
+
+lookupPrivate :: LocSymbol -> M.HashMap LocSymbol Ghc.Var -> Maybe Ghc.Var
+lookupPrivate x defs =
+    case resolvePrivateReflect (val x) (M.elems defs) of
+        Right found -> found
+        Left candidates ->
+            Ex.throw $
+                mkError x $
+                    "Ambiguous private reflection among actual identities: "
+                        ++ show (map F.symbol candidates)
 
 getExprFromUnfolding :: Ghc.Unfolding -> Maybe Ghc.CoreExpr
 getExprFromUnfolding (Ghc.CoreUnfolding expr _ _ _ _) = Just expr
@@ -340,7 +366,7 @@ makeAssumeType boxes cfg tce lmap dm sym mbT v def
     , F.mkEquation
         symbolV
         (fmap (second $ F.sortSubst sortSub) xts)
-        (F.sortSubstInExpr sortSub (F.subst su le))
+        (FV.applyCoSub sortSub (F.subst su le))
         (F.sortSubst sortSub out)
     ), retainLogicSupport (F.syms (F.subst su le) `S.difference` S.fromList (map fst xts)) support)
   where

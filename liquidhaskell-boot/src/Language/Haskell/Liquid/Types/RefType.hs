@@ -28,6 +28,7 @@ module Language.Haskell.Liquid.Types.RefType (
 
   -- * Functions for lifting Reft-values to Spec-values
   , uTop, uReft, uRType, uRType', uRTypeGen, uPVar
+  , specTypeToQueryType
 
   -- * Applying a solution to a SpecType
   , applySolution
@@ -55,6 +56,7 @@ module Language.Haskell.Liquid.Types.RefType (
   -- * Substitutions
   , subts, subvPredicate, subvUReft
   , subsTyVarMeet, subsTyVarMeet', subsTyVarMeetWith, subsTyVarNoMeet
+  , subsFreeWith
   , subsTyVarsNoMeet, subsTyVarsMeet
 
   -- * Destructors
@@ -76,8 +78,11 @@ module Language.Haskell.Liquid.Types.RefType (
   , rTypeSortedReft
   , rTypeSort
   , typeSort
+  , interpretEmbeddingSort
+  , interpretEmbedding
   , newtypeIdentitySort
   , shiftVV
+  , shiftVVWith
 
   -- * TODO: classify these
   -- , mkDataConIdsTy
@@ -138,6 +143,8 @@ import           Liquid.GHC.API        as Ghc hiding ( Expr, get
                                                                       )
 import           Language.Haskell.Liquid.GHC.TypeRep () -- Eq Type instance
 import           GHC.Core.DataCon (dataConOrigResTy)
+import           GHC.Core.Type (coreView, typeKind)
+import qualified GHC.Core.Type as Ghc (mkAppTy, mkInvisFunTy, mkSpecForAllTy, mkVisFunTyMany)
 
 
 
@@ -668,18 +675,21 @@ strengthen :: (Meet r, IsReft r, Eq (ReftVar r)) => RTypeBV b v c tv r -> r -> R
 strengthen = strengthenWith meet
 
 strengthenWith :: (IsReft r, Eq (ReftVar r)) => (r -> r -> r) -> RTypeBV b v c tv r -> r -> RTypeBV b v c tv r
-strengthenWith mt = go
+strengthenWith = strengthenWithTest isTauto
+
+strengthenWithTest :: (r -> Bool) -> (r -> r -> r) -> RTypeBV b v c tv r -> r -> RTypeBV b v c tv r
+strengthenWithTest trivial mt = go
   where
-    go (RApp c ts rs r)   r' = RApp c ts rs   (r `mt` r')
-    go (RVar a r)         r' = RVar a         (r `mt` r')
+    go (RApp c ts rs r) r' = RApp c ts rs (r `mt` r')
+    go (RVar a r) r' = RVar a (r `mt` r')
     go (RFun b i t1 t2 r) r' = RFun b i t1 t2 (r `mt` r')
-    go (RAppTy t1 t2 r)   r' = RAppTy t1 t2   (r `mt` r')
-    go (RAllT a t r)      r' = RAllT a t      (r `mt` r')
-    go (RHole r)          r' = RHole          (r `mt` r')
+    go (RAppTy t1 t2 r) r' = RAppTy t1 t2 (r `mt` r')
+    go (RAllT a t r) r' = RAllT a t (r `mt` r')
+    go (RHole r) r' = RHole (r `mt` r')
     go t@(RLit _) r
-      | isTauto r = t
-      | otherwise = panic Nothing "A type-level literal cannot carry a value refinement"
-    go t                  _  = t
+        | trivial r = t
+        | otherwise = panic Nothing "A type-level literal cannot carry a value refinement"
+    go t _ = t
 
 
 quantifyRTy :: (Monoid r, Eq tv) => [RTVar Symbol v c tv] -> RTypeV v c tv r -> RTypeV v c tv r
@@ -1001,113 +1011,132 @@ subsTyVar
   -> RTypeBV b v c tv r
 subsTyVar meet'        = subsFree Nothing meet' S.empty
 
-subsFree
-  :: (Eq tv, Hashable tv, IsReft r, Eq (ReftVar r), TyConable c, Binder b, Symbolic b, Meet r,
-      SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) c, SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) r, SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) Sort,
-      SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) (RTypeBV b v c tv (NoReftBV b v)), FreeVar c tv,
-      SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) tv,
-      SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) (RTVar b v c tv)
-     )
-  => Maybe (RTypeBV b v c tv (NoReftBV b v) -> Sort)
-  -> Bool
-  -> S.HashSet tv
-  -> (tv, RTypeBV b v c tv (NoReftBV b v), RTypeBV b v c tv r)
-  -> RTypeBV b v c tv r
-  -> RTypeBV b v c tv r
--- Replacements are required to be fresh for retained binders. The bound set
--- protects the substituted coordinate, including every retained annotation.
-subsFree image _ s (α, _, _) t | α `S.member` s = t
-subsFree image m s z@(α, τ,_) (RAllP π t)
-  = RAllP (subtWithSort image (α, τ) π) (subsFree image m s z t)
-subsFree image m s z@(a, τ, _) (RAllT α t r)
-  -- subtWithSort image inside the type variable instantiates the kind of the variable
-  = RAllT (subtWithSort image (a, τ) α) (subsFree image m (ty_var_value α `S.insert` s) z t) (subtWithSort image (a, τ) r)
-subsFree image m s z@(α, τ, _) (RFun x i t t' r)
-  = RFun x i (subsFree image m s z t) (subsFree image m s z t') (subtWithSort image (α, τ) r)
-subsFree image m s z@(α, τ, _) (RApp c ts rs r)
-  = RApp c' (subsFree image m s z <$> ts) (subsFreeRef image m s z <$> rs) (subtWithSort image (α, τ) r)
-    where z' = (α, τ) -- UNIFY: why instantiating INSIDE parameters?
-          c' = if α `S.member` s then c else subtWithSort image z' c
-subsFree image meet' s (α', τ, t') (RVar α r)
-  | α == α' && not (α `S.member` s)
-  = if meet' then t' `strengthen` subtWithSort image (α, τ) r else t'
-  | otherwise
-  = RVar (subtWithSort image (α', τ) α) (subtWithSort image (α', τ) r)
-subsFree image m s z (REx x t t')
-  = REx x (subsFree image m s z t) (subsFree image m s z t')
-subsFree image m s z@(α, τ, _) (RAppTy t t' r)
-  = subsFreeRAppTy image m s (subsFree image m s z t) (subsFree image m s z t') (subtWithSort image (α, τ) r)
-subsFree image _ _ _ t@(RLit _)
-  = t
-subsFree image _ _ (α, τ, _) (RExprArg e)
-  = RExprArg (subtWithSort image (α, τ) <$> e)
-subsFree image m s z@(α, τ, _) (RRTy e r o t)
-  = RRTy (fmap (subsFree image m s z) <$> e) (subtWithSort image (α, τ) r) o (subsFree image m s z t)
-subsFree image _ _ (α, τ, _) (RHole r)
-  = RHole (subtWithSort image (α, τ) r)
-
-subsFrees
-  :: (Eq tv, Hashable tv, IsReft r, Eq (ReftVar r), TyConable c, Binder b, Symbolic b, Meet r,
-      SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) c, SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) r, SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) Sort,
-      SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) (RTypeBV b v c tv (NoReftBV b v)), FreeVar c tv,
-      SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) tv,
-      SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) (RTVar b v c tv))
-  => Maybe (RTypeBV b v c tv (NoReftBV b v) -> Sort)
-  -> Bool
-  -> S.HashSet tv
-  -> [(tv, RTypeBV b v c tv (NoReftBV b v), RTypeBV b v c tv r)]
-  -> RTypeBV b v c tv r
-  -> RTypeBV b v c tv r
-subsFrees image m s zs t = foldl' (flip (subsFree image m s)) t zs
-
--- GHC INVARIANT: RApp is Type Application to something other than TYCon
-subsFreeRAppTy
-  :: (Eq tv, Hashable tv, IsReft r, Eq (ReftVar r), TyConable c, Binder b, Symbolic b, Meet r,
-      SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) c, SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) r, SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) Sort,
-      SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) (RTypeBV b v c tv (NoReftBV b v)),
-      FreeVar c tv,
-      SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) tv,
-      SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) (RTVar b v c tv))
-  => Maybe (RTypeBV b v c tv (NoReftBV b v) -> Sort)
-  -> Bool
-  -> S.HashSet tv
-  -> RTypeBV b v c tv r
-  -> RTypeBV b v c tv r
-  -> r
-  -> RTypeBV b v c tv r
-subsFreeRAppTy image m s (RApp c ts rs r) t' r'
-  = mkRApp image m s c (ts ++ [t']) rs r r'
-subsFreeRAppTy image _ _ t t' r'
-  = RAppTy t t' r'
-
-
--- | @mkRApp@ is the refined variant of GHC's @mkTyConApp@ which ensures that
---    that applications of the "function" type constructor are normalized to
---    the special case @FunTy _@ representation. The extra `_rep1`, and `_rep2`
---    parameters come from the "levity polymorphism" changes in GHC 8.6 (?)
---    See [NOTE:Levity-Polymorphism]
-
-mkRApp :: (Eq tv, Hashable tv, IsReft r, Eq (ReftVar r), TyConable c, Binder b, Symbolic b, Meet r,
-      SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) c, SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) r, SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) Sort,
-      SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) (RTypeBV b v c tv (NoReftBV b v)), FreeVar c tv,
-      SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) tv,
-      SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) (RTVar b v c tv))
-  => Maybe (RTypeBV b v c tv (NoReftBV b v) -> Sort)
-  -> Bool
-  -> S.HashSet tv
-  -> c
-  -> [RTypeBV b v c tv r]
-  -> [RTPropBV b v c tv r]
-  -> r
-  -> r
-  -> RTypeBV b v c tv r
-mkRApp image m s c ts rs r r'
-  | isFun c, [_m, _rep1, _rep2, t1, t2] <- ts
-  = RFun wildcard defRFInfo t1 t2 (refAppTyToFun r')
-  | otherwise
-  = subsFrees image m s zs (RApp c ts rs (r `meet` r'))
+subsFree ::
+    ( Eq tv
+    , Hashable tv
+    , IsReft r
+    , Eq (ReftVar r)
+    , TyConable c
+    , Binder b
+    , Symbolic b
+    , Meet r
+    , SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) c
+    , SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) r
+    , SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) Sort
+    , SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) (RTypeBV b v c tv (NoReftBV b v))
+    , FreeVar c tv
+    , SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) tv
+    , SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) (RTVar b v c tv)
+    ) =>
+    Maybe (RTypeBV b v c tv (NoReftBV b v) -> Sort) ->
+    Bool ->
+    S.HashSet tv ->
+    (tv, RTypeBV b v c tv (NoReftBV b v), RTypeBV b v c tv r) ->
+    RTypeBV b v c tv r ->
+    RTypeBV b v c tv r
+subsFree image = subsFreeWith image preserveBound (subtWithSort image) meet top isTauto
   where
-    zs = [(tv, toRSort t, t) | (tv, t) <- zip (freeVars c) ts]
+    preserveBound substitution binder = (subtWithSort image substitution binder, ty_var_value binder)
+
+{- | Substitute a retained type coordinate through the same structural visitor.
+Refinement actions must commute with their interpretation. In particular,
+conjunction must compose source predicates, not merely overwrite readback.
+The binder action returns the transported binder and the coordinate protected
+in its body: free instantiation protects the original owner; alpha-renaming
+protects the new owner and transports occurrences of the old owner.
+-}
+subsFreeWith ::
+    ( Eq tv
+    , Hashable tv
+    , TyConable c
+    , Binder b
+    , Symbolic b
+    , SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) c
+    , SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) Sort
+    , SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) (RTypeBV b v c tv (NoReftBV b v))
+    , FreeVar c tv
+    , SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) tv
+    , SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) (RTVar b v c tv)
+    ) =>
+    Maybe (RTypeBV b v c tv (NoReftBV b v) -> Sort) ->
+    ((tv, RTypeBV b v c tv (NoReftBV b v)) -> RTVar b v c tv -> (RTVar b v c tv, tv)) ->
+    ((tv, RTypeBV b v c tv (NoReftBV b v)) -> r -> r) ->
+    (r -> r -> r) ->
+    (r -> r) ->
+    (r -> Bool) ->
+    Bool ->
+    S.HashSet tv ->
+    (tv, RTypeBV b v c tv (NoReftBV b v), RTypeBV b v c tv r) ->
+    RTypeBV b v c tv r ->
+    RTypeBV b v c tv r
+subsFreeWith image scopeBinder act combine empty trivial = go
+  where
+    -- Replacements are required to be fresh for retained binders. The bound set
+    -- protects the substituted coordinate, including every retained annotation.
+    go _ s (α, _, _) t | α `S.member` s = t
+    go m s z@(α, τ, _) (RAllP π t) =
+        RAllP (subtWithSort image (α, τ) π) (go m s z t)
+    go m s z@(a, τ, _) (RAllT α t r) =
+        RAllT α' (go m (protected `S.insert` s) z t) (act (a, τ) r)
+      where
+        (α', protected) = scopeBinder (a, τ) α
+    go m s z@(α, τ, _) (RFun x i t t' r) =
+        RFun x i (go m s z t) (go m s z t') (act (α, τ) r)
+    go m s z@(α, τ, _) (RApp c ts rs r) =
+        RApp c' (go m s z <$> ts) (prop m s z <$> rs) (act (α, τ) r)
+      where
+        z' = (α, τ) -- UNIFY: why instantiating INSIDE parameters?
+        c' = if α `S.member` s then c else subtWithSort image z' c
+    go meet' s (α', τ, t') (RVar α r)
+        | α == α' && not (α `S.member` s) =
+            if meet' then strengthenWithTest trivial combine t' (act (α, τ) r) else t'
+        | otherwise =
+            RVar (subtWithSort image (α', τ) α) (act (α', τ) r)
+    go m s z (REx x t t') =
+        REx x (go m s z t) (go m s z t')
+    go m s z@(α, τ, _) (RAppTy t t' r) =
+        appTy m s (go m s z t) (go m s z t') (act (α, τ) r)
+    go _ _ _ t@(RLit _) =
+        t
+    go _ _ (α, τ, _) (RExprArg e) =
+        RExprArg (subtWithSort image (α, τ) <$> e)
+    go m s z@(α, τ, _) (RRTy e r o t) =
+        RRTy (fmap (go m s z) <$> e) (act (α, τ) r) o (go m s z t)
+    go _ _ (α, τ, _) (RHole r) =
+        RHole (act (α, τ) r)
+
+    gos m s zs t = foldl' (flip (go m s)) t zs
+
+    -- GHC INVARIANT: RApp is Type Application to something other than TYCon
+
+    appTy m s (RApp c ts rs r) t' r' =
+        app m s c (ts ++ [t']) rs r r'
+    appTy _ _ t t' r' =
+        RAppTy t t' r'
+
+    -- \| @app@ is the refined variant of GHC's @mkTyConApp@ which ensures that
+    --    that applications of the "function" type constructor are normalized to
+    --    the special case @FunTy _@ representation. The extra `_rep1`, and `_rep2`
+    --    parameters come from the "levity polymorphism" changes in GHC 8.6 (?)
+    --    See [NOTE:Levity-Polymorphism]
+
+    app m s c ts rs r r'
+        | isFun c
+        , [_m, _rep1, _rep2, t1, t2] <- ts =
+            RFun wildcard defRFInfo t1 t2 (checkFun r')
+        | otherwise =
+            gos m s zs (RApp c ts rs (combine r r'))
+      where
+        zs = [(tv, toRSort t, t) | (tv, t) <- zip (freeVars c) ts]
+
+    prop _ _ (α', τ', _) (RProp ss (RHole r)) =
+        RProp (fmap (subtWithSort image (α', τ')) <$> ss) (RHole (act (α', τ') r))
+    prop m s (α', τ', t') (RProp ss t) =
+        RProp (fmap (subtWithSort image (α', τ')) <$> ss) $ go m s (α', τ', fmap empty t') t
+
+    checkFun r
+        | trivial r = r
+        | otherwise = panic Nothing "RefType.refAppTyToFun"
 
 {-| [NOTE:Levity-Polymorphism]
 
@@ -1150,28 +1179,6 @@ mkRApp image m s c ts rs r r'
        • https://downloads.haskell.org/~ghc/latest/docs/html/users_guide/glasgow_exts.html#levity-polymorphism
        • and other links from https://stackoverflow.com/a/35320729/946226 (edited)
  -}
-
-refAppTyToFun :: (IsReft r, Eq (ReftVar r)) => r -> r
-refAppTyToFun r
-  | isTauto r = r
-  | otherwise = panic Nothing "RefType.refAppTyToFun"
-
-subsFreeRef
-  :: (Eq tv, Hashable tv, IsReft r, Eq (ReftVar r), TyConable c, Binder b, Symbolic b, Meet r,
-      SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) c, SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) r, SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) Sort,
-      SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) (RTypeBV b v c tv (NoReftBV b v)), FreeVar c tv,
-      SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) tv,
-      SubsTy tv (RTypeBV b v c tv (NoReftBV b v)) (RTVar b v c tv))
-  => Maybe (RTypeBV b v c tv (NoReftBV b v) -> Sort)
-  -> Bool
-  -> S.HashSet tv
-  -> (tv, RTypeBV b v c tv (NoReftBV b v), RTypeBV b v c tv r)
-  -> RTPropBV b v c tv r
-  -> RTPropBV b v c tv r
-subsFreeRef image _ _ (α', τ', _) (RProp ss (RHole r))
-  = RProp (fmap (subtWithSort image (α', τ')) <$> ss) (RHole (subtWithSort image (α', τ') r))
-subsFreeRef image m s (α', τ', t')  (RProp ss t)
-  = RProp (fmap (subtWithSort image (α', τ')) <$> ss) $ subsFree image m s (α', τ', fmap top t') t
 
 
 --------------------------------------------------------------------------------
@@ -1460,6 +1467,23 @@ type ToTypeable r = (IsReft r, ReftBind r ~ Symbol, ReftVar r ~ Symbol, PPrint r
 
 -- TODO: remove toType, generalize typeSort
 -- YL: really should take a type-level Bool
+specTypeToQueryType :: SpecType -> Type
+specTypeToQueryType = go
+  where
+    go (RLit l) = LitTy l
+    go (RVar (RTV tv) _) = mkTyVarTy tv
+    go (RFun _ _ domain result _)
+        | isClassType domain = Ghc.mkInvisFunTy (go domain) (go result)
+        | otherwise = Ghc.mkVisFunTyMany (go domain) (go result)
+    go (RAllT (ty_var_value -> RTV tv) rest _) = Ghc.mkSpecForAllTy tv (go rest)
+    go (RAllP _ rest) = go rest
+    go (RApp RTyCon{rtc_tc = tc} arguments _ _) = mkTyConApp tc (map go (filter notExprArg arguments))
+    go (REx _ _ result) = go result
+    go (RAppTy _ RExprArg{} _) = impossible Nothing "RExprArg in generated predicate telescope"
+    go (RAppTy function argument _) = Ghc.mkAppTy (go function) (go argument)
+    go (RRTy _ _ _ rest) = go rest
+    go ty = panic Nothing ("Unsupported generated predicate telescope: " ++ F.showpp ty)
+
 toType  :: (ToTypeable r) => Bool -> RRType r -> Type
 toType useRFInfo (RFun _ _ t@(RApp c _ _ _) t' _)
   | useRFInfo && isErasable c = toType useRFInfo t'
@@ -1549,26 +1573,45 @@ appSolRefa solution = trans txK
 
 --------------------------------------------------------------------------------
 -- shiftVV :: Int -- SpecType -> Symbol -> SpecType
-shiftVV :: (TyConable c, IsReft r, Subable r, Variable r ~ Symbol,
-            ReftBind r ~ Symbol, ReftVar r ~ Symbol)
-        => RType c tv r -> Symbol -> RType c tv r
+shiftVV ::
+    ( TyConable c
+    , IsReft r
+    , Subable r
+    , Variable r ~ Symbol
+    , ReftBind r ~ Symbol
+    , ReftVar r ~ Symbol
+    ) =>
+    RType c tv r -> Symbol -> RType c tv r
 --------------------------------------------------------------------------------
-shiftVV t@(RApp _ ts rs r) vv'
-  = t { rt_args  = subst1 ts (rTypeValueVar t, EVar vv') }
-      { rt_pargs = subst1 rs (rTypeValueVar t, EVar vv') }
-      { rt_reft  = mapReftField (`F.shiftVV` vv') r }
+shiftVV = shiftVVWith rTypeValueVar renameReftRoot subst1 subst1
 
-shiftVV t@(RFun _ _ _ _ r) vv'
-  = t { rt_reft = mapReftField (`F.shiftVV` vv') r }
-
-shiftVV t@(RAppTy _ _ r) vv'
-  = t { rt_reft = mapReftField (`F.shiftVV` vv') r }
-
-shiftVV t@(RVar _ r) vv'
-  = t { rt_reft = mapReftField (`F.shiftVV` vv') r }
-
-shiftVV t _
-  = t -- errorstar $ "shiftVV: cannot handle " ++ showpp t
+{- | Align a constructor root without changing the carrier traversal. The
+substitutions retain the scope of abstract-predicate formal arguments.
+-}
+shiftVVWith ::
+    (RType c tv r -> Symbol) ->
+    (r -> Symbol -> r) ->
+    ([RType c tv r] -> (Symbol, Expr) -> [RType c tv r]) ->
+    ([RTProp c tv r] -> (Symbol, Expr) -> [RTProp c tv r]) ->
+    RType c tv r ->
+    Symbol ->
+    RType c tv r
+shiftVVWith root rename substTypes substProps = go
+  where
+    go t@(RApp _ ts rs r) vv' =
+        t{rt_args = substTypes ts (root t, EVar vv')}
+            { rt_pargs = substProps rs (root t, EVar vv')
+            }
+            { rt_reft = rename r vv'
+            }
+    go t@(RFun _ _ _ _ r) vv' =
+        t{rt_reft = rename r vv'}
+    go t@(RAppTy _ _ r) vv' =
+        t{rt_reft = rename r vv'}
+    go t@(RVar _ r) vv' =
+        t{rt_reft = rename r vv'}
+    go t _ =
+        t -- errorstar $ "shiftVV: cannot handle " ++ showpp t
 
 
 --------------------------------------------------------------------------------
@@ -1590,6 +1633,7 @@ typeSort :: TCEmb TyCon -> Type -> Sort
 typeSort tce = go
   where
     go :: Type -> Sort
+    go t | Just expanded <- coreView t = go expanded
     go t@FunTy{}        = typeSortFun tce t
     go τ@(ForAllTy _ _) = typeSortForAll tce τ
     -- go (TyConApp c τs)  = fApp (tyConFTyCon tce c) (go <$> τs)
@@ -1608,6 +1652,114 @@ typeSort tce = go
     go (LitTy (StrTyLit _)) = tyConFTyCon tce listTyCon [tyConFTyCon tce charTyCon []]
     go τ                = FObj (typeUniqueSymbol τ)
 
+-- | Interpret source constructors while their native owners and formal
+-- coordinates are still available. This is not an inverse of 'typeSort':
+-- logical primitives and private logical carriers have no native preimage.
+-- Partial source constructors remain constructor values; a saturated native
+-- application is interpreted before its formal coordinates are projected.
+-- This does not give first-order 'Sort' a general constructor-function
+-- meaning: non-prefix partial actions must remain native until application.
+interpretEmbeddingSort :: (Symbol -> Maybe TyCon) -> TCEmb TyCon -> Sort -> Either LocSymbol Sort
+interpretEmbeddingSort owner catalog = go S.empty Nothing
+  where
+    go active opaque original = case F.unFApp original of
+      FTC constructor : arguments
+        | Just native <- owner (symbol constructor)
+        , let formals = Ghc.tyConTyVars native
+              generic = Ghc.mkTyConApp native (Ghc.mkTyVarTy <$> formals)
+              apply meaning actuals = fApp
+                (F.sortSubst (F.mkSortSubst (zip (symbol <$> formals) actuals)) meaning)
+                (drop (length formals) actuals)
+        -- Definitional source reduction precedes interpretation of arguments:
+        -- an alias can discard an argument or expose an identity action.
+        , Just _ <- coreView generic
+        , length arguments >= length formals ->
+            go active opaque (transport (Ghc.isTYPEorCONSTRAINT (typeKind generic)) constructor (apply (typeSort mempty generic) arguments))
+        | Just native <- owner (symbol constructor) -> do
+            let formals = Ghc.tyConTyVars native
+                generic = Ghc.mkTyConApp native (Ghc.mkTyVarTy <$> formals)
+                valueCarrier = Ghc.isTYPEorCONSTRAINT (typeKind generic)
+                coordinates = FObj . symbol <$> formals
+                genericIdentity = fApp (FTC constructor) coordinates
+                compose identity application
+                  | application == identity = pure application
+                  | otherwise = do
+                      -- Compose the action on its own formals, not on already
+                      -- interpreted operands. Substitution must not evaluate
+                      -- an operand again as a fresh recursive reference.
+                      composed <- go (S.insert native active) (Just native) application
+                      if composed == identity || not (mentions native composed)
+                        then pure composed
+                        else Left (F.fTyconSymbol constructor)
+            if Just native == opaque
+              then fApp (FTC constructor) <$> traverse (go active opaque) arguments
+              else if native `S.member` active
+                then Left (F.fTyconSymbol constructor)
+                else if length arguments >= length formals
+                  then do
+                    composed <- compose genericIdentity (transport valueCarrier constructor (typeSort catalog generic))
+                    let demanded = F.sortSymbols composed
+                        interpretActual formal actual
+                          | symbol formal `S.member` demanded = go active opaque actual
+                          | otherwise = pure actual
+                        (inputs, surplus) = splitAt (length formals) arguments
+                    actuals <- sequence (zipWith interpretActual formals inputs)
+                    extras <- traverse (go active opaque) surplus
+                    pure $ transport valueCarrier constructor $ fApp
+                      (F.sortSubst (F.mkSortSubst (zip (symbol <$> formals) actuals)) composed)
+                      extras
+                  else do
+                    actuals <- traverse (go active opaque) arguments
+                    let unchanged = fApp (FTC constructor) actuals
+                    case tceLookup native catalog of
+                      Just (prefix, NoArgs) -> compose unchanged (transport False constructor (fApp prefix actuals))
+                      _ -> pure unchanged
+      _ -> case original of
+        FAbs index body -> FAbs index <$> go active opaque body
+        FFunc input output -> FFunc <$> go active opaque input <*> go active opaque output
+        FApp function argument -> FApp <$> go active opaque function <*> go active opaque argument
+        _ -> pure original
+
+    transport valueCarrier constructor application = case F.unFApp application of
+      FTC destination : values ->
+        -- Numeric/string roles follow the existing scalar-carrier merge rule;
+        -- attaching them to an applied Set/Map head changes sort admission.
+        let located = F.symbolFTycon (symbol destination <$ F.fTyconSymbol constructor)
+            metadata
+              | valueCarrier && null values = F.mappendFTC constructor destination
+              | otherwise = destination
+        in fApp (FTC (F.mappendFTC located metadata)) values
+      _ -> application
+
+    mentions native meaning = case meaning of
+      FTC constructor -> owner (symbol constructor) == Just native
+      FAbs _ body -> mentions native body
+      FFunc input output -> mentions native input || mentions native output
+      FApp function argument -> mentions native function || mentions native argument
+      _ -> False
+
+-- | Compose a declared constructor action with its native formal arguments
+-- before projecting source aliases or other declared embeddings. A genuinely
+-- constant prefix keeps its partial-application representation.
+interpretEmbedding :: (Symbol -> Maybe TyCon) -> TCEmb TyCon -> TyCon -> (Sort, TCArgs) -> Either LocSymbol (Sort, TCArgs)
+interpretEmbedding owner catalog native (meaning, arguments) = do
+    interpreted <- interpretEmbeddingSort owner catalog generic
+    pure $ case (arguments, F.unFApp interpreted) of
+      (NoArgs, constructor : actuals)
+        | length actuals >= length formals
+        , let count = length actuals - length formals
+        , drop count actuals == coordinates
+        , let prefix = fApp constructor (take count actuals)
+        , S.null (S.intersection (S.fromList (symbol <$> formals)) (F.sortSymbols prefix)) ->
+            (prefix, NoArgs)
+      _ -> (interpreted, WithArgs)
+  where
+    formals = Ghc.tyConTyVars native
+    coordinates = FObj . symbol <$> formals
+    generic = case arguments of
+      NoArgs -> fApp meaning coordinates
+      WithArgs -> meaning
+
 {- | A representation-preserving newtype embedding interprets its constructor
 as identity only when its GENERIC source field and result have the same
 logical type. Neither SMT carrier erasure nor a coincidental instantiation
@@ -1618,8 +1770,8 @@ newtypeIdentitySort :: TCEmb TyCon -> DataCon -> Maybe Sort
 newtypeIdentitySort tce dc
     | isNewTyCon (dataConTyCon dc)
     , [field] <- dataConOrigArgTys dc
-    , let source = typeSort tce (Ghc.expandTypeSynonyms (irrelevantMult field))
-    , source == typeSort tce (Ghc.expandTypeSynonyms (dataConOrigResTy dc)) =
+    , let source = typeSort tce (irrelevantMult field)
+    , source == typeSort tce (dataConOrigResTy dc) =
         Just (F.sortSubst substitution source)
     | otherwise =
         Nothing
@@ -1780,15 +1932,15 @@ isDecreasing _ _ _
 isSizeable  :: S.HashSet TyCon -> TyCon -> Bool
 isSizeable autoenv tc = S.member tc autoenv --   Ghc.isAlgTyCon tc -- && Ghc.isRecursiveTyCon tc
 
-mkDecrFun :: S.HashSet TyCon -> RType RTyCon t t1 -> Symbol -> Expr
-mkDecrFun autoenv (RApp c _ _ _)
+mkDecrFun :: Maybe F.LocSymbol -> S.HashSet TyCon -> RType RTyCon t t1 -> Symbol -> Expr
+mkDecrFun sizeMeasure autoenv (RApp c _ _ _)
   | Just f <- szFun <$> sizeFunction (rtc_info c)
   = f
   | isSizeable autoenv $ rtc_tc c
-  = \v -> F.mkEApp lenLocSymbol [F.EVar v]
-mkDecrFun _ (RVar _ _)
+  = \v -> F.mkEApp (fromMaybe (panic Nothing "Missing or ambiguous autosize measure declaration") sizeMeasure) [F.EVar v]
+mkDecrFun _ _ (RVar _ _)
   = EVar
-mkDecrFun _ _
+mkDecrFun _ _ _
   = panic Nothing "RefType.mkDecrFun called on invalid input"
 
 makeLexRefa :: [Located Expr] -> [Located Expr] -> UReft

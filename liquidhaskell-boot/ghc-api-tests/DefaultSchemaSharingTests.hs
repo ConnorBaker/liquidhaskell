@@ -3,13 +3,12 @@ module DefaultSchemaSharingTests (tests, schemas) where
 import Control.DeepSeq (rnf)
 import Control.Exception (evaluate)
 import Control.Monad (forM, void)
-import Control.Monad.State (runState)
+import Control.Monad.State (modify, runState)
 import qualified Data.HashMap.Strict as M
 import qualified Language.Fixpoint.Types as F
 import qualified Language.Haskell.Liquid.Constraint.Fresh as CGFresh
 import Language.Haskell.Liquid.Constraint.Init (DefaultTypes, initCGI, prepareDefaultTypes)
 import qualified Language.Haskell.Liquid.Constraint.Types as CG
-import qualified Language.Haskell.Liquid.Types.Fresh as Fresh
 import Language.Haskell.Liquid.Types.PredType (makeTyConInfo)
 import Language.Haskell.Liquid.Types.RType (PVarBV (..), RSort, RTyCon (rtc_info), RTyVar (..), RTypeBV (..), SizeFunV (..), SpecType, TyConInfo (sizeFunction), TyConP (..), rTyConPVs)
 import Language.Haskell.Liquid.Types.RefType (ofType, rTypeSort, toType)
@@ -17,6 +16,7 @@ import Language.Haskell.Liquid.Types.Specs
 import Language.Haskell.Liquid.Types.Types (TyConMap (..))
 import qualified Language.Haskell.Liquid.UX.CmdLine as CmdLine
 import Language.Haskell.Liquid.UX.Config (Config)
+import qualified Language.Haskell.Liquid.UX.Config as LH
 import qualified Liquid.GHC.API as G
 import Test.Tasty (TestTree, testGroup)
 import Test.Tasty.HUnit (assertBool, assertFailure, testCase, (@?=))
@@ -24,9 +24,14 @@ import Test.Tasty.HUnit (assertBool, assertFailure, testCase, (@?=))
 -- Metadata belongs to the initializer; native row inventories belong to the
 -- actual source being checked, including callers with a different base target.
 schemas :: TargetInfo -> TargetInfo -> DefaultTypes
-schemas base stage =
+schemas base stage = schemasWith base stage (LH.typeclass (LH.getConfig base)) 0
+
+schemasWith :: TargetInfo -> TargetInfo -> Bool -> Integer -> DefaultTypes
+schemasWith base stage allow seed =
     let names = gsName (giSpec base)
      in prepareDefaultTypes
+            allow
+            seed
             (gsTyconEnv names)
             (gsTcEmbeds names)
             (giImpVars (giSrc stage))
@@ -37,14 +42,14 @@ tests emptyTarget compileToCore =
     testGroup
         "ordered native schema sharing"
         [ testCase "preparing the product does not demand unused metadata or rows" $
-            void (evaluate (prepareDefaultTypes (error "unused type metadata") (error "unused embedding") (error "unused imports") (error "unused constructors")))
+            void (evaluate (prepareDefaultTypes (error "unused typeclass mode") (error "unused fresh seed") (error "unused type metadata") (error "unused embedding") (error "unused imports") (error "unused constructors")))
         , testCase "empty inventories do not demand native metadata" $ do
-            let (imports, constructors, conlike) = prepareDefaultTypes (error "empty metadata") (error "empty embedding") [] []
+            let ((imports, constructors, conlike), _) = prepareDefaultTypes False 0 (error "empty metadata") (error "empty embedding") [] []
             map length [imports, constructors, conlike] @?= [0, 0, 0]
         , testCase "native rows retain duplicate order, conlike rows and exact fresh effects" $ withOwner $ \owner -> do
             let info = withInventories [owner, constructor, owner] [otherConstructor, otherConstructor] empty
-                prepared = schemas empty info
-                (imports, constructors, conlike) = prepared
+                prepared = schemasWith empty info
+                ((imports, constructors, conlike), _) = prepared False 0
             map fst imports @?= [owner, constructor, owner]
             map fst constructors @?= [otherConstructor, otherConstructor]
             map fst conlike @?= [constructor]
@@ -52,8 +57,8 @@ tests emptyTarget compileToCore =
         , testCase "base metadata never substitutes the base native inventory" $ withOwner $ \owner -> do
             let base = withInventories [otherConstructor] [] empty
                 stage = withInventories [owner, constructor] [constructor] empty
-                prepared = schemas base stage
-            map fst (firstRows prepared) @?= [owner, constructor]
+                prepared = schemasWith base stage
+            map fst (firstRows (prepared False 17)) @?= [owner, constructor]
             comparePrefixWith base stage prepared (False, 17)
         , testCase "captured predicates, family dispatch and embedding do not become stage metadata" $ do
             program <-
@@ -97,10 +102,10 @@ tests emptyTarget compileToCore =
                                             (metadata (F.symbol "stageOrigin") (F.symbol "stageInstance"))
                                             (embedding (F.fObj (F.dummyLoc (F.symbol "stageFamily"))))
                                             (withInventories [owner] [G.dataConWorkId constructor, G.dataConWrapId constructor] empty)
-                                    prepared = schemas base stage
-                                    (actual, _) = runState (preparedPrefix False prepared) (initCGI cfg base stage)
+                                    prepared = schemasWith base stage
+                                    (actual, _) = runState (preparedPrefix (prepared False 0)) (initCGI cfg base stage)
                                 assertBool "family dispatch metadata was empty" (not (M.null (tcmFIRTy (gsTyconEnv (gsName (giSpec base))))))
-                                case firstRows actual of
+                                case firstRows (actual, 0) of
                                     [(_, ty@(RApp tc typeArguments arguments _))] -> do
                                         map pname (rTyConPVs tc) @?= [F.symbol "baseInstance"]
                                         length arguments @?= 1
@@ -122,9 +127,9 @@ tests emptyTarget compileToCore =
                 source = original{giSrc = (giSrc original){giCbs = []}}
                 spec = giSpec source
                 stage = source{giSpec = spec{gsSig = (gsSig spec){gsTySigs = []}, gsData = (gsData spec){gsMeasures = []}, gsRefl = (gsRefl spec){gsMyAxioms = []}}}
-            let observed info = let (a, b, c) = schemas original info in map (map (F.symbol . fst)) [a, b, c]
+            let observed info = let ((a, b, c), _) = schemas original info in map (map (F.symbol . fst)) [a, b, c]
             observed stage @?= observed original
-            comparePrefix stage (schemas original stage) (False, 0)
+            comparePrefix stage (schemasWith original stage) (False, 0)
         ]
   where
     cfg = CmdLine.defConfig
@@ -132,7 +137,7 @@ tests emptyTarget compileToCore =
     constructor = G.dataConWorkId G.trueDataCon
     otherConstructor = G.dataConWorkId G.falseDataCon
     firstRows :: DefaultTypes -> [(G.Var, SpecType)]
-    firstRows (rows, _, _) = rows
+    firstRows ((rows, _, _), _) = rows
     withoutCast (G.Cast expression _) = withoutCast expression
     withoutCast expression = expression
     withInventories imports constructors info =
@@ -148,7 +153,7 @@ tests emptyTarget compileToCore =
     comparePrefixWith base stage prepared (allow, start) = do
         let initial = (initCGI cfg base stage){CG.freshIndex = start}
             (expected, oldState) = runState (originalPrefix allow stage) initial
-            (actual, newState) = runState (preparedPrefix allow prepared) initial
+            (actual, newState) = runState (preparedPrefix (prepared allow start)) initial
             rows (a, b, c) = [a, b, c]
         CG.freshIndex newState @?= CG.freshIndex oldState
         map (map (F.symbol . fst)) (rows actual) @?= map (map (F.symbol . fst)) (rows expected)
@@ -156,7 +161,7 @@ tests emptyTarget compileToCore =
         map (map (rTypeSort (CG.tyConEmbed initial) . snd)) (rows actual) @?= map (map (rTypeSort (CG.tyConEmbed initial) . snd)) (rows expected)
         assertBool "a native source telescope changed" $
             and [G.eqType (toType False actualType) (toType False expectedType) | (actualRows, expectedRows) <- zip (rows actual) (rows expected), ((_, actualType), (_, expectedType)) <- zip actualRows expectedRows]
-    originalPrefix :: Bool -> TargetInfo -> CG.CG DefaultTypes
+    originalPrefix :: Bool -> TargetInfo -> CG.CG ([(G.Var, SpecType)], [(G.Var, SpecType)], [(G.Var, SpecType)])
     originalPrefix allow info = do
         let imports = giImpVars (giSrc info)
             constructors = gsDataConIds (gsName (giSpec info))
@@ -166,11 +171,7 @@ tests emptyTarget compileToCore =
         b <- freshen constructors
         c <- freshen (filter G.isConLikeId imports)
         pure (a, b, c)
-    preparedPrefix :: Bool -> DefaultTypes -> CG.CG DefaultTypes
-    preparedPrefix allow (imports, constructors, conlike) = do
-        let freshen :: [(G.Var, SpecType)] -> CG.CG [(G.Var, SpecType)]
-            freshen = mapM (traverse (Fresh.true allow))
-        a <- freshen imports
-        b <- freshen constructors
-        c <- freshen conlike
-        pure (a, b, c)
+    preparedPrefix :: DefaultTypes -> CG.CG ([(G.Var, SpecType)], [(G.Var, SpecType)], [(G.Var, SpecType)])
+    preparedPrefix ~(rows, next) = do
+        modify (\state -> state{CG.freshIndex = next})
+        pure rows

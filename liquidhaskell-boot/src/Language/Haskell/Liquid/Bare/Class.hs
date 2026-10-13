@@ -13,6 +13,7 @@ module Language.Haskell.Liquid.Bare.Class
   , makeMethodTypes
   , instanceDictionaryOwners
   , classMethodField
+  , nominalEqualitySubstitution
   )
   where
 
@@ -29,6 +30,11 @@ import           Language.Haskell.Liquid.Types.Dictionaries
 import qualified Language.Haskell.Liquid.GHC.Misc           as GM
 import qualified Liquid.GHC.API            as Ghc
 import qualified GHC.Core.Type            as Ghc (seqTypes)
+import qualified GHC.Core.Predicate       as Ghc (getEqPredTys_maybe)
+import qualified GHC.Core.Coercion.Axiom  as Ghc (Role(Nominal))
+import qualified GHC.Core.Unify           as Ghc (tcUnifyTys, BindFlag(..))
+import qualified GHC.Core.TyCo.Subst      as Ghc (substTy)
+import qualified GHC.Builtin.Types        as Ghc (eqTyCon, heqTyCon)
 import           Language.Haskell.Liquid.Misc
 import           Language.Haskell.Liquid.Types.DataDecl
 import           Language.Haskell.Liquid.Types.Errors
@@ -37,6 +43,7 @@ import           Language.Haskell.Liquid.Types.RefType
 import           Language.Haskell.Liquid.Types.RType
 import           Language.Haskell.Liquid.Types.RTypeOp
 import           Language.Haskell.Liquid.Types.Types
+import           Language.Haskell.Liquid.UX.Config (getConfig, typeclass)
 
 import qualified Language.Haskell.Liquid.Measure            as Ms
 import           Language.Haskell.Liquid.Bare.Types         as Bare
@@ -56,67 +63,141 @@ import GHC.Types.Var.Env (mkInScopeSet)
 
 
 -------------------------------------------------------------------------------
-makeMethodTypes :: F.TCEmb Ghc.TyCon -> Bool -> DEnv Ghc.Var LocSpecType -> [DataConP] -> [Ghc.CoreBind] -> [(Ghc.Var, MethodType LocSpecType)]
+makeMethodTypes :: F.TCEmb Ghc.TyCon -> Bool -> DEnv Ghc.Var LocSpecType -> [(Ghc.Var, LocSpecType)] -> [DataConP] -> [Ghc.CoreBind] -> [(Ghc.Var, MethodType (F.Located CheckedSpecType))]
 -------------------------------------------------------------------------------
-makeMethodTypes embs allowTC (DEnv hm) cls cbs =
-  [ ( method
-    , MT
-        (addCC allowTC method . fromRISig <$> methodType dictionary selector)
-        (addCC allowTC method <$> classType dictionary selector)
-    )
-  | (dictionary, _) <- Ghc.flattenBinds cbs
-  , Ghc.isDFunId dictionary
-  , M.member dictionary hm || Mb.isJust (classDeclaration dictionary)
-  , (selector, method) <- owners dictionary
-  ]
+makeMethodTypes embs allowTC (DEnv hm) dictionaryTypes cls cbs =
+    [ ( method
+      , MT
+            (fmap logicalSpecType . addCC allowTC method . fromRISig <$> methodType dictionary selector)
+            (Just $ fmap logicalSpecType $ addCC allowTC method $ classType dictionary selector)
+            (Just (dictionary, selector))
+      )
+    | (dictionary, _) <- Ghc.flattenBinds cbs
+    , Ghc.isDFunId dictionary
+    , M.member dictionary hm || Mb.isJust (classDeclaration dictionary)
+    , (selector, method) <- owners dictionary
+    ]
+        ++ [ ( selector
+             , ImportedMethod
+                (Just $ fmap logicalSpecType $ normalize $ fromRISig signature)
+                (Just $ fmap logicalSpecType $ normalize $ classType dictionary selector)
+                (Just (dictionary, selector))
+             )
+           | (dictionary, fields) <- M.toList hm
+           , not (dictionary `S.member` localDictionaries)
+           , let (_, _, owner, _) = Ghc.tcSplitDFunTy (Ghc.varType dictionary)
+           , selector <- Ghc.classAllSelIds owner
+           , Just signature <- [M.lookup (F.symbol (Ghc.getOccString selector)) fields]
+           , let field = haskellClassField dictionary selector
+                 representation = toRTypeRep (ofType $ Ghc.varType dictionary)
+                 methodCarrier = toType False $ fromRTypeRep representation{ty_res = field}
+                 normalize = addCCType allowTC selector methodCarrier
+           ]
   where
+    localDictionaries = S.fromList [dictionary | (dictionary, _) <- Ghc.flattenBinds cbs, Ghc.isDFunId dictionary]
+    dictionaryTypeMap = M.fromList dictionaryTypes
+
+    dictionaryArguments dictionary =
+        map (specializeEquality dictionary) $ case M.lookup dictionary dictionaryTypeMap of
+            Just signature | RApp _ arguments _ _ <- ty_res (toRTypeRep $ val signature) -> arguments
+            _ -> map ofType $ fourth $ Ghc.tcSplitDFunTy (Ghc.varType dictionary)
+
+    -- A GHC instance may expose a concrete head through equality evidence,
+    -- e.g. forall a. a ~ Char => IsString [a]. Admission uses that evidence's
+    -- specialization, while the callable dictionary keeps its actual telescope.
+    specializeEquality dictionary argument =
+        case nominalEqualitySubstitution variables equalities of
+            Just substitution -> foldl (flip (subsTyVarMeetWith embs)) argument [(rTyVar variable, ofType image) | (variable, image) <- substitution]
+            Nothing -> Ex.throw (ErrOther location (text "Unsupported nominal equality specialization for instance dictionary") :: Error)
+      where
+        (variables, context, _, _) = Ghc.tcSplitDFunTy (Ghc.varType dictionary)
+        location = maybe (Ghc.getSrcSpan dictionary) GM.fSrcSpan (M.lookup dictionary dictionaryTypeMap)
+        equalities = [pair | predicate <- context, Just pair <- [equality predicate]]
+        equality predicate
+            | Just (Ghc.Nominal, left, right) <- Ghc.getEqPredTys_maybe predicate = Just (left, right)
+            | Just (constructor, arguments) <- Ghc.splitTyConApp_maybe predicate
+            , constructor `elem` [Ghc.eqTyCon, Ghc.heqTyCon]
+            , right : left : _ <- reverse arguments =
+                Just (left, right)
+            | otherwise = Nothing
+
     owners dictionary =
-      Mb.fromMaybe
-        ( panic
-            (Just (Ghc.getSrcSpan dictionary))
-            "Unsupported refined class dictionary: each field must retain its exact source owner and instance telescope"
-        )
-        (instanceDictionaryOwners cbs dictionary)
+        Mb.fromMaybe
+            ( panic
+                (Just (Ghc.getSrcSpan dictionary))
+                "Unsupported refined class dictionary: each field must retain its exact source owner and instance telescope"
+            )
+            (instanceDictionaryOwners cbs dictionary)
 
     classDeclaration dictionary =
-      let (_, _, owner, _) = Ghc.tcSplitDFunTy (Ghc.varType dictionary)
-       in L.find ((== Ghc.classDataCon owner) . dcpCon) cls
+        let (_, _, owner, _) = Ghc.tcSplitDFunTy (Ghc.varType dictionary)
+         in L.find ((== Ghc.classDataCon owner) . dcpCon) cls
 
-    classType dictionary selector = do
-      declaration <- classDeclaration dictionary
-      field <-
-        L.lookup
-          (Just (Ghc.getName selector))
-          [(getLHGHCName name, ty) | (name, ty) <- dcpTyArgs declaration]
-      let (_, _, _, arguments) = Ghc.tcSplitDFunTy (Ghc.varType dictionary)
-      pure $ dcpLoc declaration `F.atLoc` subst (zip (dcpFreeTyVars declaration) arguments) field
+    classType dictionary selector =
+        Mb.fromMaybe
+            (F.loc (GM.locNamedThing selector) `F.atLoc` haskellClassField dictionary selector)
+            declared
+      where
+        declared = do
+            declaration <- classDeclaration dictionary
+            field <-
+                L.lookup
+                    (Just (Ghc.getName selector))
+                    [(getLHGHCName name, ty) | (name, ty) <- dcpTyArgs declaration]
+            pure $ dcpLoc declaration `F.atLoc` subst (zip (dcpFreeTyVars declaration) (dictionaryArguments dictionary)) field
+
+    haskellClassField dictionary selector =
+        let (_, _, owner, _) = Ghc.tcSplitDFunTy (Ghc.varType dictionary)
+         in subst
+                (zip (map rTyVar $ Ghc.classTyVars owner) (dictionaryArguments dictionary))
+                (ofType $ thrd3 $ Ghc.tcSplitMethodTy $ Ghc.varType selector)
 
     -- The dictionary already fixes the class owner. Its declaration selector,
     -- not the implementation's occurrence spelling, supplies the field key.
     methodType dictionary selector = do
-      fields <- M.lookup dictionary hm
-      M.lookup (F.symbol (Ghc.getOccString selector)) fields
+        fields <- M.lookup dictionary hm
+        M.lookup (F.symbol (Ghc.getOccString selector)) fields
 
     subst [] t = t
-    subst ((a, ta) : su) t = subsTyVarMeetWith embs (a, ofType ta) (subst su t)
+    subst ((a, ta) : su) t = subsTyVarMeetWith embs (a, ta) (subst su t)
+
+    fourth (_, _, _, value) = value
+
+-- Joint nominal evidence has one coordinated image, independent of clause
+-- order. GHC's conservative family unification is not itself an equality proof:
+-- require the image to discharge every pair and to be idempotent before using
+-- the existing scoped refinement substitutions. Only the DFun's variables bind.
+nominalEqualitySubstitution :: [Ghc.TyVar] -> [(Ghc.Type, Ghc.Type)] -> Maybe [(Ghc.TyVar, Ghc.Type)]
+nominalEqualitySubstitution variables equalities = do
+    substitution <- Ghc.tcUnifyTys bind (map fst equalities) (map snd equalities)
+    let images = [(variable, Ghc.substTy substitution (Ghc.TyVarTy variable)) | variable <- variables]
+    guard (all (\(left, right) -> Ghc.substTy substitution left `Ghc.eqType` Ghc.substTy substitution right) equalities)
+    guard (all (\(_, image) -> Ghc.substTy substitution image `Ghc.eqType` image) images)
+    pure [(variable, image) | (variable, image) <- images, not (Ghc.TyVarTy variable `Ghc.eqType` image)]
+  where
+    bind variable _
+        | variable `elem` variables = Ghc.BindMe
+        | otherwise = Ghc.DontBindMe
 
 addCC :: Bool -> Ghc.Var -> LocSpecType -> LocSpecType
-addCC allowTC var zz@(Loc l l' st0)
-  | length sourceClasses <= length haskellClasses
-  , toType False hst `Ghc.eqType` toType False result =
-      Loc l l' result
-  | otherwise = Ex.throw (err (pprint hst) (pprint result))
+addCC allowTC var = addCCType allowTC var (Ghc.varType var)
+
+addCCType :: Bool -> Ghc.Var -> Ghc.Type -> LocSpecType -> LocSpecType
+addCCType allowTC var t0 zz@(Loc l l' st0)
+    | length sourceClasses <= length haskellClasses
+    , toType False hst `Ghc.eqType` toType False result =
+        Loc l l' result
+    | otherwise = Ex.throw (err (pprint hst) (pprint result))
   where
     result = addForall [] hst (mkArrow [] [] contextClasses (tx (stripPrefixForalls st0)))
     hst = ofType (Ghc.expandTypeSynonyms t0) :: SpecType
-    t0 = Ghc.varType var
     tyvsmap = case Bare.runMapTyVars
-      allowTC
-      (toType False (mkArrow [] [] (rows matchingClasses) rt))
-      (mkArrow [] [] (rows sourceClasses) st)
-      err of
-      Left e -> Ex.throw e
-      Right s -> Bare.vmap s
+        allowTC
+        (toType False (mkArrow [] [] (rows matchingClasses) rt))
+        (mkArrow [] [] (rows sourceClasses) st)
+        err of
+        Left e -> Ex.throw e
+        Right s -> Bare.vmap s
     su = [(y, rTyVar x) | (x, y) <- tyvsmap]
     su' = [(source, RVar target NoReft) | (source, target) <- su] :: [(RTyVar, RSort)]
     -- The absent prefix belongs to the instance context; the supplied suffix
@@ -132,14 +213,14 @@ addCC allowTC var zz@(Loc l l' st0)
     -- instance evidence may precede a method's forall and abstract predicates.
     classTelescope :: SpecType -> ([(SpecRTVar, RReft)], [PVar RSort], [(F.Symbol, SpecType, RReft)], SpecType)
     classTelescope ty =
-      let (as, ps0, cs, body) = bkUnivClass' ty
-          continue =
-            let (as', ps'', cs', result) = classTelescope body
-             in (as ++ as', ps0 ++ ps'', cs ++ cs', result)
-       in case body of
-            RAllT{} -> continue
-            RAllP{} -> continue
-            _ -> (as, ps0, cs, body)
+        let (as, ps0, cs, body) = bkUnivClass' ty
+            continue =
+                let (as', ps'', cs', result) = classTelescope body
+                 in (as ++ as', ps0 ++ ps'', cs ++ cs', result)
+         in case body of
+                RAllT{} -> continue
+                RAllP{} -> continue
+                _ -> (as, ps0, cs, body)
 
     -- Retain predicate and dictionary binders in place, including their named
     -- dependent uses. The GHC telescope supplies the type binders again below.
@@ -147,47 +228,47 @@ addCC allowTC var zz@(Loc l l' st0)
     stripPrefixForalls (RAllT _ t _) = stripPrefixForalls t
     stripPrefixForalls (RAllP p t) = RAllP p (stripPrefixForalls t)
     stripPrefixForalls (RFun x i t@(RApp c _ _ _) t' r)
-      | isClass c = RFun x i t (stripPrefixForalls t') r
+        | isClass c = RFun x i t (stripPrefixForalls t') r
     stripPrefixForalls t = t
 
     err :: Doc -> Doc -> Error
     err hsT lqT =
-      ErrMismatch
-        (GM.fSrcSpan zz)
-        (pprint var)
-        (text "makeMethodTypes")
-        (pprint $ Ghc.expandTypeSynonyms t0)
-        (pprint $ toRSort st0)
-        (Just (hsT, lqT))
-        (Ghc.getSrcSpan var)
+        ErrMismatch
+            (GM.fSrcSpan zz)
+            (pprint var)
+            (text "makeMethodTypes")
+            (pprint $ Ghc.expandTypeSynonyms t0)
+            (pprint $ toRSort st0)
+            (Just (hsT, lqT))
+            (Ghc.getSrcSpan var)
 
     addForall :: [RTyVar] -> SpecType -> SpecType -> SpecType
     addForall scope (RAllT v t r) tt@(RAllT v' _ _)
-      | v == v' =
-          tt
-      | otherwise =
-          RAllT (updateRTVar v) (addForall (ty_var_value v : scope) t tt) r
+        | v == v' =
+            tt
+        | otherwise =
+            RAllT (updateRTVar v) (addForall (ty_var_value v : scope) t tt) r
     addForall scope (RAllT v t r) t' =
-      RAllT (updateRTVar v) (addForall (ty_var_value v : scope) t t') (r <> sourceReft v)
+        RAllT (updateRTVar v) (addForall (ty_var_value v : scope) t t') (r <> sourceReft v)
     addForall scope (RAllP _ t) t' =
-      addForall scope t t'
+        addForall scope t t'
     addForall scope t (RAllP p t')
-      | all ((`elem` scope) . ty_var_value) (concatMap freeTyVars (ptype p : [s | (s, _, _) <- pargs p])) =
-          RAllP p (addForall scope t t')
-      | otherwise =
-          Ex.throw (err (pprint t) (text "Abstract predicate is outside the scope of its method type variables:" <> pprint p))
+        | all ((`elem` scope) . ty_var_value) (concatMap freeTyVars (ptype p : [s | (s, _, _) <- pargs p])) =
+            RAllP p (addForall scope t t')
+        | otherwise =
+            Ex.throw (err (pprint t) (text "Abstract predicate is outside the scope of its method type variables:" <> pprint p))
     addForall scope (RFun _ _ t1 t2 _) (RFun x i t1' t2' r) =
-      RFun x i (addForall scope t1 t1') (addForall scope t2 t2') r
+        RFun x i (addForall scope t1 t1') (addForall scope t2 t2') r
     addForall _ _ t =
-      t
+        t
 
     sourceReft :: SpecRTVar -> RReft
     sourceReft v =
-      mconcat
-        [ subts su' r
-        | (a, r) <- sourceVariables
-        , Mb.fromMaybe (ty_var_value a) (lookup (ty_var_value a) su) == ty_var_value v
-        ]
+        mconcat
+            [ subts su' r
+            | (a, r) <- sourceVariables
+            , Mb.fromMaybe (ty_var_value a) (lookup (ty_var_value a) su) == ty_var_value v
+            ]
 
 -- A selector owns its actual dictionary field, not a spelling such as $cp1.
 -- Follow only local administrative aliases; a top-level method remains its
@@ -304,28 +385,56 @@ makeMethod env sigEnv name (lx, bt) = (name, mbV,) <$> Bare.cookSpecTypeE env si
     mbV = either (const Bare.GenTV) Bare.LqTV (Bare.lookupGhcIdLHName env lx)
 
 -------------------------------------------------------------------------------
-makeSpecDictionaries
-  :: Bare.Env
-  -> Bare.SigEnv
-  -> (ModName, Ms.BareSpec)
-  -> [(ModName, Ms.BareSpec)]
-  -> Ghc.TcRn ([RInstance LocBareType], DEnv Ghc.Var LocSpecType)
+makeSpecDictionaries ::
+    Bare.Env ->
+    Bare.SigEnv ->
+    (ModName, Ms.BareSpec) ->
+    [(ModName, Ms.BareSpec)] ->
+    Ghc.TcRn ([RInstance LocBareType], DEnv Ghc.Var LocSpecType, [(Ghc.Var, LocSpecType)])
 -------------------------------------------------------------------------------
-makeSpecDictionaries env sigEnv spec0 specs
-  = do (instances, specDicts) <- makeSpecDictionary env sigEnv spec0
-       imported <- mapM (makeSpecDictionary env sigEnv) specs
-       pure (instances, dfromList $ specDicts ++ concatMap snd imported)
+makeSpecDictionaries env sigEnv spec0 specs =
+    do
+        (instances, specDicts, dictionaryTypes) <- makeSpecDictionary env sigEnv spec0
+        imported <- mapM (makeSpecDictionary env sigEnv) specs
+        let allDictionaryTypes = dictionaryTypes ++ concatMap (\(_, _, signatures) -> signatures) imported
+            declarations = M.fromListWith (flip (++)) [(dictionary, [GM.fSrcSpan signature]) | (dictionary, signature) <- allDictionaryTypes]
+            duplicates = [errDupSpecs (pprint dictionary) locations :: Error | (dictionary, locations@(_ : _ : _)) <- M.toList declarations]
+        case duplicates of
+            err : _ -> Ghc.liftIO $ Ex.throwIO err
+            [] -> pure ()
+        pure
+            ( instances
+            , dfromList $ specDicts ++ concatMap (\(_, dictionaries, _) -> dictionaries) imported
+            , allDictionaryTypes
+            )
 
-makeSpecDictionary :: Bare.Env -> Bare.SigEnv -> (ModName, Ms.BareSpec)
-                   -> Ghc.TcRn ([RInstance LocBareType], [(Ghc.Var, M.HashMap F.Symbol (RISig LocSpecType))])
+makeSpecDictionary ::
+    Bare.Env ->
+    Bare.SigEnv ->
+    (ModName, Ms.BareSpec) ->
+    Ghc.TcRn ([RInstance LocBareType], [(Ghc.Var, M.HashMap F.Symbol (RISig LocSpecType))], [(Ghc.Var, LocSpecType)])
 makeSpecDictionary env sigEnv (name, spec) = do
     let instances = Ms.rinstance spec
-    resolved <- resolveDictionaries env $ map (makeSpecDictionaryOne env sigEnv name) instances
+    let cooked = map (makeSpecDictionaryOne env sigEnv name) instances
+    resolved <- resolveDictionaries env cooked
     let updatedInstances =
-          [ ri { riDictName = Just $ makeGHCLHNameLocatedFromId v }
-          | (ri, (v, _)) <- zip instances resolved
-          ]
-    pure (updatedInstances, resolved)
+            [ ri{riDictName = Just $ makeGHCLHNameLocatedFromId v}
+            | (ri, (v, _)) <- zip instances resolved
+            ]
+        dictionaryTypes =
+            [ (dictionary, addCC (typeclass $ getConfig env) dictionary $ location `F.atLoc` headType)
+            | (ri, (dictionary, _)) <- zip cooked resolved
+            , let representation = toRTypeRep (ofType $ Ghc.varType dictionary)
+                  arguments = map (dropUniv . val) (ritype ri)
+                  headType = case ty_res representation of
+                    actual@RApp{} | all (all isTauto) arguments -> actual
+                    RApp constructor _ predicates refinement -> RApp constructor arguments predicates refinement
+                    _ -> panic (Just $ Ghc.getSrcSpan dictionary) "Instance dictionary has no class result"
+                  location = case ritype ri of
+                    first : _ -> F.loc first
+                    [] -> F.loc $ GM.locNamedThing dictionary
+            ]
+    pure (updatedInstances, resolved, dictionaryTypes)
 
 makeSpecDictionaryOne :: Bare.Env -> Bare.SigEnv -> ModName
                       -> RInstance LocBareType

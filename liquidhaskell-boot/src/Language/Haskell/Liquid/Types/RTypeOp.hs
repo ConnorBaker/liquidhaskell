@@ -43,6 +43,8 @@ module Language.Haskell.Liquid.Types.RTypeOp (
   , emapDataCtorTyM
   , emapBareTypeVM
   , parsedToBareType
+  , rTypeSymsWith, rTypeSubstWith
+  , refSubstWith
 
   -- * Converting To and From Sort
   , ofRSort, toRSort
@@ -249,216 +251,231 @@ addInvCond t r'
     F.Reft(v, rv) = ur_reft r'
 
 
-instance ( IsReft r
-         , F.Subable r
-         , F.Subable t
-         , TyConable c
-         , F.Binder v
-         , F.Refreshable v
-         , F.Variable r ~ v
-         , F.Variable t ~ v
-         , ReftBind r ~ v
-         , ReftVar r ~ v
-         ) =>
-         F.Subable (RefB v (RTypeBV v v c tv r) t) where
-  type Variable (RefB v (RTypeBV v v c tv r) t) = v
-  syms (RProp ss r) =
+instance
+    ( IsReft r
+    , F.Subable r
+    , F.Subable t
+    , TyConable c
+    , F.Binder v
+    , F.Refreshable v
+    , F.Variable r ~ v
+    , F.Variable t ~ v
+    , ReftBind r ~ v
+    , ReftVar r ~ v
+    ) =>
+    F.Subable (RefB v (RTypeBV v v c tv r) t)
+    where
+    type Variable (RefB v (RTypeBV v v c tv r) t) = v
+    syms = refSymsWith F.syms
+    substr = refSubstWith F.substr
+
+refSymsWith ::
+    (F.Subable s, F.Variable s ~ v, F.Binder v) =>
+    (t -> S.HashSet v) -> RefB v s t -> S.HashSet v
+refSymsWith symsBody (RProp ss r) =
     let (bs, tss) =
-          List.mapAccumL
-            (\bs0 (b, tb) -> (S.insert b bs0, F.syms tb `S.difference` bs0))
-            S.empty
-            ss
-     in
-        S.unions $ (F.syms r `S.difference` bs) : tss
+            List.mapAccumL
+                (\bs0 (b, tb) -> (S.insert b bs0, F.syms tb `S.difference` bs0))
+                S.empty
+                ss
+     in S.unions $ (symsBody r `S.difference` bs) : tss
 
-  substr ns0 su0 (RProp ss0 t0) =
-      let ((bs', ns', su'), ts) = substInArgs ss0 ns0 su0
-          ss' = zip bs' ts
-      in RProp ss' (F.substr ns' su' t0)
-    where
-      substInArgs ss1 ns1 su1 =
+refSubstWith ::
+    (F.Subable s, F.Variable s ~ v, F.Binder v, F.Refreshable v) =>
+    (S.HashSet v -> F.SubstV v -> t -> t) ->
+    S.HashSet v ->
+    F.SubstV v ->
+    RefB v s t ->
+    RefB v s t
+refSubstWith substBody ns0 su0 (RProp ss0 t0) =
+    let ((bs', ns', su'), ts) = substInArgs ss0 ns0 su0
+        ss' = zip bs' ts
+     in RProp ss' (substBody ns' su' t0)
+  where
+    substInArgs ss1 ns1 su1 =
         List.mapAccumR
-          (\(bs, ns, su) (x, t) ->
-             let (ns', x') = F.freshInNS x ns
-                 su' = F.extendSubstWithVar su x x'
-              in
-                 ( (x' : bs, ns', su')
-                 , F.substr ns su t
-                 )
-          )
-          ([], ns1, su1)
-          ss1
+            ( \(bs, ns, su) (x, t) ->
+                let (ns', x') = F.freshInNS x ns
+                    su' = F.extendSubstWithVar su x x'
+                 in ( (x' : bs, ns', su')
+                    , F.substr ns su t
+                    )
+            )
+            ([], ns1, su1)
+            ss1
 
-
-instance ( F.Subable r
-         , IsReft r
-         , TyConable c
-         , F.Binder v
-         , F.Refreshable v
-         , F.Variable r ~ v
-         , ReftBind r ~ v
-         , ReftVar r ~ v
-         ) => F.Subable (RTypeBV v v c tv r) where
-  type Variable (RTypeBV v v c tv r) = v
-  syms = go
+instance
+    ( F.Subable r
+    , IsReft r
+    , TyConable c
+    , F.Binder v
+    , F.Refreshable v
+    , F.Variable r ~ v
+    , ReftBind r ~ v
+    , ReftVar r ~ v
+    ) =>
+    F.Subable (RTypeBV v v c tv r)
     where
-      deletev r0 = case toConcreteReft r0 of
-        ConcreteNoReft -> id
-        ConcreteReft r -> S.delete (F.reftBind r)
-        ConcreteUReft (MkUReft r _) -> S.delete (F.reftBind r)
+    type Variable (RTypeBV v v c tv r) = v
+    syms = rTypeSymsWith reftBinder
+    substr = rTypeSubstWith reftBinder
 
-      go :: RTypeBV v v c tv r -> S.HashSet v
-      go (RVar _ r) = F.syms r
-      go (RFun x _ t1 t2 r)  =
+{- | The refinement root scopes over constructor children, independently of
+how the refinement is represented. A root getter must retain binder presence
+under substitution and report the substituted root.
+-}
+rTypeSymsWith ::
+    forall r v c tv.
+    (F.Subable r, TyConable c, F.Binder v, F.Refreshable v, F.Variable r ~ v) =>
+    (r -> Maybe v) -> RTypeBV v v c tv r -> S.HashSet v
+rTypeSymsWith binder = go
+  where
+    deletev r = maybe id S.delete (binder r)
+
+    go :: RTypeBV v v c tv r -> S.HashSet v
+    go (RVar _ r) = F.syms r
+    go (RFun x _ t1 t2 r) =
         -- x scopes over t1, t2, and r
-        deletev r (S.delete x $ F.syms t1 `S.union` F.syms t2)
-        `S.union` F.syms r
-      go (RAllT α t r)       =
+        deletev r (S.delete x $ go t1 `S.union` go t2)
+            `S.union` F.syms r
+    go (RAllT α t r) =
         let kindSyms = maybe S.empty (F.syms . snd) (rTVarToBind α)
             deleteα = maybe id (S.delete . fst) (rTVarToBind α)
-         in
-            deletev r (kindSyms `S.union` deleteα (F.syms t))
-            `S.union` F.syms r
-      go (RAllP pb t) =
-          S.delete (pname pb) (F.syms t) `S.union` symsPVar pb
-        where
-          symsPVar p =
+         in deletev r (kindSyms `S.union` deleteα (go t))
+                `S.union` F.syms r
+    go (RAllP pb t) =
+        S.delete (pname pb) (go t) `S.union` symsPVar pb
+      where
+        symsPVar p =
             let (bs, tss) =
-                  List.mapAccumL
-                    (\bs0 (tb, b, _) -> (S.insert b bs0, F.syms tb `S.difference` bs0))
-                    S.empty
-                    (pargs p)
-             in
-                S.unions $ (F.syms (ptype p) `S.difference` bs) : tss
-
-      go (RApp _ ts ps r) =
-        deletev r (F.syms ts `S.union` F.syms ps)
-        `S.union` F.syms r
-      go (REx x t1 t2) =
+                    List.mapAccumL
+                        (\bs0 (tb, b, _) -> (S.insert b bs0, F.syms tb `S.difference` bs0))
+                        S.empty
+                        (pargs p)
+             in S.unions $ (F.syms (ptype p) `S.difference` bs) : tss
+    go (RApp _ ts ps r) =
+        deletev r (S.unions (go <$> ts) `S.union` S.unions (refSymsWith go <$> ps))
+            `S.union` F.syms r
+    go (REx x t1 t2) =
         -- x scopes over t2 only
-        F.syms t1 `S.union` S.delete x (F.syms t2)
-      go (RLit _) = S.empty
-      go (RExprArg e) = F.syms e
-      go (RAppTy t1 t2 r) =
-        deletev r (F.syms t1 `S.union` F.syms t2)
-        `S.union` F.syms r
-      go (RRTy env r _ t) =
-          -- env scopes over the refinement type
-          let (bs, envSyms) = symsEnv env
-              rsyms = F.syms r `S.difference` bs
-           in
-              envSyms `S.union` rsyms `S.union` F.syms t
-        where
-          symsEnv = foldl'
-              (\(s, env') (x, xt) ->
-                let s' = S.insert x s
-                 in (s', (F.syms xt `S.difference` s) `S.union` env')
-              )
-              (S.empty, S.empty)
+        go t1 `S.union` S.delete x (go t2)
+    go (RLit _) = S.empty
+    go (RExprArg e) = F.syms e
+    go (RAppTy t1 t2 r) =
+        deletev r (go t1 `S.union` go t2)
+            `S.union` F.syms r
+    go (RRTy env r _ t) =
+        -- env scopes over the refinement type
+        let (bs, envSyms) = symsEnv env
+            rsyms = F.syms r `S.difference` bs
+         in envSyms `S.union` rsyms `S.union` go t
+      where
+        symsEnv =
+            foldl'
+                ( \(s, env') (x, xt) ->
+                    let s' = S.insert x s
+                     in (s', (go xt `S.difference` s) `S.union` env')
+                )
+                (S.empty, S.empty)
+    go (RHole r) = F.syms r
 
-      go (RHole r) = F.syms r
+rTypeSubstWith ::
+    forall r v c tv.
+    (F.Subable r, TyConable c, F.Binder v, F.Refreshable v, F.Variable r ~ v) =>
+    (r -> Maybe v) ->
+    S.HashSet v ->
+    F.SubstV v ->
+    RTypeBV v v c tv r ->
+    RTypeBV v v c tv r
+rTypeSubstWith binder = go
+  where
+    -- Given a reft 'r' and the nameset 's' that will be passed to
+    -- 'F.substr' for 'r', compute the fresh reft-binder 'v0'' and return
+    -- the updated nameset and substitution for sub-fields that have 'v0'
+    -- in scope (i.e. all fields of the same constructor other than 'r').
+    substReft :: r -> S.HashSet v -> F.SubstV v -> (S.HashSet v, F.SubstV v, r)
+    substReft r s su = case binder r of
+        Nothing -> (s, su, r)
+        Just v ->
+            let r' = F.substr s su r
+             in case binder r' of
+                    Nothing -> (s, su, r')
+                    Just v' -> (S.insert v' s, F.extendSubstWithVar su v v', r')
 
-  substr = go
-    where
-      -- Given a reft 'r' and the nameset 's' that will be passed to
-      -- 'F.substr' for 'r', compute the fresh reft-binder 'v0'' and return
-      -- the updated nameset and substitution for sub-fields that have 'v0'
-      -- in scope (i.e. all fields of the same constructor other than 'r').
-      substReft :: r -> S.HashSet v -> F.SubstV v -> (S.HashSet v, F.SubstV v, r)
-      substReft r s su =
-        case toConcreteReft r of
-          ConcreteNoReft -> (s, su, r)
-          ConcreteReft (F.Reft (v0, e)) ->
-            let (s', v0') = F.freshInNS v0 s
-                su' = F.extendSubstWithVar su v0 v0'
-             in (s', su', F.Reft (v0', F.substr s' su' e))
-          ConcreteUReft (MkUReft (F.Reft (v0, e)) ps) ->
-            let (s', v0') = F.freshInNS v0 s
-                su' = F.extendSubstWithVar su v0 v0'
-                e' = F.substr s' su' e
-                ps' = F.substr s su ps
-                ur' = MkUReft (F.Reft (v0', e')) ps'
-             in (s', su', ur')
-
-      go :: S.HashSet v -> F.SubstV v -> RTypeBV v v c tv r -> RTypeBV v v c tv r
-      go s su (RFun x i t1 t2 r) =
+    go :: S.HashSet v -> F.SubstV v -> RTypeBV v v c tv r -> RTypeBV v v c tv r
+    go s su (RFun x i t1 t2 r) =
         -- x scopes over t1 and t2; v0 (reft binder of r) scopes over t1 and t2.
-        let (s_x, x')     = F.freshInNS x s
-            su_x          = F.extendSubstWithVar su x x'
-            (s_xv, su_xv, r') = substReft r s_x su_x    -- nameset/subst for t1, t2
+        let (s_x, x') = F.freshInNS x s
+            su_x = F.extendSubstWithVar su x x'
+            (s_xv, su_xv, r') = substReft r s_x su_x -- nameset/subst for t1, t2
          in RFun x' i (go s_xv su_xv t1) (go s_xv su_xv t2) r'
-      go s su (REx x t1 t2) =
+    go s su (REx x t1 t2) =
         -- x scopes over t2 only; no reft field.
         let (s', x') = F.freshInNS x s
             su' = F.extendSubstWithVar su x x'
          in REx x' (go s su t1) (go s' su' t2)
-      go s su (RAllT α t r) =
+    go s su (RAllT α t r) =
         -- v0 (reft binder of r) scopes over the kind inside α and over t.
         let (s', su', r') = substReft r s su
             (s'', su'', α') = αScope s' su' α
          in RAllT α' (go s'' su'' t) r'
-        where
-          αScope s0 su0 rtv@(RTVar _tv (RTVNoInfo _)) = (s0, su0, rtv)
-          αScope s0 su0 (RTVar tv (RTVInfo b k v pol)) =
+      where
+        αScope s0 su0 rtv@(RTVar _tv (RTVNoInfo _)) = (s0, su0, rtv)
+        αScope s0 su0 (RTVar tv (RTVInfo b k v pol)) =
             let (s1, b') = F.freshInNS b s0
                 su1 = F.extendSubstWithVar su0 b b'
                 k' = F.substr s0 su0 k
              in (s1, su1, RTVar tv (RTVInfo b' k' v pol))
-
-      go s su (RAllP π t) =
+    go s su (RAllP π t) =
         let (ns_p, pname') = F.freshInNS (pname π) s
             su_p = F.extendSubstWithVar su (pname π) pname'
-            π' = (substPVar s su π) { pname = pname' }
-         in
-            RAllP π' (go ns_p su_p t)
-        where
-          substPVar s0 su0 π0 =
+            π' = (substPVar s su π){pname = pname'}
+         in RAllP π' (go ns_p su_p t)
+      where
+        substPVar s0 su0 π0 =
             let ((ns_pargs, su_pargs), pargs') =
-                  List.mapAccumR
-                    (\(ns', su') (tb, b, e) ->
-                      let (ns'', b') = F.freshInNS b ns'
-                          su'' = F.extendSubstWithVar su' b b'
-                          -- b must be in scope for substituting into e (which is typically EVar b)
-                          nsE = S.insert b ns'
-                          e' = F.substr nsE su' e
-                       in ((ns'', su''), (F.substr ns' su' tb, b', e'))
-                    )
-                    (s0, su0)
-                    (pargs π)
-             in
-                PV { pname = pname π0
-                   , ptype = F.substr ns_pargs su_pargs (ptype π0)
-                   , pargs = pargs'
-                   }
-
-      go s su (RVar α r)       = RVar α (F.substr s su r)
-      go s su (RApp c ts ps r) =
+                    List.mapAccumR
+                        ( \(ns', su') (tb, b, e) ->
+                            let (ns'', b') = F.freshInNS b ns'
+                                su'' = F.extendSubstWithVar su' b b'
+                                -- b must be in scope for substituting into e (which is typically EVar b)
+                                nsE = S.insert b ns'
+                                e' = F.substr nsE su' e
+                             in ((ns'', su''), (F.substr ns' su' tb, b', e'))
+                        )
+                        (s0, su0)
+                        (pargs π)
+             in PV
+                    { pname = pname π0
+                    , ptype = F.substr ns_pargs su_pargs (ptype π0)
+                    , pargs = pargs'
+                    }
+    go s su (RVar α r) = RVar α (F.substr s su r)
+    go s su (RApp c ts ps r) =
         -- v0 (reft binder of r) scopes over ts and ps.
         let (s', su', r') = substReft r s su
-         in RApp c (go s' su' <$> ts) (F.substr s' su' ps) r'
-      go s su (RAppTy t1 t2 r) =
+         in RApp c (go s' su' <$> ts) (refSubstWith go s' su' <$> ps) r'
+    go s su (RAppTy t1 t2 r) =
         -- v0 (reft binder of r) scopes over t1 and t2.
         let (s', su', r') = substReft r s su
-        in RAppTy (go s' su' t1) (go s' su' t2) r'
-      go _ _ (RLit l) = RLit l
-      go s su (RExprArg e) = RExprArg (F.substr s su <$> e)
-      go s su (RRTy env r o t) =
-          let ((s', su'), env') = substEnv s su env
-           in
-              RRTy env' (F.substr s' su' r) o (go s su t)
-        where
-          substEnv s0 su0 env0 =
+         in RAppTy (go s' su' t1) (go s' su' t2) r'
+    go _ _ (RLit l) = RLit l
+    go s su (RExprArg e) = RExprArg (F.substr s su <$> e)
+    go s su (RRTy env r o t) =
+        let ((s', su'), env') = substEnv s su env
+         in RRTy env' (F.substr s' su' r) o (go s su t)
+      where
+        substEnv s0 su0 env0 =
             List.mapAccumL
-              (\(s', su') (x, xt) ->
-                 let (s'', x') = F.freshInNS x s'
-                     su'' = F.extendSubstWithVar su' x x'
-                     xt' = F.substr s' su' xt
-                  in ((s'', su''), (x', xt'))
-              )
-              (s0, su0)
-              env0
-
-      go s su (RHole r)        = RHole (F.substr s su r)
+                ( \(s', su') (x, xt) ->
+                    let (s'', x') = F.freshInNS x s'
+                        su'' = F.extendSubstWithVar su' x x'
+                        xt' = go s' su' xt
+                     in ((s'', su''), (x', xt'))
+                )
+                (s0, su0)
+                env0
+    go s su (RHole r) = RHole (F.substr s su r)
 
 mapExprReft :: (b -> ExprBV b v -> ExprBV b v) -> RTypeBV b v c tv (RReftBV b v) -> RTypeBV b v c tv (RReftBV b v)
 mapExprReft f = mapReft g

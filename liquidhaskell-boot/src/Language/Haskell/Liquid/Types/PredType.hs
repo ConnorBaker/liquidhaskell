@@ -31,6 +31,9 @@ module Language.Haskell.Liquid.Types.PredType (
   -- * should be elsewhere
   , dataConWorkRep
   , substPVar
+  , mapScopedPredicate
+  , mapScopedPredicateWith
+  , substPredAtomicWith
   ) where
 
 import           Prelude                         hiding (error)
@@ -290,13 +293,11 @@ symbolRTyCon n = RTyCon (stringTyCon 'x' 42 $ F.symbolString n) [] defaultTyConI
 --   The range of the `PVar` substitutions are /fresh/ or /true/ `RefType`.
 --   That is, there are no further _quantified_ `PVar` in the target.
 -------------------------------------------------------------------------------------
-replacePreds                 :: String -> SpecType -> [(RPVar, SpecProp)] -> SpecType
+replacePreds :: String -> SpecType -> [(RPVar, SpecProp)] -> SpecType
 -------------------------------------------------------------------------------------
-replacePreds msg                 = L.foldl' go
+replacePreds msg = L.foldl' go
   where
-     go _ (_, RProp _ (RHole _)) = panic Nothing "replacePreds on RProp _ (RHole _)"
-     go z (π, t)                 = substPred msg   (π, t)     z
-
+    go z (π, t) = substPred msg (π, t) z
 
 -- TODO: replace `replacePreds` with
 -- instance SubsTy RPVar (Ref RReft SpecType) SpecType where
@@ -308,76 +309,141 @@ replacePreds msg                 = L.foldl' go
 --         go z (π, RPropP r) = replacePVarReft (π, r) <$> z
 
 -------------------------------------------------------------------------------------
-substPVar :: PVarV v (BSortV v) -> PVarV v (BSortV v) -> BareTypeParsed -> BareTypeParsed
+substPVar ::
+    (Eq b) =>
+    PVarBV b v a ->
+    PVarBV b v a' ->
+    RTypeBV b v c tv (UReftBV b v) ->
+    RTypeBV b v c tv (UReftBV b v)
 -------------------------------------------------------------------------------------
-substPVar src dst = go
+substPVar src dst = mapScopedPredicate src (const goRR)
   where
-    go :: BareTypeParsed -> BareTypeParsed
-    go (RVar a r)         = RVar a (goRR r)
-    go (RApp c ts rs r)   = RApp c (go <$> ts) (goR <$> rs) (goRR r)
-    go (RAllP q t)
-     | pname q == pname src = RAllP q t
-     | otherwise            = RAllP q (go t)
-    go (RAllT a t r)      = RAllT a   (go t)  (goRR r)
-    go (RFun x i t t' r)  = RFun x i  (go t)  (go t') (goRR r)
-    go (REx x t t')       = REx x     (go t)  (go t')
-    go (RRTy e r o rt)    = RRTy e'   (goRR r) o (go rt) where e' = [(x, go t) | (x, t) <- e]
-    go (RAppTy t1 t2 r)   = RAppTy    (go t1) (go t2) (goRR r)
-    go (RHole r)          = RHole     (goRR r)
-    go t@(RLit _)        = t
-    go t@(RExprArg  _)    = t
-    goR :: BRPropV LocSymbol (RReftV LocSymbol) -> BRPropV LocSymbol (RReftV LocSymbol)
-    goR rp = rp {rf_body = go (rf_body rp) }
-    goRR :: RReftV LocSymbol -> RReftV LocSymbol
-    goRR rr = rr { ur_pred = goP (ur_pred rr) }
-    goP :: PredicateV LocSymbol -> PredicateV LocSymbol
+    goRR rr = rr{ur_pred = goP (ur_pred rr)}
     goP (Pr ps) = Pr (goPV <$> ps)
-    goPV :: UsedPVarV LocSymbol -> UsedPVarV LocSymbol
     goPV pv
-      | pname pv == pname src = pv { pname = pname dst }
-      | otherwise             = pv
+        | pname pv == pname src = pv{pname = pname dst}
+        | otherwise = pv
+
+-- Traverse refinement fields in the predicate's lexical scope, preserving
+-- carrier structure and stopping at a shadowing predicate binder.
+mapScopedPredicate :: (Eq b) => PVarBV b v a -> (RTypeBV b v c tv r -> r -> r) -> RTypeBV b v c tv r -> RTypeBV b v c tv r
+mapScopedPredicate = mapScopedPredicateWith (\binder -> Just (binder, pname binder))
+
+-- The binder action owns the query's result telescope, not binders inside
+-- callback domains or type arguments. After opening that one binder, ordinary
+-- lexical shadowing resumes. Nothing eliminates it; Just protects the given
+-- coordinate (unchanged for a free action, new for alpha conversion).
+mapScopedPredicateWith ::
+    (Eq b) =>
+    (PVarBV b v (RTypeBV b v c tv (NoReftBV b v)) -> Maybe (PVarBV b v (RTypeBV b v c tv (NoReftBV b v)), b)) ->
+    PVarBV b v a ->
+    (RTypeBV b v c tv r -> r -> r) ->
+    RTypeBV b v c tv r ->
+    RTypeBV b v c tv r
+mapScopedPredicateWith scopeBinder src action = go True
+  where
+    go _ ty@(RVar a r) = RVar a (action ty r)
+    go _ ty@(RApp c ts rs r) = RApp c (go False <$> ts) (goR <$> rs) (action ty r)
+    go telescope (RAllP q t) = case if telescope then scopeBinder q else Just (q, pname q) of
+        Nothing -> go False t
+        Just (transported, protected)
+            | protected == pname src -> RAllP transported t
+            | otherwise -> RAllP transported (go (telescope && pname q /= pname src) t)
+    go telescope ty@(RAllT a t r) = RAllT a (go telescope t) (action ty r)
+    go telescope ty@(RFun x i t t' r) = RFun x i (go False t) (go telescope t') (action ty r)
+    go telescope (REx x t t') = REx x (go False t) (go telescope t')
+    go telescope ty@(RRTy e r o rt) = RRTy e' (action ty r) o (go telescope rt) where e' = [(x, go False t) | (x, t) <- e]
+    go _ ty@(RAppTy t1 t2 r) = RAppTy (go False t1) (go False t2) (action ty r)
+    go _ ty@(RHole r) = RHole (action ty r)
+    go _ t@(RLit _) = t
+    go _ t@(RExprArg _) = t
+    goR rp = rp{rf_body = go False (rf_body rp)}
 
 -------------------------------------------------------------------------------
 substPred :: String -> (RPVar, SpecProp) -> SpecType -> SpecType
 -------------------------------------------------------------------------------
 
-substPred _   (rp, RProp ss (RVar a1 r1)) t@(RVar a2 r2)
-  | isPredInReft && a1 == a2    = RVar a1 $ meetListWithPSubs (thd3 <$> pargs rp) πs ss r1 r2'
-  | isPredInReft                = panic Nothing ("substPred RVar Var Mismatch" ++ show (a1, a2))
-  | otherwise                   = t
+-- RHole denotes an atomic refinement of the declared predicate carrier (as
+-- in mkRTProp), not a structural function or datatype contract to intersect.
+substPred msg (rp, RProp ss (RHole replacement)) target =
+    substPredAtomicWith (\binder -> Just (binder, pname binder)) id id (\logical _ -> logical) meet msg rp ss replacement target
+substPred _ (rp, RProp ss (RVar a1 r1)) t@(RVar a2 r2)
+    | isPredInReft && a1 == a2 = RVar a1 $ meetListWithPSubs (thd3 <$> pargs rp) πs ss r1 r2'
+    | isPredInReft = panic Nothing ("substPred RVar Var Mismatch" ++ show (a1, a2))
+    | otherwise = t
   where
-    (r2', πs)                   = splitRPvar rp r2
-    isPredInReft                = not $ null πs
-
-substPred msg su@(π, _ ) (RApp c ts rs r)
-  | null πs                     = t'
-  | otherwise                   = substRCon msg su t' πs r2'
+    (r2', πs) = splitRPvar rp r2
+    isPredInReft = not $ null πs
+substPred msg su@(π, _) (RApp c ts rs r)
+    | null πs = t'
+    | otherwise = substRCon msg su t' πs r2'
   where
-    t'                          = RApp c (substPred msg su <$> ts) (substPredP msg su <$> rs) r
-    (r2', πs)                   = splitRPvar π r
-
+    t' = RApp c (substPred msg su <$> ts) (substPredP msg su <$> rs) r
+    (r2', πs) = splitRPvar π r
 substPred msg (p, tp) (RAllP q@PV{} t)
-  | p /= q                      = RAllP q $ substPred msg (p, tp) t
-  | otherwise                   = RAllP q t
-
-substPred msg su (RAllT a t r)  = RAllT a (substPred msg su t) r
-
-substPred msg su@(rp,prop) (RFun x i rt rt' r)
---                        = RFun x (substPred msg su t) (substPred msg su t') r
-  | null πs                     = RFun x i (substPred msg su rt) (substPred msg su rt') r
-  | otherwise                   =
-      let sus = (\π -> F.mkSubst (zip (fst <$> rf_args prop) (thd3 <$> pargs π))) <$> πs in
-      foldl (\t subst -> t `meet` F.subst subst (rf_body prop)) (RFun x i (substPred msg su rt) (substPred msg su rt') r') sus
-  where (r', πs)                = splitRPvar rp r
+    | p /= q = RAllP q $ substPred msg (p, tp) t
+    | otherwise = RAllP q t
+substPred msg su@(rp, _) (RAllT a t r)
+    | null (snd (splitRPvar rp r)) = RAllT a (substPred msg su t) r
+    | otherwise = errorP "substPred unsupported concrete quantified carrier: " msg
+substPred msg su@(rp, _) (RAppTy t1 t2 r)
+    | null (snd (splitRPvar rp r)) = RAppTy (substPred msg su t1) (substPred msg su t2) r
+    | otherwise = errorP "substPred unsupported concrete application carrier: " msg
+substPred msg su@(rp, prop) (RFun x i rt rt' r)
+    --                        = RFun x (substPred msg su t) (substPred msg su t') r
+    | null πs = RFun x i (substPred msg su rt) (substPred msg su rt') r
+    | otherwise =
+        let sus = (\π -> F.mkSubst (zip (fst <$> rf_args prop) (thd3 <$> pargs π))) <$> πs
+         in foldl (\t subst -> t `meet` F.subst subst (rf_body prop)) (RFun x i (substPred msg su rt) (substPred msg su rt') r') sus
+  where
+    (r', πs) = splitRPvar rp r
 -- ps has   , pargs :: ![(t, Symbol, Expr)]
 
-substPred msg su (RRTy e r o t) = RRTy (fmap (substPred msg su) <$> e) r o (substPred msg su t)
-substPred msg su (REx x t t')   = REx   x (substPred msg su t) (substPred msg su t')
-substPred _   _  t              = t
+substPred msg su@(rp, _) (RRTy e r o t)
+    | null (snd (splitRPvar rp r)) = RRTy (fmap (substPred msg su) <$> e) r o (substPred msg su t)
+    | otherwise = errorP "substPred unsupported concrete obligation carrier: " msg
+substPred msg su (REx x t t') = REx x (substPred msg su t) (substPred msg su t')
+substPred _ _ t = t
 
--- | Requires: @not $ null πs@
--- substRCon :: String -> (RPVar, SpecType) -> SpecType -> SpecType
+-- Atomic predicate instantiation has one nominal/arity check and one scoped
+-- walker. A source-bearing refinement supplies its lawful logical update and
+-- conjunction instead of being coerced through an arbitrary IsReft setter.
+substPredAtomicWith ::
+    (RPVar -> Maybe (RPVar, F.Symbol)) ->
+    (RRType r -> SpecType) ->
+    (r -> UReft) ->
+    (UReft -> r -> r) ->
+    (r -> UReft -> r) ->
+    String ->
+    RPVar ->
+    [(F.Symbol, RSort)] ->
+    UReft ->
+    RRType r ->
+    RRType r
+substPredAtomicWith scopeBinder ordinary logical replace conjoin msg rp ss replacement target = mapScopedPredicateWith scopeBinder rp instantiate target
+  where
+    instantiate target refinement
+        | null occurrences = refinement
+        | not (compatible target) = errorP "substPred atomic carrier mismatch: " (msg ++ " " ++ showpp (ordinary target))
+        | length ss /= length (pargs rp) = errorP "substPred atomic formal arity mismatch: " msg
+        | not (and (zipWith sameFormal ss (pargs rp))) = errorP "substPred atomic formal carrier mismatch: " msg
+        | otherwise = L.foldl' apply (replace clean refinement) occurrences
+      where
+        (clean, occurrences) = splitRPvar rp (logical refinement)
+    compatible RHole{} = False
+    compatible RRTy{} = eqType (toType False (pvType rp)) boolTy
+    compatible target = eqType (toType False (pvType rp)) (toType False (ordinary target))
+    sameFormal (_, sort) (declared, _, _) = eqType (toType False sort) (toType False declared)
+    apply accumulated occurrence
+        | length (pargs occurrence) > length (pargs rp) = errorP "substPred atomic actual arity mismatch: " msg
+        | otherwise = accumulated `conjoin` F.subst substitution replacement
+      where
+        actuals = thd3 <$> pargs occurrence ++ drop (length (pargs occurrence)) (pargs (uPVar rp))
+        substitution = F.mkSubst (zip (fst <$> ss) actuals)
 
+{- | Requires: @not $ null πs@
+substRCon :: String -> (RPVar, SpecType) -> SpecType -> SpecType
+-}
 substRCon :: String -> (RPVar, SpecProp) -> SpecType -> [UsedPVar] -> UReft -> SpecType
 substRCon msg (rp, RProp ss t1@(RApp c1 ts1 rs1 r1)) t2@(RApp c2 ts2 rs2 _) πs r2'
     | rtc_tc c1 == rtc_tc c2 = RApp c1 ts rs $ meetListWithPSubs defaults πs ss r1 r2'
@@ -393,8 +459,7 @@ substRCon msg (rp, RProp ss t1@(RApp c1 ts1 rs1 r1)) t2@(RApp c2 ts2 rs2 _) πs 
 
     rvs = foldReft False (\_ r acc -> rvReft r : acc) []
     rvReft r = let F.Reft (s, _) = toReft r in s
-
-substRCon msg su t _ _        = {- panic Nothing -} errorP "substRCon: " $ msg ++ " " ++ showpp (su, t)
+substRCon msg su t _ _ = {- panic Nothing -} errorP "substRCon: " $ msg ++ " " ++ showpp (su, t)
 
 pad :: [Char] -> (a -> a) -> [a] -> [a] -> ([a], [a])
 pad _ f [] ys   = (f <$> ys, ys)
@@ -417,8 +482,8 @@ substPredP msg (p, RProp ss prop) (RProp s t)
  where
    ss' = drop n ss ++  s
    n   = length ss - length (freeArgsPs p t)
-   -- su  = mkSubst (zip (fst <$> ss) (EVar . fst <$> ss'))
 
+-- su  = mkSubst (zip (fst <$> ss) (EVar . fst <$> ss'))
 
 splitRPvar :: PVar t -> UReft -> (UReft, [UsedPVar])
 splitRPvar pv (MkUReft x (Pr pvs)) = (MkUReft x (Pr pvs'), epvs)
@@ -437,11 +502,11 @@ freeArgsPs p (RAllP p' t)
   | p == p'   = []
   | otherwise = freeArgsPs p t
 freeArgsPs p (RApp _ ts _ r)
-  = L.nub $ freeArgsPsRef p r ++ concatMap (freeArgsPs p) ts
+  = L.nub $  freeArgsPsRef p r ++ concatMap (freeArgsPs p) ts
 freeArgsPs p (REx _ t1 t2)
-  = L.nub $ freeArgsPs p t1 ++ freeArgsPs p t2
+  = L.nub $  freeArgsPs p t1 ++ freeArgsPs p t2
 freeArgsPs p (RAppTy t1 t2 r)
-  = L.nub $ freeArgsPsRef p r ++ freeArgsPs p t1 ++ freeArgsPs p t2
+  = L.nub $  freeArgsPsRef p r ++ freeArgsPs p t1 ++ freeArgsPs p t2
 freeArgsPs _ (RLit _)
   = []
 freeArgsPs _ (RExprArg _)
@@ -523,7 +588,9 @@ meetListWithPSubRef ss (RProp s1 r1) (RProp s2 r2) π
 
 
 ----------------------------------------------------------------------------
+
 -- | Interface: Modified CoreSyn.exprType due to predApp -------------------
+
 ----------------------------------------------------------------------------
 predType   :: Type
 predType   = symbolType predName

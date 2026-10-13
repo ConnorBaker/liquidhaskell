@@ -25,6 +25,26 @@ selectMin = min
 selectMax :: Text -> Text -> Text
 selectMax = max
 
+genericMin, genericMax :: Ord a => a -> a -> a
+genericMin = min
+genericMax = max
+{-# NOINLINE genericMin #-}
+{-# NOINLINE genericMax #-}
+
+{-@ selectGenericMin :: x:{Text | tbounds x} -> y:{Text | tbounds y}
+                     -> {v:Text | tbounds v} @-}
+selectGenericMin :: Text -> Text -> Text
+selectGenericMin = genericMin
+
+{-@ selectGenericMax :: x:{Text | tbounds x} -> y:{Text | tbounds y}
+                     -> {v:Text | tbounds v} @-}
+selectGenericMax :: Text -> Text -> Text
+selectGenericMax = genericMax
+
+{-@ compareBounded :: {t:Text | tbounds t} -> {t:Text | tbounds t} -> Ordering @-}
+compareBounded :: Text -> Text -> Ordering
+compareBounded = compare
+
 -- Selection preserves either domain; it neither needs nor creates UTF-8.
 {-@ selectValid :: x:{Text | tvalid x} -> y:{Text | tvalid y}
                 -> {v:Text | tvalid v} @-}
