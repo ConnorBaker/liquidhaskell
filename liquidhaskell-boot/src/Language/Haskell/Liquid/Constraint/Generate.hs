@@ -90,11 +90,13 @@ import Language.Haskell.Liquid.UX.Config (
   ),
   HasConfig (getConfig),
   adtFlag,
+  totalityCheck,
   higherOrderFlag,
   patternFlag,
   warnOnTermHoles,
  )
 import qualified GHC.Core.Coercion as Co
+import GHC.Builtin.Names (gHC_INTERNAL_ERR)
 import GHC.Core.TyCo.Rep (Coercion (CoVarCo, TransCo))
 import qualified GHC.Data.Strict as Strict
 import GHC.Types.Unique.Set (nonDetEltsUniqSet)
@@ -1131,7 +1133,13 @@ consE γ (Var x)
         consE γ constructor
 
 consE γ (Var x)
-  = do t <- varRefType γ x
+  = do -- GHC's undefined has no ordinary argument on which to place an
+       -- impossible domain, and a false RESULT would make every context that
+       -- merely binds it vacuous. Under totality its use is an obligation that
+       -- the context is unreachable.
+       when (totalityCheck γ && isUndefinedPrimitive x) $
+         addC (SubC γ (ofType boolTy) (ofType boolTy `strengthen` uTop F.falseReft)) "strict totality: undefined"
+       t <- varRefType γ x
        addLocA (Just x) (getLocation γ) (varAnn γ x t)
        return t
 
@@ -1519,6 +1527,15 @@ selectedDictionaryField γ (App function dictionary) = do
   fieldSymbol (F.EVar owner) = Just owner
   fieldSymbol _ = Nothing
 selectedDictionaryField _ _ = Nothing
+
+-- The defining binder, not its spelling or re-exporting module: a user's own
+-- total binding named undefined remains an ordinary value.
+isUndefinedPrimitive :: Var -> Bool
+isUndefinedPrimitive x =
+  nameModule_maybe name == Just gHC_INTERNAL_ERR
+    && occNameString (nameOccName name) == "undefined"
+  where
+    name = varName x
 
 caseKVKind ::[Alt Var] -> KVKind
 caseKVKind [Alt (DataAlt _) _ (Var _)] = ProjectE
