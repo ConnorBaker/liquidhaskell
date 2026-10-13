@@ -596,6 +596,26 @@ makeGhcSpec0 boxes stratNames cfg ghcTyLookupEnv tcg instEnvs lenv localVars src
           , msKind declaration `notElem` [MsLifted, MsReflect]
           , not (null (msEqns declaration))
           , Just alternatives <- [traverse fieldProjection (msEqns declaration)]
+          , sourceCaseProjection alternatives
+          ]
+        -- A projection is lowered to a source case, and the logic reads that
+        -- case through each constructor's generated selector. That reading
+        -- exists only when the case covers every constructor (otherwise GHC
+        -- adds a pattern-match failure branch) and every selected field has a
+        -- declared selector. Any other measure keeps its own declared name.
+        sourceCaseProjection alternatives = case map fst alternatives of
+          constructors@(constructor : _) ->
+            let complete = Ghc.tyConDataCons (Ghc.dataConTyCon constructor)
+             in length constructors == length complete
+                  && all (`elem` constructors) complete
+                  && all (`elem` declaredSelectors) alternatives
+          [] -> False
+        declaredSelectors =
+          [ selected
+          | declaration <- M.elems (Ms.measMap measureSpec)
+          , msKind declaration == MsSelector
+          , [equation] <- [msEqns declaration]
+          , Just selected <- [fieldProjection equation]
           ]
         fieldProjection equation
           | E (F.EVar field) <- body equation
