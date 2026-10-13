@@ -795,8 +795,12 @@ is missing, vecrification proceeds without any extra specifications.
 
 `A.B.C_LHAssumptions` is looked in any package that is visible to GHC
 when verifying a module. But the following flag can be used to stop
-this automatic loading when the imported module belongs to the given
-package.
+this automatic loading when the defining module belongs to the given
+package. Package re-exports retain their defining owner: importing
+`GHC.Classes` through `ghc-prim` selects the `GHC.Classes_LHAssumptions`
+companion, but its defining owner belongs to `ghc-internal`. Import aliases
+do not change the companion name. Exclusions use the defining owner's
+registered package name, not an abbreviation of its unit identifier.
 
 **Options:** `--exclude-automatic-assumptions-for=PACKAGE`
 

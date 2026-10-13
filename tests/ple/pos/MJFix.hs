@@ -1,4 +1,4 @@
--- | This tests that we dig up sorts (for `applySorts`) from the BODIES of reflected functions.
+-- | Tests on-demand apply-carrier declarations used in reflected function bodies.
 -- c.f. https://piazza.com/class/jqk23zupq7a62c?cid=72
 
 {-@ LIQUID "--reflection"  @-}

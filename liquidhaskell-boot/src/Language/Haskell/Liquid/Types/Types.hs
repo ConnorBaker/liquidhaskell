@@ -24,6 +24,12 @@ module Language.Haskell.Liquid.Types.Types (
     TyConMap     (..)
   , ConstructorBox (..)
   , LogicSupport, retainLogicSupport
+  , QueryTelescope (..)
+  , CheckedPredicate (..)
+  , CheckedRefinement (..), CheckedSpecType
+  , checkedOrdinary, meetCheckedRefinement, renameCheckedRoot
+  , logicalSpecType, ordinarySpecType
+  , checkedTypeSyms, substCheckedType
 
   -- * F.Located Things
   , F.Located (..)
@@ -197,24 +203,120 @@ import           Language.Haskell.Liquid.GHC.Logging as GHC
 import           Language.Haskell.Liquid.Types.Errors
 import           Language.Haskell.Liquid.Types.Names
 import           Language.Haskell.Liquid.Types.RType
+import           Language.Haskell.Liquid.Types.RTypeOp (rTypeSymsWith, rTypeSubstWith)
 import           Language.Haskell.Liquid.Misc
 
 
 -----------------------------------------------------------------------------
--- | Actual source identities paired with their interpreted logical sorts.
-type LogicSupport = [(Var, F.Sort)]
-
--- Retain actual typed source identities only while their observations remain
--- free in the completed meaning. Local telescopes own their bound symbols.
-retainLogicSupport :: S.HashSet F.Symbol -> LogicSupport -> LogicSupport
-retainLogicSupport symbols = filter ((`S.member` symbols) . F.symbol . fst)
-
 -- | GHC's typed reconstruction of source fields from the worker telescope.
 data ConstructorBox = ConstructorBox [Var] [(Var, CoreExpr)]
 instance Show ConstructorBox where
     show (ConstructorBox worker fields) = showPpr worker ++ showPpr fields
 
+{- | Nominal correspondence established by checking one source telescope.
+Keep type images until application has been instantiated: projecting an
+unapplied higher-kinded image to a logical sort loses its application action.
+Coercion and dictionary owners remain here even when they have no logical
+value argument. Equal logical sorts never establish this correspondence.
+-}
+data QueryTelescope = QueryTelescope
+    { queryTypeOwners :: [(TyVar, Type)]
+    , queryValueOwners :: [(F.Symbol, Var)]
+    }
+
+{- | Two representations of one authored predicate, produced by the same
+checked query. Its readback is not an additional assumption or conjunct.
+Owner denotations interpret the retained Core; transporting just the
+readback while discarding these denotations changes the predicate's meaning.
+-}
+data CheckedPredicate = CheckedPredicate
+    { predicateCore :: CoreExpr
+    , predicateSignature :: SpecType
+    , predicateTelescope :: QueryTelescope
+    , predicateReadback :: F.Expr
+    , predicateDefinitions :: [(Id, F.Expr)]
+    , predicateEmbeddings :: F.TCEmb TyCon
+    , predicateSupport :: LogicSupport
+    , predicateLogicalParameters :: [Id]
+    }
+
+{- | A refinement and its source interpretation occupy the same type-tree
+leaf. Logical-only leaves carry no fabricated native application evidence.
+This deliberately has no 'IsReft' instance: arbitrary refinement maps
+cannot transport checked source meaning.
+-}
+data CheckedRefinement = CheckedRefinement
+    { checkedLogical :: UReft
+    , checkedPredicates :: [CheckedPredicate]
+    }
+
+-- Conjunction is interpreted before projection: the logical remainder and
+-- every checked source conjunct share this refinement's value binder.
+checkedOrdinary :: CheckedRefinement -> UReft
+checkedOrdinary (CheckedRefinement logical sources) =
+    logical{ur_reft = F.Reft (F.reftBind $ ur_reft logical, F.pAnd (F.reftPred (ur_reft logical) : map predicateReadback sources))}
+
+renameCheckedRoot :: CheckedRefinement -> F.Symbol -> CheckedRefinement
+renameCheckedRoot (CheckedRefinement logical sources) root =
+    CheckedRefinement (renameReftRoot logical root) (map (transportCheckedPredicate names action) sources)
+  where
+    action = F.mkSubst [(F.reftBind $ ur_reft logical, F.EVar root)]
+    names = S.insert root (F.syms logical `S.union` F.syms (map predicateReadback sources) `S.union` F.syms (map (map snd . predicateDefinitions) sources))
+
+meetCheckedRefinement :: CheckedRefinement -> CheckedRefinement -> CheckedRefinement
+meetCheckedRefinement left right = CheckedRefinement logical (checkedPredicates left' ++ checkedPredicates right')
+  where
+    root = F.reftBind $ ur_reft $ checkedOrdinary left `meet` checkedOrdinary right
+    left' = renameCheckedRoot left root
+    right' = renameCheckedRoot right root
+    logical = checkedLogical left' `meet` checkedLogical right'
+
+transportCheckedPredicate :: S.HashSet F.Symbol -> F.Subst -> CheckedPredicate -> CheckedPredicate
+transportCheckedPredicate names action checked =
+    checked
+        { predicateReadback = F.substr names action (predicateReadback checked)
+        , predicateDefinitions = [(owner, F.substr names action meaning) | (owner, meaning) <- predicateDefinitions checked]
+        , predicateSupport = retainLogicSupport (F.syms $ F.substr names action $ predicateReadback checked) (predicateSupport checked)
+        }
+
+instance Show CheckedRefinement where
+    show = show . checkedOrdinary
+
+-- This is the logical action on one source closure, not admission of a new
+-- native argument. In particular, transported denotations never authorize
+-- importing the original formal-domain contracts into a different Gamma.
+instance F.Subable CheckedRefinement where
+    type Variable CheckedRefinement = F.Symbol
+    syms (CheckedRefinement ordinary source) =
+        F.syms ordinary `S.union` S.delete (F.reftBind $ ur_reft ordinary) (F.syms (map (map snd . predicateDefinitions) source) `S.union` F.syms (map predicateReadback source))
+    substr names substitution (CheckedRefinement original source) =
+        CheckedRefinement ordinary (transportCheckedPredicate (S.insert root names) action <$> source)
+      where
+        ordinary = F.substr names substitution original
+        root = F.reftBind (ur_reft ordinary)
+        action = F.extendSubstWithVar substitution (F.reftBind $ ur_reft original) root
+
+type CheckedSpecType = RRType CheckedRefinement
+
+logicalSpecType :: SpecType -> CheckedSpecType
+logicalSpecType = fmap (\refinement -> CheckedRefinement refinement [])
+
+ordinarySpecType :: CheckedSpecType -> SpecType
+ordinarySpecType = fmap checkedOrdinary
+
+checkedTypeSyms :: CheckedSpecType -> S.HashSet F.Symbol
+checkedTypeSyms = rTypeSymsWith (Just . F.reftBind . ur_reft . checkedOrdinary)
+
+substCheckedType :: F.Subst -> CheckedSpecType -> CheckedSpecType
+substCheckedType substitution ty =
+    rTypeSubstWith
+        (Just . F.reftBind . ur_reft . checkedOrdinary)
+        (checkedTypeSyms ty `S.union` F.substSymbolsSet substitution)
+        substitution
+        ty
+
 -- | Information about Type Constructors
+
 -----------------------------------------------------------------------------
 data TyConMap = TyConMap
   { tcmTyRTy    :: M.HashMap TyCon             RTyCon  -- ^ Map from GHC TyCon to RTyCon
@@ -396,12 +498,20 @@ newtype DEnv x ty = DEnv (M.HashMap x (M.HashMap Symbol (RISig ty)))
 
 type RDEnv = DEnv Var SpecType
 
-data MethodType t = MT {tyInstance :: !(Maybe t), tyClass :: !(Maybe t) }
-  deriving (Show)
+-- The dictionary and selector identify the source field judgment. An
+-- implementation owner alone need not identify an interface: it may serve
+-- several dictionaries. Synthetic obligations have no source field origin.
+data MethodType t
+    = MT {tyInstance :: !(Maybe t), tyClass :: !(Maybe t), methodOrigin :: !(Maybe (Var, Var))}
+    | -- Imported per-instance schemas constrain dictionary admission; they are
+      -- not replacement callable types for the universal class selectors.
+      ImportedMethod {tyInstance :: !(Maybe t), tyClass :: !(Maybe t), methodOrigin :: !(Maybe (Var, Var))}
+    deriving (Show, Functor, Foldable, Traversable)
 
 getMethodType :: MethodType t -> Maybe t
-getMethodType (MT (Just t) _ ) = Just t
-getMethodType (MT _ t) = t
+getMethodType (MT (Just t) _ _) = Just t
+getMethodType (MT _ t _) = t
+getMethodType ImportedMethod{} = Nothing
 
 --------------------------------------------------------------------------
 -- | Values Related to Specifications ------------------------------------
@@ -1061,3 +1171,11 @@ instance Eq ctor => Semigroup (MSpec ty ctor) where
 instance Eq ctor => Monoid (MSpec ty ctor) where
   mempty = MSpec M.empty M.empty M.empty []
   mappend = (<>)
+
+-- | Actual source identities paired with their interpreted logical sorts.
+type LogicSupport = [(Var, F.Sort)]
+
+-- Retain actual typed source identities only while their observations remain
+-- free in the completed meaning. Local telescopes own their bound symbols.
+retainLogicSupport :: S.HashSet F.Symbol -> LogicSupport -> LogicSupport
+retainLogicSupport symbols = filter ((`S.member` symbols) . F.symbol . fst)

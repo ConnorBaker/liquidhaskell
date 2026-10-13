@@ -53,6 +53,7 @@
 module Language.Haskell.Liquid.LHNameResolution
   ( resolveLHNames
   , resolveSymbolToTcName
+  , resolveEmbeddingSort
   , mkLookupGRE
   , exprArg
   , fromBareSpecLHName
@@ -184,9 +185,12 @@ resolveLHNames cfg thisModule localVars impMods globalRdrEnv bareSpec0 dependenc
       -- the same name is used in a type position (as opposed to the head
       -- of a data declaration) the type alias continues to take priority
       -- via the normal 'resolveLHName' path below.
+      resolvedEmbeds <- either (throwError . pure) pure $
+        F.tceFromList <$> mapM resolveEmbed (F.tceToList (embeds sp0))
       let sp0' = sp0
                    { dataDecls  = map resolveDataDeclHeadName (dataDecls  sp0)
                    , newtyDecls = map resolveDataDeclHeadName (newtyDecls sp0)
+                   , embeds = resolvedEmbeds
                    }
 
       -- First resolution pass: A generic traversal that resolves names
@@ -238,6 +242,10 @@ resolveLHNames cfg thisModule localVars impMods globalRdrEnv bareSpec0 dependenc
       dcs <- gets roUsedDataCons
       return (sp3 { usedDataCons = dcs }, logicNameEnv0, lmap2)
   where
+    resolveEmbed (owner, (meaning, arguments)) = do
+      resolved <- resolveEmbeddingSort globalRdrEnv meaning
+      pure (owner, (resolved, arguments))
+
     -- Early exit name resolution if errors are found and pass them to the output.
     checkErrors :: ExceptT [Error] (StateT RenameOutput Identity) ()
     checkErrors = do
@@ -399,6 +407,37 @@ errTypeclassDisabled locSym =
       [ PJ.text "This is a class method, but typeclass support is disabled."
       , PJ.text "Enable it with {-@ LIQUID \"--typeclass\" @-}."
       ])
+
+{- | Embedding sorts are interpreted in their author's scope before publication.
+A source nominal atom keeps its actual owner; intrinsic and explicitly
+logical atoms, coordinates, application structure and carrier metadata stay
+unchanged. Missing source names remain authored logical atoms, not guesses.
+This name pass does not expand GHC type synonyms or compose source embeddings;
+those require source-type interpretation, not nominal renaming.
+-}
+resolveEmbeddingSort :: GHC.GlobalRdrEnv -> Sort -> Either Error Sort
+resolveEmbeddingSort environment = go
+  where
+    go :: Data a => a -> Either Error a
+    go = gmapM (go `extM` resolveConstructor)
+    resolveConstructor constructor
+        | isPrim (val spelling) = Right constructor
+        | otherwise = case GHC.lookupGRE environment (mkLookupGRE (LHTcName LHAnyModuleNameF) (val spelling)) of
+            [] -> Right constructor
+            [entry] ->
+                Right $
+                    mappendFTC
+                        (symbolFTycon (symbol (GHC.greName entry) <$ spelling))
+                        constructor
+            entries ->
+                Left $
+                    ErrDupNames
+                        (LH.fSrcSpan spelling)
+                        "embedding type constructor"
+                        (pprint (val spelling))
+                        (map (PJ.text . GHC.showPprUnsafe) entries)
+      where
+        spelling = fTyconSymbol constructor
 
 -- | Produces an LHName from a symbol by looking it in the rdr environment.
 resolveSymbolToTcName :: GHC.GlobalRdrEnv -> LocSymbol -> Either Error (Located LHName)

@@ -72,13 +72,19 @@ import qualified GHC.Unit.Types as GHC
 import qualified GHC.Utils.Error as GHC
 
 import GHC.Paths (libdir)
+import qualified CachedNativePrefixTests
+import qualified CheckedPredicateOwnerTests
 import qualified ConstraintGenerationTests
+import qualified NativeJudgmentTests
+import qualified EmbeddingSortTests
+import qualified PrivateReflectTests
 import qualified QualifierDecompositionTests
 import qualified FamilyPredicateTests
 import qualified MethodTelescopeTests
 import qualified MeasureApplicabilityTests
 import qualified LogicSupportTests
 import qualified QueryTelescopeTests
+import qualified RefinementRepresentationTests
 import qualified RewriteDependencyTests
 import qualified TypeLiteralIdentityTests
 import qualified SpecClosureTests
@@ -94,12 +100,18 @@ testTree =
     testGroup
         "GHC API"
         [ MeasureApplicabilityTests.tests compileToCore
+        , RefinementRepresentationTests.tests
+        , CheckedPredicateOwnerTests.tests compileToCore
+        , CachedNativePrefixTests.tests ConstraintGenerationTests.emptyTarget compileToCore
+        , EmbeddingSortTests.tests
+        , PrivateReflectTests.tests
         , MethodTelescopeTests.tests compileToCore
         , LogicSupportTests.tests compileToCore
         , QueryTelescopeTests.tests compileToCore
         , FamilyPredicateTests.tests compileToCore
         , RewriteDependencyTests.tests compileToCore
         , ConstraintGenerationTests.tests compileToCore
+        , NativeJudgmentTests.tests ConstraintGenerationTests.emptyTarget compileToCore
         , QualifierDecompositionTests.tests
         , TypeLiteralIdentityTests.tests compileToCore
         , SpecClosureTests.tests

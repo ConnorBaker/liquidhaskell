@@ -165,16 +165,16 @@ proofTyConName = "Proof"
 maxArity :: Arity
 maxArity = 7
 
-wiredTyCons :: [TyConP]
-wiredTyCons  = fst wiredTyDataCons
+wiredTyCons :: Maybe F.LocSymbol -> [TyConP]
+wiredTyCons = fst . wiredTyDataCons
 
 wiredDataCons :: [Located DataConP]
-wiredDataCons = snd wiredTyDataCons
+wiredDataCons = snd (wiredTyDataCons Nothing)
 
-wiredTyDataCons :: ([TyConP] , [Located DataConP])
-wiredTyDataCons = (concat tcs, dummyLoc <$> concat dcs)
+wiredTyDataCons :: Maybe F.LocSymbol -> ([TyConP], [Located DataConP])
+wiredTyDataCons sizeMeasure = (concat tcs, dummyLoc <$> concat dcs)
   where
-    (tcs, dcs)  = unzip $ listTyDataCons : map tupleTyDataCons [2..maxArity]
+    (tcs, dcs) = unzip $ listTyDataCons sizeMeasure : map tupleTyDataCons [2 .. maxArity]
 
 charDataCon :: Located DataConP
 charDataCon = dummyLoc (DataConP l0 Ghc.charDataCon  [] [] [] [(makeGeneratedLogicLHName "charX",lt)] lt False wiredInName l0)
@@ -183,25 +183,28 @@ charDataCon = dummyLoc (DataConP l0 Ghc.charDataCon  [] [] [] [(makeGeneratedLog
     c  = Ghc.charTyCon
     lt = rApp c [] [] mempty
 
-listTyDataCons :: ([TyConP] , [DataConP])
-listTyDataCons   = ( [TyConP l0 c [RTV tyv] [p] [Covariant] [Covariant] (Just fsize)]
-                   , [DataConP l0 Ghc.nilDataCon  [RTV tyv] [p] [] []    lt False wiredInName l0
-                   ,  DataConP l0 Ghc.consDataCon [RTV tyv] [p] [] cargs lt False wiredInName l0])
-    where
-      l0         = F.dummyPos "LH.Bare.listTyDataCons"
-      c          = Ghc.listTyCon
-      [tyv]      = tyConTyVarsDef c
-      t          = rVar tyv :: RSort
-      fld        = "fldList"
-      xHead      = "head"
-      xTail      = "tail"
-      p          = PV "p" t [(t, fld, F.EVar fld)]
-      px         = pdVarReft $ PV "p" t [(t, fld, F.EVar xHead)]
-      lt         = rApp c [xt] [rPropP [] $ pdVarReft p] mempty
-      xt         = rVar tyv
-      xst        = rApp c [RVar (RTV tyv) px] [rPropP [] $ pdVarReft p] mempty
-      cargs      = map (first makeGeneratedLogicLHName) [(xTail, xst), (xHead, xt)]
-      fsize      = SymSizeFun (dummyLoc "GHC.Types_LHAssumptions.len")
+listTyDataCons :: Maybe F.LocSymbol -> ([TyConP], [DataConP])
+listTyDataCons sizeMeasure =
+    ( [TyConP l0 c [RTV tyv] [p] [Covariant] [Covariant] (SymSizeFun <$> sizeMeasure)]
+    ,
+        [ DataConP l0 Ghc.nilDataCon [RTV tyv] [p] [] [] lt False wiredInName l0
+        , DataConP l0 Ghc.consDataCon [RTV tyv] [p] [] cargs lt False wiredInName l0
+        ]
+    )
+  where
+    l0 = F.dummyPos "LH.Bare.listTyDataCons"
+    c = Ghc.listTyCon
+    [tyv] = tyConTyVarsDef c
+    t = rVar tyv :: RSort
+    fld = "fldList"
+    xHead = "head"
+    xTail = "tail"
+    p = PV "p" t [(t, fld, F.EVar fld)]
+    px = pdVarReft $ PV "p" t [(t, fld, F.EVar xHead)]
+    lt = rApp c [xt] [rPropP [] $ pdVarReft p] mempty
+    xt = rVar tyv
+    xst = rApp c [RVar (RTV tyv) px] [rPropP [] $ pdVarReft p] mempty
+    cargs = map (first makeGeneratedLogicLHName) [(xTail, xst), (xHead, xt)]
 
 wiredInName :: F.Symbol
 wiredInName = "WiredIn"

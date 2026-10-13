@@ -1,6 +1,7 @@
 module ImportedBodyTests (tests) where
 
 import CompilerFixture
+import SourceVariantFixtures (copySourceFixture)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Tasty (TestTree, testGroup)
@@ -60,7 +61,7 @@ tests fixture compiler optimization =
         ]
   where
     scenario label action = testCase label $ withSystemTempDirectory "lh-imported-owned" $ \directory -> compiler >>= \tool -> action tool directory
-    copy directory name = copyFixture fixture ("plugin-boundary-tests/fixtures/imported-owned" </> name ++ ".hs") directory name
+    copy directory name = copySourceFixture fixture ("plugin-boundary-tests/fixtures/imported-owned" </> name ++ ".hs") directory name
     raw tool directory name = do
         let target = directory </> name
         copy target name

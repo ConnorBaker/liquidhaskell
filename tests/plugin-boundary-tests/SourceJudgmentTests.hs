@@ -2,7 +2,9 @@ module SourceJudgmentTests (tests) where
 
 import CompilerFixture
 import Control.Monad (when)
+import DeclaredAliasFixtures (declaredAlias)
 import QueryAssertions (assertDefaultInterfaces, assertExternalFormationTag, assertJointInferenceCheck, assertSingleSourceCheck)
+import SourceVariantFixtures (copySourceFixture)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Tasty (TestTree, testGroup)
@@ -27,6 +29,9 @@ tests fixture compiler optimization =
                , checkedInterfaces ObjectCode "imported higher-order callback selectors" "lh-callback-interface" "callback-projections" "CallbackProducer" [] [("CallbackClientGood", Safe), ("CallbackClientFalse", UnsafeAt [13])]
                , checkedInterfaces InterfaceOnly "interface-only higher-order callback publication" "lh-callback-interface-only" "callback-projections" "CallbackProducer" [] [("CallbackClientGood", Safe), ("CallbackClientFalse", UnsafeAt [13])]
                , constructorInterfaces
+               , importedInstanceInterfaces
+               , naturalSourceGraphs
+               , guardedImageInterfaces
                , testGroup
                     "checked imported measure staging"
                     [ sourceInterfaces
@@ -87,6 +92,17 @@ tests fixture compiler optimization =
                     ]
                , instanceFormation
                , testGroup
+                    "higher-kinded predicate scope"
+                    [ testGroup
+                        mode
+                        [ sourceCase "callback-projections" flags "HigherKindedPredicateGood" Safe
+                        , sourceCase "callback-projections" flags "HigherKindedPredicateFalse" (UnsafeAt [8])
+                        , sourceCase "callback-projections" flags "HigherKindedPredicateCapability" Safe
+                        , sourceCase "callback-projections" flags "PredicateOverapplicationBad" (FormationRefusal 7 "expects at most 1 arguments, but is given 2")
+                        ]
+                    | (mode, flags) <- [("default", []), ("typeclass", ["--typeclass"])]
+                    ]
+               , testGroup
                     "authored class field formation"
                     [ sourceCase "instance-formation" [] "ClassMethodScopeGood" Safe
                     , sourceCase "instance-formation" [] "ClassMethodWrongCarrier" (FormationRefusal 6 "source constructor contract does not match GHC carrier")
@@ -121,7 +137,7 @@ tests fixture compiler optimization =
             let relative = "plugin-boundary-tests/fixtures" </> category </> name ++ ".hs"
             if category == "declared-alias"
                 then writeFixture relative directory name (declaredAlias name (if name == "DeclaredAliasGood" then "==" else "/="))
-                else copyFixture fixture relative directory name
+                else copySourceFixture fixture relative directory name
             compiled <- compile tool Strict optimization ObjectCode directory name [] flags expected
             when (name == "ForeignAssumptionBad") (assertExternalFormationTag compiled)
             when (name == "IgnoredNestedGood") (assertSingleSourceCheck compiled)
@@ -133,7 +149,19 @@ tests fixture compiler optimization =
             [ testGroup
                 mode
                 [ sourceCase "instance-formation" flags name expected
-                | (name, expected) <- [("InstanceFormationGood", Safe), ("InstanceFormationBad", UnsafeAt [15])]
+                | (name, expected) <-
+                    [ ("InstanceFormationGood", Safe)
+                    , ("InstanceFormationBad", UnsafeAt [15])
+                    , ("InstanceCarrierGood", Safe)
+                    , ("InstancePlainCarrierGood", Safe)
+                    , ("InstancePlainCarrierBad", UnsafeAt [16])
+                    , ("InstanceCarrierDuplicateBad", FormationRefusal 6 "Multiple specifications for")
+                    , ("InstanceCarrierBodyBad", UnsafeAt [12])
+                    , ("InstanceCarrierGenericBad", UnsafeAt [23])
+                    , ("InstanceResultGood", Safe)
+                    , ("EqualityInstanceGood", Safe)
+                    , ("EqualityInstanceBad", UnsafeAt [7])
+                    ]
                 ]
             | (mode, flags) <- [("default", []), ("typeclass", ["--typeclass"])]
             ]
@@ -146,6 +174,50 @@ tests fixture compiler optimization =
             producer <- compile tool Strict optimization backend producerDirectory name [] flags Safe
             assertPublication tool producer True
             mapM_ (client tool directory fixtures producerDirectory flags) cases
+    importedInstanceInterfaces =
+        testGroup
+            "imported instance domains"
+            [ testGroup
+                mode
+                [ checkedInterfaces ObjectCode "checked dictionary publication" "lh-checked-instance" "instance-formation" "CheckedCarrier" flags [("CheckedCarrierGood", Safe), ("CheckedCarrierBad", UnsafeAt [10])]
+                , testCase "assumed dictionary admission" $ withSystemTempDirectory "lh-imported-instance" $ \directory -> do
+                    tool <- compiler
+                    let producerDirectory = directory </> "producer"
+                        fixtures = "plugin-boundary-tests/fixtures/instance-formation"
+                    copyFixture fixture (fixtures </> "ImportedCarrier.hs") producerDirectory "ImportedCarrier"
+                    _ <- compileHaskell tool optimization producerDirectory "ImportedCarrier" []
+                    mapM_
+                        (client tool directory fixtures producerDirectory flags)
+                        [("ImportedInstanceCarrierGood", Safe), ("ImportedInstanceCarrierGenericBad", UnsafeAt [13]), ("ImportedInstanceCarrierMethodBad", UnsafeAt [6]), ("ImportedInstanceResultGood", Safe), ("ImportedInstancePredicateGood", Safe), ("ImportedInstancePredicateNarrowBad", UnsafeAt [10]), ("ImportedInstancePredicateResultBad", UnsafeAt [14]), ("ImportedInstanceQueryOnlyGood", Safe), ("ImportedInstanceQueryOnlyBad", UnsafeAt [13])]
+                , testCase "nested predicate callback admission" $ withSystemTempDirectory "lh-imported-callback-instance" $ \directory -> do
+                    tool <- compiler
+                    let producerDirectory = directory </> "producer"
+                        fixtures = "plugin-boundary-tests/fixtures/instance-formation"
+                    copyFixture fixture (fixtures </> "ImportedCallbackCarrier.hs") producerDirectory "ImportedCallbackCarrier"
+                    _ <- compileHaskell tool optimization producerDirectory "ImportedCallbackCarrier" []
+                    mapM_
+                        (client tool directory fixtures producerDirectory flags)
+                        [("ImportedInstanceCallbackWideGood", Safe), ("ImportedInstanceCallbackRestrictedBad", UnsafeAt [15])]
+                ]
+            | (mode, flags) <- [("default", []), ("typeclass", ["--typeclass"])]
+            ]
+    naturalSourceGraphs =
+        testGroup
+            "native source-call graphs"
+            [ testGroup
+                mode
+                [ checkedInterfaces ObjectCode "checked native unit and worker application" "lh-native-source-graph" "natural-source-graphs" "NaturalUnitProducer" flags [("NaturalUnitWorkerGood", Safe)]
+                , sourceCase "natural-source-graphs" flags "NaturalUnitFalseRawDividendBad" (UnsafeAt [11])
+                , sourceCase "natural-source-graphs" flags "NaturalUnitWorkerBad" (UnsafeAt [8])
+                ]
+            | (mode, flags) <- [("default", []), ("typeclass", ["--typeclass"])]
+            ]
+    guardedImageInterfaces =
+        testGroup
+            "source-call nominal carrier boundary"
+            [ checkedInterfaces ObjectCode mode "lh-guarded-image" "guarded-source-graphs" "GuardedImageProducer" flags [("GuardedImageBad", UnsafeAt [16])]
+            | (mode, flags) <- [("default", []), ("typeclass", ["--typeclass"])]
+            ]
     sourceInterfaces label name source cases =
         testCase label $ withSystemTempDirectory "lh-measure-staging" $ \directory -> do
             tool <- compiler
@@ -201,7 +273,7 @@ tests fixture compiler optimization =
             ]
     client tool directory fixtures producerDirectory flags (name, expected) = do
         let target = directory </> name
-        copyFixture fixture (fixtures </> name ++ ".hs") target name
+        copySourceFixture fixture (fixtures </> name ++ ".hs") target name
         _ <- compile tool Strict optimization ObjectCode target name [producerDirectory </> "objects"] flags expected
         pure ()
     groups =
@@ -239,6 +311,9 @@ tests fixture compiler optimization =
                 , ("TextOrdGood", Safe)
                 , ("TextOrdRawMinBad", UnsafeAt [7])
                 , ("TextOrdRawMaxBad", UnsafeAt [7])
+                , ("TextOrdGenericMinBad", UnsafeAt [10])
+                , ("TextOrdGenericMaxBad", UnsafeAt [10])
+                , ("TextOrdRawCompareBad", UnsafeAt [6])
                 , ("TextBoundsFalse", UnsafeAt [8, 14])
                 , ("TextBoundsSplitBad", UnsafeAt [8])
                 , ("TextBoundsNotUtf8Bad", UnsafeAt [7])
@@ -437,6 +512,15 @@ tests fixture compiler optimization =
                 [ ("OpaqueNullaryGood", Safe)
                 , ("OpaqueNullaryFalse", UnsafeAt [6])
                 , ("OpaqueUnaryFalse", UnsafeAt [6])
+                ]
+            )
+        ,
+            ( "type-family-normalization"
+            , []
+            ,
+                [ ("FamilyRootGood", Safe)
+                , ("FamilyRootBad", UnsafeAt [16])
+                , ("DirectRootBad", UnsafeAt [10])
                 ]
             )
         ,
@@ -848,80 +932,4 @@ importedMeasureCollision =
         , ""
         , "unit :: ()"
         , "unit = ()"
-        ]
-
-declaredAlias :: String -> String -> String
-declaredAlias name relation =
-    unlines
-        [ "{-# LANGUAGE ExplicitForAll #-}"
-        , "{-# LANGUAGE RankNTypes #-}"
-        , "{-# LANGUAGE TypeApplications #-}"
-        , ""
-        , "module " ++ name ++ " where"
-        , ""
-        , "import Data.Coerce (coerce)"
-        , "import Data.Set (Set)"
-        , ""
-        , "import Data.Set qualified as Set"
-        , ""
-        , "{-@ reflect direct @-}"
-        , "direct :: Set Int -> Set Int -> Set Int"
-        , "direct xs ys = Set.union xs ys"
-        , ""
-        , "{-@ reflect partial @-}"
-        , "partial :: Set Int -> (Set Int -> Set Int)"
-        , "partial xs = Set.union xs"
-        , ""
-        , "{-@ reflect aliased @-}"
-        , "aliased :: Set Int -> Set Int -> Set Int"
-        , "aliased xs ys = let selected = Set.union xs in selected ys"
-        , ""
-        , "{-@ reflect polymorphic @-}"
-        , "polymorphic :: (Ord a) => Set a -> Set a -> Set a"
-        , "polymorphic xs ys = Set.union xs ys"
-        , ""
-        , "{-@ embed Bag as Set_Set int @-}"
-        , "newtype Bag = Bag (Set Int)"
-        , ""
-        , "{-@ reflect castUnion @-}"
-        , "castUnion :: Bag -> Bag -> Bag"
-        , "castUnion = coerce (Set.union :: Set Int -> Set Int -> Set Int)"
-        , ""
-        , "-- This separate declared alias exercises interleaved type/evidence binders;"
-        , "-- its meaning comes from the explicit definition, not from Eq membership."
-        , "{-@ define keep x y = x @-}"
-        , "keep :: forall a. (Eq a) => a -> forall b. (Eq b) => b -> a"
-        , "keep x _ = x"
-        , ""
-        , "{-@ reflect selected @-}"
-        , "selected :: Int -> Bool -> Int"
-        , "selected x y = keep @Int x @Bool y"
-        , ""
-        , "{-@ sourceClaim :: xs:Set Int -> ys:Set Int -> {v:Set Int | v " ++ relation ++ " Set_cup xs ys} @-}"
-        , "sourceClaim :: Set Int -> Set Int -> Set Int"
-        , "sourceClaim xs ys = Set.union xs ys"
-        , ""
-        , "{-@ directClaim :: xs:Set Int -> ys:Set Int -> {v:Set Int | v " ++ relation ++ " Set_cup xs ys} @-}"
-        , "directClaim :: Set Int -> Set Int -> Set Int"
-        , "directClaim xs ys = direct xs ys"
-        , ""
-        , "{-@ partialClaim :: xs:Set Int -> ys:Set Int -> {v:Set Int | v " ++ relation ++ " Set_cup xs ys} @-}"
-        , "partialClaim :: Set Int -> Set Int -> Set Int"
-        , "partialClaim xs ys = partial xs ys"
-        , ""
-        , "{-@ aliasClaim :: xs:Set Int -> ys:Set Int -> {v:Set Int | v " ++ relation ++ " Set_cup xs ys} @-}"
-        , "aliasClaim :: Set Int -> Set Int -> Set Int"
-        , "aliasClaim xs ys = aliased xs ys"
-        , ""
-        , "{-@ polyClaim :: xs:Set Int -> ys:Set Int -> {v:Set Int | v " ++ relation ++ " Set_cup xs ys} @-}"
-        , "polyClaim :: Set Int -> Set Int -> Set Int"
-        , "polyClaim xs ys = polymorphic xs ys"
-        , ""
-        , "{-@ castClaim :: xs:Bag -> ys:Bag -> {v:Bag | v " ++ relation ++ " Set_cup xs ys} @-}"
-        , "castClaim :: Bag -> Bag -> Bag"
-        , "castClaim xs ys = castUnion xs ys"
-        , ""
-        , "{-@ interleavedClaim :: x:Int -> y:Bool -> {v:Int | v " ++ relation ++ " x} @-}"
-        , "interleavedClaim :: Int -> Bool -> Int"
-        , "interleavedClaim x y = selected x y"
         ]

@@ -15,11 +15,13 @@ module Language.Haskell.Liquid.Types.Fresh
   , refreshArgs
   , refreshHoles
   , refreshArgsSub
+  , refreshArgsSubWith
   )
   where
 
 import           Data.Maybe                    (catMaybes) -- , fromJust, isJust)
 import           Data.Bifunctor
+import           Control.Monad.State (State, state)
 import qualified Data.List                      as L
 -- import qualified Data.HashMap.Strict            as M
 -- import qualified Data.HashSet                   as S
@@ -50,6 +52,9 @@ class (Applicative m, Monad m) => Freshable m a where
   true _  = return
   refresh :: Bool -> a -> m a
   refresh _ = return
+
+instance Freshable (State Integer) Integer where
+  fresh = state (\n -> (n, n + 1))
 
 
 instance (Freshable m Integer, Monad m, Applicative m) => Freshable m F.Symbol where
@@ -234,31 +239,41 @@ refreshArgs t = fst <$> refreshArgsSub t
 
 -- NV TODO: this does not refresh args if they are wrapped in an RRTy
 refreshArgsSub :: (FreshM m) => SpecType -> m (SpecType, F.Subst)
-refreshArgsSub t
-  = do ts     <- mapM refreshArgs ts_u
-       xs'    <- mapM (const fresh) xs
-       let sus = F.mkSubst <$> L.inits (zip xs (F.EVar <$> xs'))
-       let su  = last sus
-       ts'    <- mapM refreshPs $ zipWith F.subst sus ts
-       let rs' = zipWith F.subst sus rs
-       tr     <- refreshPs $ F.subst su tbd
-       let t'  = fromRTypeRep $ trep {ty_binds = xs', ty_args = ts', ty_res = tr, ty_refts = rs'}
-       return (t', su)
-    where
-       trep    = toRTypeRep t
-       xs      = ty_binds trep
-       ts_u    = ty_args  trep
-       tbd     = ty_res   trep
-       rs      = ty_refts trep
+refreshArgsSub = refreshArgsSubWith F.subst F.subst
 
-refreshPs :: (FreshM m) => SpecType -> m SpecType
-refreshPs = mapPropM go
+{- | Refresh the same dependent telescope with representation-specific
+substitution actions. Each argument sees only its preceding formal owners.
+-}
+refreshArgsSubWith ::
+    (FreshM m) =>
+    (F.Subst -> RRType r -> RRType r) ->
+    (F.Subst -> r -> r) ->
+    RRType r ->
+    m (RRType r, F.Subst)
+refreshArgsSubWith substType substRefinement = go
   where
-    go (RProp s st) = do
-      t'    <- refreshPs st
-      xs    <- mapM (const fresh) s
-      let su = F.mkSubst [(y, F.EVar x) | (x, (y, _)) <- zip xs s]
-      return $ RProp [(x, t) | (x, (_, t)) <- zip xs s] $ F.subst su t'
+    go t = do
+        ts <- mapM (fmap fst . go) ts_u
+        xs' <- mapM (const fresh) xs
+        let sus = F.mkSubst <$> L.inits (zip xs (F.EVar <$> xs'))
+            su = last sus
+        ts' <- mapM refreshPs $ zipWith substType sus ts
+        let rs' = zipWith substRefinement sus rs
+        tr <- refreshPs $ substType su tbd
+        let t' = fromRTypeRep $ trep{ty_binds = xs', ty_args = ts', ty_res = tr, ty_refts = rs'}
+        return (t', su)
+      where
+        trep = toRTypeRep t
+        xs = ty_binds trep
+        ts_u = ty_args trep
+        tbd = ty_res trep
+        rs = ty_refts trep
+    refreshPs = mapPropM refreshProp
+    refreshProp (RProp s st) = do
+        t' <- refreshPs st
+        xs <- mapM (const fresh) s
+        let su = F.mkSubst [(y, F.EVar x) | (x, (y, _)) <- zip xs s]
+        return $ RProp [(x, t) | (x, (_, t)) <- zip xs s] $ substType su t'
 
 --------------------------------------------------------------------------------
 refreshHoles :: (F.Symbolic t, IsReft r, ReftBind r ~ F.Symbol, ReftVar r ~ F.Symbol, TyConable c, Freshable f r)

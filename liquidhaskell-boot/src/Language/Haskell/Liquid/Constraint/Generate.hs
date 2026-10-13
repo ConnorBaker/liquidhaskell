@@ -16,7 +16,7 @@
 -- | This module defines the representation of Subtyping and WF Constraints,
 --   and the code for syntax-directed constraint generation.
 
-module Language.Haskell.Liquid.Constraint.Generate ( generateConstraints, caseEnv, consE ) where
+module Language.Haskell.Liquid.Constraint.Generate ( ConstraintObligations (..), generateConstraints, caseEnv, consE ) where
 
 import           Prelude                                       hiding (error)
 import           GHC.Stack ( CallStack )
@@ -28,7 +28,7 @@ import           Liquid.GHC.API               as Ghc hiding ( panic
 import qualified Language.Haskell.Liquid.GHC.Resugar           as Rs
 import qualified Language.Haskell.Liquid.GHC.SpanStack         as Sp
 import qualified Language.Haskell.Liquid.GHC.Misc              as GM -- ( isInternal, collectArguments, tickSrcSpan, showPpr )
-import Language.Haskell.Liquid.GHC.PrimitiveContract (primitiveContract)
+import Language.Haskell.Liquid.GHC.PrimitiveContract (primitiveContract, wiredBoolean)
 import Text.PrettyPrint.HughesPJ ( text )
 import           Control.Monad ( foldM, forM, forM_, when, void, unless, msum, guard)
 import           Control.Monad.State
@@ -48,7 +48,8 @@ import           Language.Haskell.Liquid.Constraint.Fresh ( addKuts, freshTyType
 import           Language.Haskell.Liquid.Constraint.Init (DefaultTypes, initEnv)
 import           Language.Haskell.Liquid.Constraint.Env
 import           Language.Haskell.Liquid.Constraint.Monad
-import Language.Haskell.Liquid.Constraint.Split ( splitC, splitW )
+import Language.Haskell.Liquid.Constraint.Split ( splitC, splitCheckedCWith, bsplitC, splitW )
+import GHC.Core.SimpleOpt (SimpleOpts (so_eta_red), defaultSimpleOpts, simpleOptExprNoInline)
 import           Language.Haskell.Liquid.Constraint.Relational (consAssmRel, consRelTop)
 import           Language.Haskell.Liquid.Types.Dictionaries
 import           Language.Haskell.Liquid.Types.Errors
@@ -71,6 +72,9 @@ import qualified Language.Haskell.Liquid.Measure as Measure
 import Language.Haskell.Liquid.Transforms.CoreToLogic (LogicM, NewtypeCoercion (..), castToLg, coreToLogic, newtypeCoercionDataCon, runToLogic, weakenResult)
 import           Language.Haskell.Liquid.Bare.DataType (dataConMap, makeDataConChecker, makeDataConSelector)
 import           Language.Haskell.Liquid.Bare.Misc (simpleSymbolVar)
+import Language.Haskell.Liquid.Bare.Class (instanceDictionaryOwners)
+import GHC.Core.Map.Expr (eqCoreExpr)
+import GHC.Core (mkVarApps)
 import Language.Haskell.Liquid.UX.Config (
   Config (
     checkDerived,
@@ -94,6 +98,7 @@ import qualified GHC.Core.Coercion as Co
 import GHC.Core.TyCo.Rep (Coercion (CoVarCo, TransCo))
 import qualified GHC.Data.Strict as Strict
 import GHC.Types.Unique.Set (nonDetEltsUniqSet)
+import GHC.Core.Type (getTyVar_maybe)
 
 -- Note [Term holes]
 --
@@ -178,72 +183,89 @@ import GHC.Types.Unique.Set (nonDetEltsUniqSet)
 --------------------------------------------------------------------------------
 -- | Constraint Generation: Toplevel -------------------------------------------
 --------------------------------------------------------------------------------
-generateConstraints :: (TargetInfo -> CGInfo) -> DefaultTypes -> [(Var, SpecType)] -> TargetInfo -> [CoreBind] -> ([(Var, SpecType)], CGInfo)
---------------------------------------------------------------------------------
-generateConstraints initialize defaultTypes callables info groups =
-  {-# SCC "ConsGen" #-} runState act $ initialize info
- where
-  act = do
-    γ <- initEnv defaultTypes callables info
-    checked <- consAct γ cfg info groups
-    -- Retain the callable environment after checking, including synthesized
-    -- unsigned bindings. Reuse requires the source driver's corresponding
-    -- proof obligations, not merely source-position annotations. A rejected
-    -- expected goal resolves to its independently checked callable instead.
-    pure
-      [ (owner, ty)
-      | owner <- concatMap bindersOf groups
-      , Just ty <- [lookupREnv (F.symbol owner) (renv checked)]
-      ]
-  cfg = getConfig info
+data ConstraintObligations = ConstraintObligations
+    { obligationBodies :: [CoreBind]
+    , obligationMethods :: [(Var, MethodType (F.Located CheckedSpecType))]
+    , obligationInterfaces :: AdmittedInterfaces
+    , obligationDeclarations :: [Var]
+    }
 
-consAct :: CGEnv -> Config -> TargetInfo -> [CoreBind] -> CG CGEnv
-consAct γ cfg info groups = do
-  let sSpc = gsSig . giSpec $ info
-  γ' <- foldM checkGroup γ groups
-  requested <- gets refinementChecksByOwner
-  -- An authored assumption about an imported function has no local body.
-  -- Check its collected predicate in the completed module environment, using
-  -- the same judgment as local declarations, without checking the assumed body.
-  let localOwners = S.fromList (letVars (giCbs (giSrc info)))
-      assumedOwners = S.fromList (map fst (gsAsmSigs sSpc))
-  consRefinementChecks γ'
-    [owner | owner <- M.keys requested, owner `S.member` assumedOwners, not (owner `S.member` localOwners)]
-  visited <- gets visitedRefinementOwners
-  let missingOwners = filter (not . (`S.member` visited)) (M.keys requested)
-  unless (null missingOwners) $
-    panic Nothing ("Refinement formation has no checked lexical owner: " ++
-      unwords (map GM.showPpr missingOwners))
-  -- Relational Checking: the following only runs when the list of relational specs is not empty
-  (ψ, γ'') <- foldM (consAssmRel cfg info) ([], γ') (gsAsmRel sSpc ++ gsRelation sSpc)
-  mapM_ (consRelTop cfg info γ'' ψ) (gsRelation sSpc)
-  -- End: Relational Checking
-  mapM_ (consClass γ) (gsMethods $ gsSig $ giSpec info)
-  hcs <- gets hsCs
-  hws <- gets hsWfs
-  fcs <- concat <$> mapM (splitC (typeclass (getConfig info))) hcs
-  fws <- concat <$> mapM splitW hws
-  checkStratCtors γ sSpc
-  when (warnOnTermHoles cfg) emitConsolidatedHoleWarnings
-  -- Self is a constructor-field placeholder whose lexical owner is supplied
-  -- by caseEnv, not a global value. Keep it in the frontend checking scope,
-  -- but do not offer it as a solver constant or qualifier argument. Any
-  -- residual free occurrence must fail the ordinary query scope checks.
-  modify $ \st -> st { fEnv     = F.deleteSEnv selfSymbol (fEnv st `mappend` feEnv (fenv γ))
-                     , cgLits   = litEnv   γ
-                     , cgConsts = cgConsts st `mappend` constEnv γ
-                     , fixCs    = fcs
-                     , fixWfs   = fws }
-  pure γ'
+generateConstraints :: (TargetInfo -> CGInfo) -> DefaultTypes -> [(Var, SpecType)] -> TargetInfo -> ConstraintObligations -> ([(Var, SpecType)], CGInfo)
+--------------------------------------------------------------------------------
+generateConstraints initialize defaultTypes callables info obligations =
+    {-# SCC "ConsGen" #-} runState act $ (initialize info){admittedInterfaces = obligationInterfaces obligations}
   where
+    act = do
+        γ <- initEnv defaultTypes callables info
+        checked <- consAct γ cfg info obligations
+        -- Retain the callable environment after checking, including synthesized
+        -- unsigned bindings. Reuse requires the source driver's corresponding
+        -- proof obligations, not merely source-position annotations. A rejected
+        -- expected goal resolves to its independently checked callable instead.
+        pure
+            [ (owner, ty)
+            | owner <- concatMap bindersOf groups
+            , Just ty <- [lookupREnv (F.symbol owner) (renv checked)]
+            ]
+    cfg = getConfig info
+    groups = obligationBodies obligations
+
+consAct :: CGEnv -> Config -> TargetInfo -> ConstraintObligations -> CG CGEnv
+consAct γ cfg info obligations = do
+    let sSpc = gsSig . giSpec $ info
+    γ' <- foldM checkGroup γ groups
+    consRefinementChecks γ' (obligationDeclarations obligations)
+    requested <- gets refinementChecksByOwner
+    -- An authored assumption about an imported function has no local body.
+    -- Check its collected predicate in the completed module environment, using
+    -- the same judgment as local declarations, without checking the assumed body.
+    let localOwners = S.fromList (letVars (giCbs (giSrc info)))
+        assumedOwners = S.fromList (map fst (gsAsmSigs sSpc))
+    consRefinementChecks
+        γ'
+        [owner | owner <- M.keys requested, owner `S.member` assumedOwners, not (owner `S.member` localOwners), owner `notElem` obligationDeclarations obligations]
+    visited <- gets visitedRefinementOwners
+    let missingOwners = filter (not . (`S.member` visited)) (M.keys requested)
+    unless (null missingOwners) $
+        panic
+            Nothing
+            ( "Refinement formation has no checked lexical owner: "
+                ++ unwords (map GM.showPpr missingOwners)
+            )
+    -- Relational Checking: the following only runs when the list of relational specs is not empty
+    (ψ, γ'') <- foldM (consAssmRel cfg info) ([], γ') (gsAsmRel sSpc ++ gsRelation sSpc)
+    mapM_ (consRelTop cfg info γ'' ψ) (gsRelation sSpc)
+    -- End: Relational Checking
+    classConstraints <- concat <$> mapM (consClass γ') (obligationMethods obligations)
+    hcs <- gets hsCs
+    fcs <- concat <$> mapM (splitC (typeclass (getConfig info))) hcs
+    hws <- gets hsWfs
+    fws <- concat <$> mapM splitW hws
+    checkStratCtors γ sSpc
+    when (warnOnTermHoles cfg) emitConsolidatedHoleWarnings
+    -- Self is a constructor-field placeholder whose lexical owner is supplied
+    -- by caseEnv, not a global value. Keep it in the frontend checking scope,
+    -- but do not offer it as a solver constant or qualifier argument. Any
+    -- residual free occurrence must fail the ordinary query scope checks.
+    modify $ \st ->
+        st
+            { fEnv = F.deleteSEnv selfSymbol (fEnv st `mappend` feEnv (fenv γ))
+            , cgLits = litEnv γ
+            , cgConsts = cgConsts st `mappend` constEnv γ
+            , fixCs = classConstraints ++ fcs
+            , fixWfs = fws
+            }
+    pure γ'
+  where
+    groups = obligationBodies obligations
     checkGroup :: CGEnv -> CoreBind -> CG CGEnv
     checkGroup environment cb = do
         checked <- consCBTop cfg info environment cb
         consRefinementChecks checked (bindersOf cb)
         pure checked
 
-
 ---------------------------------
+
 -- | Checking stratified ctors --
 ---------------------------------
 type FExpr = F.ExprV F.Symbol
@@ -253,7 +275,8 @@ checkStratCtors :: CGEnv -> GhcSpecSig -> CG ()
 checkStratCtors env sSpc = do
   let ctors = S.fromList $ M.keys $ F.seBinds $ constEnv env
   let ctorRefinements = filter (isStrat . fst) $ gsTySigs sSpc
-  forM_ ctorRefinements $ uncurry $ checkCtor ctors
+  let propOwner = lookupLogicMeasure (Ghc.mkModuleName "Language.Haskell.Liquid.ProofCombinators") "prop" (gsData $ giSpec $ cgInfo env)
+  forM_ ctorRefinements $ uncurry $ checkCtor propOwner ctors
   where
     -- (Alecs): For some reason it can't see that they are the same
     -- GHC name, probably is due to some worker wrapper shenannigans
@@ -267,22 +290,22 @@ uncurryPi rest                 = ([], rest)
 getTyConName :: SpecType -> Name
 getTyConName a = Ghc.tyConName $ rtc_tc $ rt_tycon a
 
-checkCtor :: Ctors -> Var -> LocSpecType -> CG ()
-checkCtor ctors name typ = do
+checkCtor :: Maybe F.Symbol -> Ctors -> Var -> LocSpecType -> CG ()
+checkCtor propOwner ctors name typ = do
   let loc = GM.fSrcSpan $ F.loc typ
   let (args, ret) = uncurryPi $ val typ
   -- The constuctor that we want not to appear negatively
   let tyName = getTyConName ret
   -- Its index information
-  retIdx <- case getPropIndex $ ur_reft $ rt_reft ret of
+  retIdx <- case getPropIndex propOwner $ ur_reft $ rt_reft ret of
     Just idx -> pure idx
     Nothing  -> uError $ ErrStratNotPropRet loc (pprint tyName) (pprint name) (F.pprint ret)
   -- For every argument of the constructor we check that all the
   -- self-refernce are refined by a "smaller" `prop` annotation
-  forM_ args $ checkNg ctors loc name tyName retIdx
+  forM_ args $ checkNg propOwner ctors loc name tyName retIdx
 
-checkNg :: Ctors -> SrcSpan -> Var -> Name -> FExpr -> SpecType -> CG ()
-checkNg ctors loc ctorName tyName retIdx = go
+checkNg :: Maybe F.Symbol -> Ctors -> SrcSpan -> Var -> Name -> FExpr -> SpecType -> CG ()
+checkNg propOwner ctors loc ctorName tyName retIdx = go
   where
     go :: SpecType -> CG ()
     go RVar {} = pure ()
@@ -293,7 +316,7 @@ checkNg ctors loc ctorName tyName retIdx = go
       go rt_out
     go r@RApp { rt_tycon = RTyCon { rtc_tc }, rt_args, rt_reft } = do
       if Ghc.tyConName rtc_tc == tyName then do
-          case getPropIndex $ ur_reft rt_reft of
+          case getPropIndex propOwner $ ur_reft rt_reft of
             (Just arg) -> do
               -- We compare index information The occurrence is safe
               -- iff the index of the return type is strictly bigger
@@ -362,18 +385,230 @@ emitConsolidatedHoleWarnings = do
 
 --------------------------------------------------------------------------------
 -- | Ensure that the instance type is a subtype of the class type --------------
+
 --------------------------------------------------------------------------------
 
-consClass :: CGEnv -> (Var, MethodType LocSpecType) -> CG ()
+consClass :: CGEnv -> (Var, MethodType (F.Located CheckedSpecType)) -> CG [FixSubC]
 consClass γ (x, mt)
     | Just ti <- tyInstance mt =
         do
-            ti' <- refreshArgs (val ti)
-            tc <- refreshArgs $ maybe (ofType $ varType x) val (tyClass mt)
-            addC (SubC (γ `setLocation` Sp.Span (GM.fSrcSpan (F.loc ti))) ti' tc) ("cconsClass for " ++ GM.showPpr x)
+            (ti', _) <- refreshArgsSubWith substCheckedType F.subst (val ti)
+            (tc, _) <- refreshArgsSubWith substCheckedType F.subst $ maybe (logicalSpecType $ ofType $ varType x) val (tyClass mt)
+            constraints <- splitCheckedCWith nativeRefinementLeaf (typeclass (getConfig γ)) (SubC (γ `setLocation` Sp.Span (GM.fSrcSpan (F.loc ti))) ti' tc)
+            let endpoints = fmap (fmap ordinarySpecType) mt{tyInstance = Just (F.loc ti `F.atLoc` ti'), tyClass = Just (maybe (F.loc ti) F.loc (tyClass mt) `F.atLoc` tc)}
+            modify $ \state -> state{interfaceEndpoints = (x, endpoints) : interfaceEndpoints state}
+            pure constraints
 -- Without a refined class declaration, the public interface is Haskell's.
 consClass _ _ =
-    return ()
+    return []
+
+-- Both concrete predicates are opened in the actual oriented split judgment.
+-- In particular, no original query argument domain is replayed as a premise.
+nativeRefinementLeaf :: [RPVar] -> CGEnv -> CheckedSpecType -> CheckedSpecType -> CG [FixSubC]
+nativeRefinementLeaf predicates environment left right
+    | Just leftRefinement <- stripRTypeBase left
+    , Just rightRefinement <- stripRTypeBase right
+    , not (null $ checkedPredicates leftRefinement ++ checkedPredicates rightRefinement) = do
+        let root = F.reftBind $ ur_reft $ checkedOrdinary leftRefinement
+            carrier = mapRBase (const mempty) (ordinarySpecType left)
+            rightAtRoot = renameCheckedRoot rightRefinement root
+        scoped <- environment += ("native refinement value", root, carrier)
+        case alignNativeOwners scoped (checkedPredicates leftRefinement ++ checkedPredicates rightAtRoot) of
+            Nothing -> ordinary
+            Just owners
+                | all (isJust . openNativeSignature predicates . predicateSignature) (checkedPredicates leftRefinement ++ checkedPredicates rightAtRoot) -> do
+                    opened <- renameNativeEnvironment owners scoped
+                    (leftEnvironment, lhsBody, lhsMeaning) <- openNativeRefinement predicates opened owners leftRefinement
+                    -- A relational goal must be concrete: nested RHS KVars
+                    -- are not Horn producers and cannot establish this cut.
+                    unless (F.isConc lhsMeaning) $
+                        panic (Just $ getLocation environment) "Native source interpretation contains an inferred predicate"
+                    inferred <- freshTyType (typeclass $ getConfig leftEnvironment) LetE lhsBody (exprType lhsBody)
+                    addW $ WfC leftEnvironment inferred
+                    let booleanRoot = F.vv Nothing
+                        -- One checking pass proves both native result facts
+                        -- and their precise interpretation. The readback alone
+                        -- need not expose a checked source result contract.
+                        witnessed = inferred `strengthen` uTop (F.Reft (booleanRoot, F.PIff (F.EVar booleanRoot) lhsMeaning))
+                    cconsE leftEnvironment lhsBody witnessed
+                    witness <- freshNativeBool
+                    witnessedEnvironment <- leftEnvironment += ("checked native refinement", F.symbol witness, witnessed)
+                    trueEnvironment <- caseEnv witnessedEnvironment witness [DataAlt falseDataCon, DataAlt trueDataCon] (DataAlt trueDataCon) [] Nothing
+                    producerRoot <- fresh
+                    let action = F.mkSubst [(owner, F.EVar $ F.symbol actual) | (owner, actual) <- owners]
+                        nativeRoot = maybe root F.symbol (lookup root owners)
+                        membership refinement = renameReftRoot (F.subst action $ checkedLogical refinement) nativeRoot
+                        leftMembership = shiftVV (carrier `strengthen` membership leftRefinement) producerRoot
+                        rightMembership = carrier `strengthen` membership rightAtRoot
+                        pinnedLeft = leftMembership `strengthen` uTop (F.Reft (producerRoot, F.PAtom F.Eq (F.EVar producerRoot) (F.EVar nativeRoot)))
+                    -- Keep the oriented membership conclusion on the Horn
+                    -- RHS. Boxing it as an input Bool would lose its producer.
+                    constraints <- bsplitC trueEnvironment pinnedLeft rightMembership
+                    let resident = fromMaybe (panic (Just $ getLocation environment) "Native refinement lost its value owner") (trueEnvironment ?= nativeRoot)
+                    cutEnvironment <- trueEnvironment += ("checked native membership", nativeRoot, resident `strengthen` membership rightAtRoot)
+                    (rightEnvironment, rhsBody, _) <- openNativeRefinement predicates cutEnvironment owners rightAtRoot{checkedLogical = mempty}
+                    let target = ofType boolTy `strengthen` uTop (F.Reft (booleanRoot, F.EVar booleanRoot))
+                    cconsE rightEnvironment rhsBody target
+                    return constraints
+            _ -> ordinary
+    | otherwise = ordinary
+  where
+    ordinary = bsplitC environment (ordinarySpecType left) (ordinarySpecType right)
+
+-- A logical substitution may have no native application. Only exact source
+-- variable owners, with their actual nominal Gamma carriers, admit opening.
+alignNativeOwners :: CGEnv -> [CheckedPredicate] -> Maybe [(F.Symbol, Id)]
+alignNativeOwners environment = foldM addPredicate []
+  where
+    addPredicate owners predicate = foldM (addFormal predicate) owners (queryValueOwners $ predicateTelescope predicate)
+    addFormal predicate owners (_, formal)
+        | isCoVar formal = Nothing
+        | primitiveFormal predicate formal = Just owners
+        | Just (F.EVar source) <- lookup formal (predicateDefinitions predicate)
+        , Just actual <- environment ?= source
+        , let nominal = instantiateNativeType predicate (varType formal)
+        , nominal `eqType` specTypeToQueryType actual =
+            case lookup source owners of
+                Just existing | varType existing `eqType` nominal -> Just owners
+                Just _ -> Nothing
+                Nothing | isJust (environment ?= F.symbol formal) && F.symbol formal /= source -> Nothing
+                Nothing -> Just (owners ++ [(source, setVarType formal nominal)])
+        | otherwise = Nothing
+
+primitiveFormal :: CheckedPredicate -> Id -> Bool
+primitiveFormal predicate formal = formal `elem` predicateLogicalParameters predicate
+
+instantiateNativeType :: CheckedPredicate -> Type -> Type
+instantiateNativeType predicate ty = substTyWith native source ty
+  where
+    correspondence = [(actual, mkTyVarTy owner) | (owner, image) <- queryTypeOwners (predicateTelescope predicate), Just actual <- [getTyVar_maybe image]]
+    (native, source) = unzip correspondence
+
+-- Rebuild the SAME active Horn context under one simultaneous owner action;
+-- retaining old bindings plus aliases would not be native alpha conversion.
+renameNativeEnvironment :: [(F.Symbol, Id)] -> CGEnv -> CG CGEnv
+renameNativeEnvironment owners environment = do
+    bindings <- gets binds
+    renamed <- forM (F.elemsIBindEnv $ feBinds $ fenv environment) $ \key -> do
+        let (owner, refinement, information) = F.lookupBindEnv key bindings
+            owner' = rename owner
+            refinement' = F.subst action refinement
+        if owner' == owner && refinement' == refinement
+            then return ((owner, F.sr_sort refinement), key)
+            else state $ \current ->
+                let (freshKey, updated) = F.insertBindEnv owner' refinement' information (binds current)
+                 in (((owner', F.sr_sort refinement'), freshKey), current{binds = updated})
+    let renamedFixpoint = insertsFEnv (initFEnv [(rename owner, sort) | (owner, sort) <- F.toListSEnv $ feEnv $ fenv environment]) renamed
+    return
+        environment
+            { renv = renameTypes (renv environment)
+            , grtys = renameTypes (grtys environment)
+            , assms = renameTypes (assms environment)
+            , intys = renameTypes (intys environment)
+            , fenv = renamedFixpoint
+            , denv = renameDictionaries (denv environment)
+            , lcb = M.fromList [(rename owner, renameCore expression) | (owner, expression) <- M.toList $ lcb environment]
+            , forallcb = M.fromList [(renameId owner, F.subst action expression) | (owner, expression) <- M.toList $ forallcb environment]
+            , lcs = case lcs environment of LC contexts -> LC [[(rename owner, F.subst action ty) | (owner, ty) <- context] | context <- contexts]
+            }
+  where
+    action = F.mkSubst [(owner, F.EVar $ F.symbol actual) | (owner, actual) <- owners]
+    rename owner = maybe owner F.symbol (lookup owner owners)
+    renameTypes (REnv globals locals) = REnv (renameMap globals) (renameMap locals)
+    renameMap types = M.fromList [(rename owner, F.subst action ty) | (owner, ty) <- M.toList types]
+    renameId owner = fromMaybe owner (lookup (F.symbol owner) owners)
+    renameDictionaries (DEnv dictionaries) = DEnv $ M.fromList [(renameId owner, M.map (fmap $ F.subst action) fields) | (owner, fields) <- M.toList dictionaries]
+    renameCore expression = foldr (\owner -> GM.substCoreVar owner (Var $ renameId owner)) expression [owner | owner <- nonDetEltsUniqSet $ exprFreeVars expression, isId owner]
+
+-- Abstract applications retain their owned representation through query
+-- composition. Only rigid owners introduced by this split judgment are lowered
+-- here; a same-spelled source term is never an abstract predicate owner.
+openNativeSignature :: [RPVar] -> SpecType -> Maybe SpecType
+openNativeSignature predicates signature =
+    let opened = foldl open signature predicates
+     in if closedTelescope opened then Just opened else Nothing
+  where
+    open ty predicate = mapScopedPredicateWith remove predicate (const $ replacePredsWithRefs (uPVar predicate, pVartoRConc predicate)) ty
+      where
+        remove binder
+            | pname binder == pname predicate = Nothing
+            | otherwise = Just (binder, pname binder)
+    closedTelescope (RAllT _ rest _) = closedTelescope rest
+    closedTelescope RAllP{} = False
+    closedTelescope (RFun _ _ _ rest _) = closedTelescope rest
+    closedTelescope _ = True
+
+openNativeRefinement :: [RPVar] -> CGEnv -> [(F.Symbol, Id)] -> CheckedRefinement -> CG (CGEnv, CoreExpr, F.Expr)
+openNativeRefinement predicates environment owners refinement = do
+    (opened, bodies) <- foldM open (environment, []) (checkedPredicates refinement)
+    let logical = checkedLogical refinement
+        F.Reft (root, concrete) = ur_reft logical
+        Pr applications = ur_pred logical
+        remainder = F.pAnd (concrete : [pVartoRConc application (root, pargs application) | application <- applications])
+        action = F.mkSubst [(owner, F.EVar $ F.symbol actual) | (owner, actual) <- owners]
+    (withRemainder, remainderBody, membershipMeaning) <- logicalBoolean opened (F.subst action remainder)
+    -- Membership supplies the path on which the authored source guards are
+    -- admitted. Demand each whole guard only there, in its original order;
+    -- no original query argument domain is installed as an assumption.
+    sourceBody <- foldM (\result source -> nativeIf source result (Var $ dataConWorkId falseDataCon)) (Var $ dataConWorkId trueDataCon) (reverse bodies)
+    body <- nativeIf remainderBody sourceBody (Var $ dataConWorkId falseDataCon)
+    let meaning = F.pAnd (membershipMeaning : [F.subst action $ predicateReadback source | source <- checkedPredicates refinement])
+    return (withRemainder, body, meaning)
+  where
+    open (scope, bodies) predicate = do
+        let signature = fromMaybe (panic (Just $ getLocation environment) "Native opening lost its owned predicate scope") (openNativeSignature predicates $ predicateSignature predicate)
+            openedBody = simpleOptExprNoInline defaultSimpleOpts{so_eta_red = False} $ mkApps (predicateCore predicate) (arguments predicate signature)
+            primitiveDomains = [(formal, F.subst (queryOwnerAction predicate) domain) | (owner, domain) <- domains signature, Just formal <- [lookup owner $ queryValueOwners $ predicateTelescope predicate], primitiveFormal predicate formal]
+        scope' <- foldM (\current (formal, domain) -> if primitiveFormal predicate formal then current += ("native logical primitive", F.symbol formal, domain) else return current) scope primitiveDomains
+        return (scope', bodies ++ [openedBody])
+    domains (RAllT _ rest _) = domains rest
+    domains (RAllP _ rest) = domains rest
+    domains (RFun owner _ domain rest _) = (owner, domain) : domains rest
+    domains _ = []
+    -- Generated contracts share the complete query telescope. Open their
+    -- dependent value coordinates by the SAME action as the Core arguments.
+    queryOwnerAction predicate = F.mkSubst [(owner, F.EVar $ F.symbol actual) | (owner, formal) <- queryValueOwners $ predicateTelescope predicate, Just actual <- [argumentOwner predicate formal]]
+    argumentOwner predicate formal
+        | primitiveFormal predicate formal = Just formal
+        | Just (F.EVar source) <- lookup formal (predicateDefinitions predicate) = lookup source owners
+        | otherwise = Nothing
+    arguments predicate (RAllT variable rest _)
+        | RTV source <- ty_var_value variable = Type (mkTyVarTy source) : arguments predicate rest
+    arguments predicate (RAllP _ rest) = arguments predicate rest
+    arguments predicate (RFun owner _ _ rest _) = case lookup owner (queryValueOwners $ predicateTelescope predicate) of
+        Just formal
+            | primitiveFormal predicate formal -> Var (setVarType formal $ instantiateNativeType predicate $ varType formal) : arguments predicate rest
+            | Just (F.EVar source) <- lookup formal (predicateDefinitions predicate)
+            , Just actual <- lookup source owners ->
+                Var actual : arguments predicate rest
+        _ -> panic (Just $ getLocation environment) "Native opening lost a validated source owner"
+    arguments _ _ = []
+
+logicalBoolean :: CGEnv -> F.Expr -> CG (CGEnv, CoreExpr, F.Expr)
+logicalBoolean environment F.PTrue = return (environment, Var $ dataConWorkId trueDataCon, F.PTrue)
+logicalBoolean environment F.PFalse = return (environment, Var $ dataConWorkId falseDataCon, F.PFalse)
+logicalBoolean environment meaning = do
+    identifier <- freshNativeBool
+    let root = F.vv Nothing
+        carrier = ofType boolTy `strengthen` uTop (F.Reft (root, F.PIff (F.EVar root) meaning))
+    extended <- environment += ("native logical Boolean", F.symbol identifier, carrier)
+    return (extended, Var identifier, F.EVar $ F.symbol identifier)
+
+freshNativeBool :: CG Id
+freshNativeBool = do
+    unique <- fresh
+    return $ mkLocalVar VanillaId (mkInternalName (mkUnique 'L' $ fromInteger unique) (mkVarOcc "lh_native_bool") noSrcSpan) ManyTy boolTy vanillaIdInfo
+
+nativeIf :: CoreExpr -> CoreExpr -> CoreExpr -> CG CoreExpr
+-- Bool's identity case preserves the source expression itself, including its
+-- demand structure, instead of asking inference to summarize another Case.
+nativeIf condition (Var yes) (Var no)
+    | yes == dataConWorkId trueDataCon
+    , no == dataConWorkId falseDataCon =
+        return condition
+nativeIf condition yes no = do
+    binder <- freshNativeBool
+    return $ Case condition binder boolTy [Alt (DataAlt falseDataCon) [] no, Alt (DataAlt trueDataCon) [] yes]
 
 --------------------------------------------------------------------------------
 consCBLet :: CGEnv -> CoreBind -> CG CGEnv
@@ -407,7 +642,7 @@ consRefinementChecks γ owners = forM_ owners $ \owner -> do
     -- path; the visited set only detects obligations with no owner at all.
     forM_ (M.findWithDefault [] owner requested) $ \check -> do
         let expression = refinementCheckExpr check
-            location = GM.fSrcSpan (F.loc (refinementCheckType check))
+            location = GM.fSrcSpan (F.loc (refinementCheckPredicate check))
             freeIds = filter isId (nonDetEltsUniqSet (exprFreeVars expression))
             sourceIds = S.fromList (giDefVars (giSrc (cgInfo γ)))
         -- A predicate can mention a source definition before its Core group.
@@ -429,7 +664,7 @@ consRefinementChecks γ owners = forM_ owners $ \owner -> do
                     ++ unwords (map GM.showPpr missing)
                 )
         tycons <- gets tyConInfo
-        target <- refreshArgs $ addTyConInfo (emb γ) tycons (F.val (refinementCheckType check))
+        target <- refreshArgs $ addTyConInfo (emb γ) tycons (predicateSignature (F.val (refinementCheckPredicate check)))
         -- Metadata belongs to this declaration, not the last checked member
         -- of its group. Bodyless external owners use the ordinary default tag.
         let ownedEnv = queryEnv{cgVar = Just owner, tgKey = Nothing} `setBind` owner
@@ -494,12 +729,21 @@ consCB TerminationCheck γ (Rec xes)
 
 -- don't do termination checking, but some strata checks?
 consCB StrataCheck γ (Rec xes)
-  = do xets     <- forM xes $ \(x, e) -> (x, e,) <$> varTemplate γ (x, Just e)
+  = do authorized <- structuralTerminationAuthorized (getConfig γ) (Rec xes)
+       xets     <- forM xes $ \(x, e) -> (x, e,) <$> varTemplate γ (x, Just e)
        modify     $ \i -> i { recCount = recCount i + length xes }
        let xts    = [(x, to) | (x, _, to) <- xets]
-       γ'        <- foldM (extenderWith recursiveHypothesis) (γ `setRecs` (fst <$> xts)) xts
-       mapM_ (consBind True γ') xets
-       foldM extender (γ `setRecs` (fst <$> xts)) xts
+       γ'        <- foldM (extend authorized) (γ `setRecs` (fst <$> xts)) xts
+       checked <- mapM (consBind True γ') xets
+       foldM (extenderAfterBodyWith id) (γ `setRecs` (fst <$> xts))
+         [(owner, original, actual) | ((owner, original), actual) <- zip xts checked]
+  where
+    extend True env (owner, Asserted target) = induction env owner target
+    extend True env (owner, Internal target) = induction env owner target
+    extend _ env binding = extenderWith recursiveHypothesis env binding
+    induction env owner target = do
+      callable <- recursiveCallable env owner target
+      env += ("structural induction", F.symbol owner, recursiveHypothesis callable)
 
 -- don't do termination checking, and don't do any strata checks either?
 consCB NoCheck γ (Rec xes)
@@ -507,8 +751,9 @@ consCB NoCheck γ (Rec xes)
        modify $ \i -> i { recCount = recCount i + length xes }
        let xts = [(x, to) | (x, _, to) <- xets]
        γ'     <- foldM (extenderWith recursiveHypothesis) (γ `setRecs` (fst <$> xts)) xts
-       mapM_ (consBind True γ') xets
-       foldM extender (γ `setRecs` (fst <$> xts)) xts
+       checked <- mapM (consBind True γ') xets
+       foldM (extenderAfterBodyWith id) (γ `setRecs` (fst <$> xts))
+         [(owner, original, actual) | ((owner, original), actual) <- zip xts checked]
 
 consCB _ γ (NonRec x def)
   | Just (w, τ) <- grepDictionary def
@@ -530,7 +775,7 @@ consCBNonRec γ x e
   = do to  <- varTemplate γ (x, Nothing)
        when (warnOnTermHoles (getConfig γ)) checkLetHole
        to' <- consBind False γ (x, e, to) >>= addPostTemplate γ
-       extenderWith (makeSingleton γ (simplify e)) γ (x, to')
+       extenderAfterBodyWith (makeSingleton γ (simplify e)) γ (x, to, to')
   where
     -- See Note [Term holes]
     checkLetHole =
@@ -629,12 +874,6 @@ defAnn :: Bool -> t -> Annot t
 defAnn True  = AnnRDf
 defAnn False = AnnDef
 
-addPToEnv :: CGEnv
-          -> PVar RSort -> CG CGEnv
-addPToEnv γ π
-  = do γπ <- γ += ("addSpec1", pname π, pvarRType π)
-       foldM (+=) γπ [("addSpec2", x, ofRSort t) | (t, x, _) <- pargs π]
-
 -- | Detect a direct typed-hole occurrence in Core and recover the source span
 --   that GHC attached to it, if present. The helper deliberately matches the
 --   stable @.hole@ naming convention after stripping wrappers introduced by
@@ -707,13 +946,11 @@ cconsE' γ e@(Let b@(NonRec x _) ee) t
          else do γ' <- consCBLet γ b
                  cconsE γ' ee t
 
-cconsE' γ e (RAllP p t)
-  = cconsE γ' e t''
-  where
-    t'         = replacePredsWithRefs su <$> t
-    su         = (uPVar p, pVartoRConc p)
-    (css, t'') = splitConstraints (typeclass (getConfig γ)) t'
-    γ'         = L.foldl' addConstraints γ css
+cconsE' γ e (RAllP p t) =
+    do
+        (γπ, t') <- openPredicate γ p t
+        let (css, t'') = splitConstraints (typeclass (getConfig γ)) t'
+        cconsE (L.foldl' addConstraints γπ css) e t''
 
 cconsE' γ (Let b e) t
   = do γ' <- consCBLet γ b
@@ -766,7 +1003,7 @@ cconsE' γ e t
 
 cconsType :: CGEnv -> CoreExpr -> SpecType -> SpecType -> CG ()
 cconsType γ e te t = do
-  te' <- instantiatePreds γ e te >>= addPost γ
+  te' <- instantiatePreds γ te >>= addPost γ
   addC (SubC γ te' t) ("cconsE: " ++ "\n t = " ++ showpp t ++ "\n te = " ++ showpp te ++ GM.showPpr e)
 
 lambdaSingleton :: CGEnv -> F.TCEmb TyCon -> Var -> CoreExpr -> CG UReft
@@ -826,14 +1063,13 @@ splitConstraints _ t =
 --   in the body.
 -------------------------------------------------------------------
 instantiatePreds :: CGEnv
-                 -> CoreExpr
                  -> SpecType
                  -> CG SpecType
-instantiatePreds γ e (RAllP π t)
-  = do r <- freshPredRef γ e π
-       instantiatePreds γ e $ replacePreds "consE" t [(π, r)]
+instantiatePreds γ (RAllP π t)
+  = do r <- freshPredRef γ π
+       instantiatePreds γ $ replacePreds "consE" t [(π, r)]
 
-instantiatePreds _ _ t0
+instantiatePreds _ t0
   = return t0
 
 
@@ -1042,9 +1278,14 @@ collectVars (Case e x _ alts) =
 collectVars _ = []
 
 consEApp :: CGEnv -> CoreExpr -> CG SpecType
-consEApp γ e'@(App e a@(Type τ)) =
+consEApp = consEAppUsing consE
+
+-- The function's source judgment can differ at an admitted subsumption site.
+-- Its arguments still use the ordinary environment and argument checker.
+consEAppUsing :: (CGEnv -> CoreExpr -> CG SpecType) -> CGEnv -> CoreExpr -> CG SpecType
+consEAppUsing synthesize γ e'@(App e a@(Type τ)) =
     do
-        RAllT α te _ <- checkAll ("Non-all TyApp with expr", e) γ <$> consE γ e
+        RAllT α te _ <- checkAll ("Non-all TyApp with expr", e) γ <$> synthesize γ e
         -- Runtime dictionaries are checked arguments. Their constructor-field
         -- variance, not a class-name whitelist, constrains instantiation.
         t <-
@@ -1053,7 +1294,7 @@ consEApp γ e'@(App e a@(Type τ)) =
                 else trueTy (typeclass (getConfig γ)) τ
         addW $ WfC γ t
         t' <- refreshVV t
-        tt0 <- instantiatePreds γ e' (subsTyVarMeetWith (emb γ) (ty_var_value α, t') te)
+        tt0 <- instantiatePreds γ (subsTyVarMeetWith (emb γ) (ty_var_value α, t') te)
         let tyVarSym = F.symbol (ty_var_value α)
             tyVarSort = typeSort (emb γ) (Ghc.expandTypeSynonyms τ)
             tt0' = addTyVarSubToKVars tyVarSym tyVarSort tt0
@@ -1063,7 +1304,7 @@ consEApp γ e'@(App e a@(Type τ)) =
             Nothing -> tt
   where
     isPos α = not (extensionality (getConfig γ)) || rtv_is_pol (ty_var_info α)
-consEApp γ e'@(App e a) | Just aDict <- getExprDict γ a =
+consEAppUsing synthesize γ e'@(App e a) | Just aDict <- getExprDict γ a =
     case getExprFun e a >>= dhasinfo (dlookup (denv γ) aDict) of
         Just riSig | recursiveFields aDict -> do
             actual <- ordinaryApplication
@@ -1071,18 +1312,75 @@ consEApp γ e'@(App e a) | Just aDict <- getExprDict γ a =
             -- field bound. Returning the latter also checks partial/value uses.
             addC (SubC γ (fromRISig riSig) actual) "recursive dictionary selector contract"
             return actual
-        Just riSig -> return $ fromRISig riSig
+        Just riSig -> do
+            actual <- ordinaryApplication
+            addC (SubC γ (fromRISig riSig) actual) "dictionary selector contract"
+            return $ fromRISig riSig
         _ -> ordinaryApplication
   where
     recursiveFields aDict =
         isJust (recursiveDictionary γ a)
             || maybe False (isJust . recursiveDictionary γ) (M.lookup (F.symbol aDict) (lcb γ))
-    ordinaryApplication = snd <$> consEAppWith γ e' e (argExpr γ a) (\γ' -> cconsE γ' a)
-consEApp γ e'@(App e a) =
+    ordinaryApplication = snd <$> consEAppWith synthesize γ e' e (argExpr γ a) (\γ' -> sourceArgument γ' e' a)
+consEAppUsing synthesize γ e'@(App e a) =
     do
-        (γ', t) <- consEAppWith γ e' e (argExpr γ $ simplify a) (\γ' -> cconsE γ' a)
+        (γ', t) <- consEAppWith synthesize γ e' e (argExpr γ $ simplify a) (\γ' -> sourceArgument γ' e' a)
         return $ scopedConstructorIntroduction γ' e' (makeSingleton γ' (simplify e') t)
-consEApp _ _ = panic Nothing "Constraint.Generate.consEApp called on invalid inputs"
+consEAppUsing _ _ _ = panic Nothing "Constraint.Generate.consEApp called on invalid inputs"
+
+-- Subsumption changes this source value's view, not the surrounding callable
+-- environment. Every actual argument and every residual expected refinement
+-- is checked by the ordinary application and subtyping judgments.
+sourceArgument :: CGEnv -> CoreExpr -> CoreExpr -> SpecType -> CG ()
+sourceArgument γ site = sourceArgumentAt γ (constructorField site)
+  where
+    constructorField expression = case collectArgs expression of
+        (Var headOwner, arguments)
+            | Just constructor <- sourceConstructor headOwner
+            , null (Ghc.dataConExTyCoVars constructor)
+            , Ghc.dataConWrapperType constructor `eqType` varType headOwner
+            , let (_, fields) = span isTypeArg arguments
+            , not (null fields) ->
+                Just (constructor, length fields - 1)
+        _ -> Nothing
+    sourceConstructor owner = case idDetails owner of
+        DataConWorkId constructor -> Just constructor
+        DataConWrapId constructor -> Just constructor
+        _ -> Nothing
+
+sourceArgumentAt :: CGEnv -> Maybe (Ghc.DataCon, Int) -> CoreExpr -> SpecType -> CG ()
+sourceArgumentAt γ origin argument expected = do
+    AdmittedInterfaces interfaces <- gets admittedInterfaces
+    case origin >>= \(constructor, index) -> admittedField interfaces constructor index of
+        Just (owner, interface) -> do
+            actual <- synthesizeInterface owner interface γ argument
+            cconsType γ argument actual expected
+        Nothing -> cconsE γ argument expected
+  where
+    admittedField interfaces constructor index = do
+        dictionary <- cgVar γ
+        guard (isDFunId dictionary)
+        let (_, _, cls, _) = Ghc.tcSplitDFunTy (varType dictionary)
+        guard (constructor == Ghc.classDataCon cls)
+        selector <- atIndex (Ghc.classAllSelIds cls) index
+        let program = giCbs (giSrc (cgInfo γ))
+        owner <- lookup selector =<< instanceDictionaryOwners program dictionary
+        body <- lookup dictionary (flattenBinds program)
+        let (parameters, _) = collectBinders body
+        guard (argument `eqCoreExpr` mkVarApps (Var owner) parameters)
+        case [val ty | (actualOwner, method@MT{}) <- interfaces, actualOwner == owner, methodOrigin method == Just (dictionary, selector), Just ty <- [tyClass method]] of
+            [ty] | toType False ty `eqType` varType owner -> Just (owner, ty)
+            _ -> Nothing
+    atIndex values index = case drop index values of
+        value : _ -> Just value
+        [] -> Nothing
+
+synthesizeInterface :: Var -> SpecType -> CGEnv -> CoreExpr -> CG SpecType
+synthesizeInterface owner interface γ expression = case expression of
+    Var actual | actual == owner -> varRefType' γ owner <$> refreshVV interface
+    App{} -> consEAppUsing (synthesizeInterface owner interface) γ expression
+    Tick tick body -> synthesizeInterface owner interface (γ `setLocation` Sp.Tick tick) body
+    _ -> consE γ expression
 
 -- The actual constructor application has already passed ordinary argument
 -- checking. Its native prefix supplies the entire instantiated source telescope;
@@ -1133,17 +1431,17 @@ scopedConstructorFacts γ dc actual fields
 
 -- Ordinary applications and synthesized coercion endpoints use the same
 -- argument judgment, differing only in how the actual argument is checked.
-consEAppWith :: CGEnv -> CoreExpr -> CoreExpr -> Maybe F.Expr -> (CGEnv -> SpecType -> CG ()) -> CG (CGEnv, SpecType)
-consEAppWith γ site function actual checkArgument = do
-  ([], πs, te) <- bkUniv <$> consE γ function
-  te1 <- instantiatePreds γ site $ foldr RAllP te πs
-  (γ', te2) <- dropExists γ te1
-  te3 <- dropConstraints γ te2
-  updateLocA (exprLoc function) te3
-  let RFun x _ tx t _ = checkFun ("Non-fun App with caller ", site) γ te3
-  checkArgument γ' tx
-  result <- addPost γ' $ maybe (checkUnbound γ' site x t actual) (F.subst1 t . (x,)) actual
-  return (γ', result)
+consEAppWith :: (CGEnv -> CoreExpr -> CG SpecType) -> CGEnv -> CoreExpr -> CoreExpr -> Maybe F.Expr -> (CGEnv -> SpecType -> CG ()) -> CG (CGEnv, SpecType)
+consEAppWith synthesize γ site function actual checkArgument = do
+    ([], πs, te) <- bkUniv <$> synthesize γ function
+    te1 <- instantiatePreds γ $ foldr RAllP te πs
+    (γ', te2) <- dropExists γ te1
+    te3 <- dropConstraints γ te2
+    updateLocA (exprLoc function) te3
+    let RFun x _ tx t _ = checkFun ("Non-fun App with caller ", site) γ te3
+    checkArgument γ' tx
+    result <- addPost γ' $ maybe (checkUnbound γ' site x t actual) (F.subst1 t . (x,)) actual
+    return (γ', result)
 
 -- A checked constructor equality identifies its stored field, but does not
 -- replace the selector's source contract. Infer extra result facts under that
@@ -1157,7 +1455,7 @@ refineDictionarySelection γ expression source
             | otherwise = mempty
       case resultTemplate refinement source of
         Just (goal, candidate) -> do
-          instantiated <- instantiatePreds γ expression field
+          instantiated <- instantiatePreds γ field
           addW (WfC γ (mapReft onlyNew goal))
           addC (SubC γ instantiated goal) "checked dictionary field projection"
           return candidate
@@ -1319,16 +1617,16 @@ unRRTy (RRTy _ _ _ t) = unRRTy t
 unRRTy t              = t
 
 --------------------------------------------------------------------------------
-castTy  :: CGEnv -> Type -> CoreExpr -> Coercion -> CG SpecType
+castTy :: CGEnv -> Type -> CoreExpr -> Coercion -> CG SpecType
 --------------------------------------------------------------------------------
 castTy γ t e co
     | Just (dc, direction) <- newtypeCoercionDataCon co =
         do
             checked <- case direction of
                 UnwrapCoercion -> do
-                    input <- consE γ e >>= instantiatePreds γ e >>= addPost γ
+                    input <- consE γ e >>= instantiatePreds γ >>= addPost γ
                     castTyNewtypeUnwrap γ t input (argExpr γ e) dc
-                WrapCoercion -> castTyNewtypeWrap γ t e (argExpr γ e) (\γ' -> cconsE γ' e) dc
+                WrapCoercion -> castTyNewtypeWrap γ t e (argExpr γ e) (\γ' -> sourceArgumentAt γ' (Just (dc, 0)) e) dc
             -- Use the same interpretation as reflection, after structural checking.
             -- No expected refinement participates in interpreting the actual cast.
             meaning <- lamExpr γ (Cast e co)
@@ -1348,16 +1646,16 @@ castTy γ _ e co = do
 -- See note [Newtype checking]
 castTyNewtypeWrap :: CGEnv -> Type -> CoreExpr -> Maybe F.Expr -> (CGEnv -> SpecType -> CG ()) -> Ghc.DataCon -> CG SpecType
 castTyNewtypeWrap γ τ site actual checkArgument dc
-  | Just (_, tyArgs) <- Ghc.splitTyConApp_maybe τ =
-      do
-        -- The declared field obligation precedes constructor application and is
-        -- instantiated independently from its argument obligation.
-        mtc <- lookupNewType (Ghc.dataConTyCon dc)
-        forM_ mtc $ checkArgument γ
-        let constructor = foldl App (Var (Ghc.dataConWorkId dc)) (map Type tyArgs)
-        snd <$> consEAppWith γ site constructor actual checkArgument
-  | otherwise =
-      panic (Just (getLocation γ)) "Newtype wrap requires its target datatype application"
+    | Just (_, tyArgs) <- Ghc.splitTyConApp_maybe τ =
+        do
+            -- The declared field obligation precedes constructor application and is
+            -- instantiated independently from its argument obligation.
+            mtc <- lookupNewType (Ghc.dataConTyCon dc)
+            forM_ mtc $ checkArgument γ
+            let constructor = foldl App (Var (Ghc.dataConWorkId dc)) (map Type tyArgs)
+            snd <$> consEAppWith consE γ site constructor actual checkArgument
+    | otherwise =
+        panic (Just (getLocation γ)) "Newtype wrap requires its target datatype application"
 
 -- A newtype projection eliminates its one constructor. Instantiate that
 -- constructor exactly as caseEnv does, then transfer its declared equations
@@ -1400,7 +1698,7 @@ checkNewtypeCoercion γ co dc direction source target = do
     checked <- case direction of
         WrapCoercion -> castTyNewtypeWrap γ' τ site (Just actual) (\env -> cconsType env site input) dc
         UnwrapCoercion -> do
-            prepared <- instantiatePreds γ' site input >>= addPost γ'
+            prepared <- instantiatePreds γ' input >>= addPost γ'
             castTyNewtypeUnwrap γ' τ prepared (Just actual) dc
     meaning <- logicExpr γ' (castToLg co actual)
     addC (SubC γ' (checked `strengthen` maybe mempty (uTop . F.uexprReft) meaning) target) "newtype coercion endpoint"
@@ -1609,15 +1907,6 @@ varAnn γ x t
 -----------------------------------------------------------------------
 -- | Helpers: Creating Fresh Refinement -------------------------------
 -----------------------------------------------------------------------
-freshPredRef :: CGEnv -> CoreExpr -> PVar RSort -> CG SpecProp
-freshPredRef γ e (PV _ rsort as)
-  = do t    <- freshTyType (typeclass (getConfig γ))  PredInstE e (toType False rsort)
-       args <- mapM (const fresh) as
-       let targs = [(x, s) | (x, (s, y, z)) <- zip args as, F.EVar y == z ]
-       γ' <- foldM (+=) γ [("freshPredRef", x, ofRSort τ) | (x, τ) <- targs]
-       addW $ WfC γ' t
-       return $ RProp targs t
-
 --------------------------------------------------------------------------------
 -- | Helpers: Creating Refinement Types For Various Things ---------------------
 --------------------------------------------------------------------------------
@@ -1632,12 +1921,13 @@ argType _                    = Nothing
 
 
 argExpr :: CGEnv -> CoreExpr -> Maybe F.Expr
-argExpr _ (Var v)          = Just $ F.eVar v
-argExpr γ (Lit c)          = snd $ literalConst (emb γ) c
-argExpr γ e@App{}          | Just l <- boxedLiteralExpr γ e = Just l
-argExpr γ (Tick _ e)       = argExpr γ e
+argExpr γ e | Just meaning <- wiredBoolean (emb γ) e = Just meaning
+argExpr _ (Var v) = Just $ F.eVar v
+argExpr γ (Lit c) = snd $ literalConst (emb γ) c
+argExpr γ e@App{} | Just l <- boxedLiteralExpr γ e = Just l
+argExpr γ (Tick _ e) = argExpr γ e
 argExpr γ (App e (Type _)) = argExpr γ e
-argExpr _ _                = Nothing
+argExpr _ _ = Nothing
 
 
 lamExpr :: CGEnv -> CoreExpr -> CG (Maybe F.Expr)
@@ -1736,6 +2026,8 @@ varRefType' γ x t'
 -- | create singleton types for function application
 makeSingleton :: CGEnv -> CoreExpr -> SpecType -> SpecType
 makeSingleton γ cexpr t
+    | Just e <- wiredBoolean (emb γ) (simplify cexpr) =
+        strengthenMeet t (uTop $ F.exprReft e)
     | Just e <- boxedLiteralExpr γ (simplify cexpr) =
         strengthenMeet t (uTop $ F.exprReft e)
     | higherOrderFlag γ

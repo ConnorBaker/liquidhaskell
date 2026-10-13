@@ -16,6 +16,8 @@ module Language.Haskell.Liquid.Bare.Elaborate
   ( elaborateSpecTypeWithPrimitives
   , kindCheckLogicalMeasure
   , alignQueryTelescope
+  , renameCheckedPredicateOwner
+  , interpretCheckedPredicate
   , freshenQueryTelescope
   -- , buildSimplifier
   )
@@ -34,7 +36,7 @@ import           Language.Haskell.Liquid.Types.Errors
 import           Language.Haskell.Liquid.Types.RType
 import           Language.Haskell.Liquid.Types.RTypeOp
 import           Language.Haskell.Liquid.Types.RefType
-                                                ( ofType, strengthen, strengthenWith, subsTyVarMeet', subts, typeSort, uTop, updateRTVar )
+                                                ( ofType, strengthen, strengthenWith, subsTyVarMeet', subts, typeSort, uTop, updateRTVar, specTypeToQueryType )
 import qualified Language.Haskell.Liquid.Types.Types as T
 import qualified Language.Haskell.Liquid.Bare.Axiom as Axiom
 import qualified Language.Haskell.Liquid.Measure as Measure
@@ -54,7 +56,7 @@ import GHC.Tc.Types.Origin (ReportRedundantConstraints (NoRRC))
 import GHC.Types.Name (mkExternalName)
 import GHC.Types.Name.Occurrence
 import GHC.Types.Name.Reader (rdrNameOcc)
-import GHC.Core.Type (mkAppTy, mkInvisFunTy, mkSpecForAllTy, mkTYPEapp, mkVisFunTyMany, typeKind)
+import GHC.Core.Type (getTyVar_maybe, mkSpecForAllTy, mkTYPEapp, typeKind)
 import GHC.Core.Predicate (isCoVarType)
 import qualified GHC.Tc.Utils.TcType as TcType
 import GHC.Core.TyCon (Role (Nominal), isVisibleTyConBinder, isInferredTyConBinder, mkAnonTyConBinder)
@@ -283,39 +285,37 @@ freshenQueryTelescope bindSelf reserved original = State.evalState (go M.empty o
 -- scoped and nominal: equal logical sorts never identify different carriers.
 -- Logical predicate quantifiers introduce no GHC lambda. Dictionaries are
 -- paired by their checked types, independently of their printed names.
-alignQueryTelescope :: SpecType -> CoreExpr -> Either String ([(Id, F.Expr)], [(F.Symbol, F.Sort)])
-alignQueryTelescope = go [] [] [] []
+alignQueryTelescope :: SpecType -> CoreExpr -> Either String T.QueryTelescope
+alignQueryTelescope = go [] [] []
   where
-    go sourceTypes actualTypes terms sorts signature (Tick _ expression) =
-        go sourceTypes actualTypes terms sorts signature expression
+    go sourceTypes actualTypes terms signature (Tick _ expression) =
+        go sourceTypes actualTypes terms signature expression
     -- A nonrecursive let introduces no type or source-arrow parameter. Look
     -- through its body only for telescope metadata; the caller retains the
     -- whole checked Core, including this binding, for checking and readback.
-    go sourceTypes actualTypes terms sorts signature (Let (NonRec _ _) expression) =
-        go sourceTypes actualTypes terms sorts signature expression
-    go sourceTypes actualTypes terms sorts (RAllP _ rest) expression =
-        go sourceTypes actualTypes terms sorts rest expression
-    go sourceTypes actualTypes terms sorts (RAllT (ty_var_value -> RTV source) rest _) (Lam actual expression)
+    go sourceTypes actualTypes terms signature (Let (NonRec _ _) expression) =
+        go sourceTypes actualTypes terms signature expression
+    go sourceTypes actualTypes terms (RAllP _ rest) expression =
+        go sourceTypes actualTypes terms rest expression
+    go sourceTypes actualTypes terms (RAllT (ty_var_value -> RTV source) rest _) (Lam actual expression)
         | isTyVar source && isTyVar actual
         , eqType (substTyWith sourceTypes actualTypes (tyVarKind source)) (tyVarKind actual) =
-            go (sourceTypes ++ [source]) (actualTypes ++ [mkTyVarTy actual]) terms
-                (sorts ++ [(F.symbol actual, F.FObj (F.symbol source))]) rest expression
-    go _ _ terms _ (RFun name _ domain _ _) _
+            go (sourceTypes ++ [source]) (actualTypes ++ [mkTyVarTy actual]) terms rest expression
+    go _ _ terms (RFun name _ domain _ _) _
         | isClassType domain
-        , any (\(actual, meaning) -> isDictId actual && meaning == F.EVar name) terms =
+        , any (\(owner, actual) -> isDictId actual && owner == name) terms =
             Left "Distinct query dictionaries share an explicit source owner"
-    go sourceTypes actualTypes terms sorts (RFun name _ domain rest _) (Lam actual expression)
+    go sourceTypes actualTypes terms (RFun name _ domain rest _) (Lam actual expression)
         | let expected = substTyWith sourceTypes actualTypes (specTypeToQueryType domain)
         , isId actual
         , isCoVar actual == isCoVarType expected
         , eqType expected (varType actual) =
-            go sourceTypes actualTypes
-                (if isCoVar actual then terms else terms ++ [(actual, F.EVar name)]) sorts rest expression
-    go sourceTypes actualTypes terms sorts result expression
+            go sourceTypes actualTypes (terms ++ [(name, actual)]) rest expression
+    go sourceTypes actualTypes terms result expression
         | not (hasBinder result)
         , eqType (substTyWith sourceTypes actualTypes (specTypeToQueryType result)) (exprType expression) =
-            Right (terms, sorts)
-    go sourceTypes actualTypes _ _ signature expression =
+            Right (T.QueryTelescope (zip sourceTypes actualTypes) terms)
+    go sourceTypes actualTypes _ signature expression =
         Left $ "GHC predicate elaboration changed its typed source telescope\nExpected remaining type: "
             ++ showPprQualified (substTyWith sourceTypes actualTypes (specTypeToQueryType signature))
             ++ "\nActual remaining type: " ++ showPprQualified (exprType expression)
@@ -324,6 +324,46 @@ alignQueryTelescope = go [] [] [] []
     hasBinder RAllP{} = True
     hasBinder RFun{} = True
     hasBinder _ = False
+
+-- Re-present one checked value owner in its resident refinement namespace.
+-- This is alpha-renaming, not an application to an arbitrary logical actual:
+-- retain the checked formal/Core identities and their nominal type images,
+-- while acting simultaneously on both views of the closure's interpretation.
+renameCheckedPredicateOwner :: Type -> F.Symbol -> F.Symbol -> T.CheckedPredicate -> Either String T.CheckedPredicate
+renameCheckedPredicateOwner expected source destination checked =
+    case [actual | (owner, actual) <- T.queryValueOwners telescope, owner == source, isId actual, not (isCoVar actual)] of
+        [actual]
+            | eqType (varType actual) nominal ->
+                Right
+                    checked
+                        { T.predicateReadback = readback
+                        , T.predicateDefinitions = [(owner, F.subst action meaning) | (owner, meaning) <- T.predicateDefinitions checked]
+                        , T.predicateSupport = T.retainLogicSupport (F.syms readback) (T.predicateSupport checked)
+                        }
+        _ -> Left "Refinement owner renaming lacks its exact checked nominal carrier"
+  where
+    telescope = T.predicateTelescope checked
+    images = T.queryTypeOwners telescope
+    nominal = substTyWith (map fst images) (map snd images) expected
+    action = F.mkSubst [(source, F.EVar destination)]
+    readback = F.subst action (T.predicateReadback checked)
+
+-- Core and its denotations use the checked native type owners. Only the final
+-- interpretation projects those coordinates into the authored sort namespace.
+-- Derive this action from the same nominal alignment, also when reinterpreting
+-- a transported closure; the stored readback is not an input to interpretation.
+interpretCheckedPredicate ::
+    (F.TCEmb TyCon -> [(Id, F.Expr)] -> CoreExpr -> (F.Expr, T.LogicSupport)) ->
+    T.CheckedPredicate ->
+    (F.Expr, T.LogicSupport)
+interpretCheckedPredicate interpret checked =
+    (readback, T.retainLogicSupport (F.syms readback) [(owner, F.sortSubst action sort) | (owner, sort) <- support])
+  where
+    (meaning, support) = interpret (T.predicateEmbeddings checked) (T.predicateDefinitions checked) (T.predicateCore checked)
+    action =
+        F.mkSortSubst
+            [(F.symbol actual, F.FObj (F.symbol source)) | (source, actualType) <- T.queryTypeOwners (T.predicateTelescope checked), Just actual <- [getTyVar_maybe actualType]]
+    readback = F.applyCoSub action meaning
 
 -- The same typed query supplies checking obligations and logical readback.
 -- Generated values have explicit denotations, while source values and their
@@ -338,10 +378,10 @@ elaborateSpecTypeWithPrimitives ::
     [(F.Symbol, TyCon, SpecType)] ->
     [(F.Symbol, Id)] ->
     [Var] ->
-    (F.TCEmb TyCon -> CoreExpr -> SpecType -> T.LogicSupport -> TcRn ()) ->
+    (T.CheckedPredicate -> TcRn ()) ->
     (F.TCEmb TyCon -> [(Id, F.Expr)] -> CoreExpr -> (F.Expr, T.LogicSupport)) ->
     SpecType ->
-    TcRn SpecType
+    TcRn T.CheckedSpecType
 elaborateSpecTypeWithPrimitives bindSelf flags native embeddings measures projections instances sources captures collect interpret ty =
     RnUtils.bindLocalNames (map getName (reverse captures)) $
         TcEnv.tcExtendTyVarEnv (filter isTyVar captures) $
@@ -357,19 +397,28 @@ elaborateSpecTypeWithPrimitives bindSelf flags native embeddings measures projec
                          in foldr mkSpecForAllTy rho variables
                     logicalDeclarationType T.MsReflect = sourceRho . specTypeToQueryType
                     logicalDeclarationType _ = specTypeToQueryType
-                    query signature expression = do
-                        (core, checkedType, logicalEmbeddings, definitions) <- primitiveQuery flags native location embeddings measures projections instances sources declarations signature expression
-                        (owners, sorts) <- case alignQueryTelescope checkedType core of
+                    query resultType signature expression = do
+                        (core, checkedType, logicalEmbeddings, definitions, parameters) <- primitiveQuery flags native location embeddings measures projections instances sources declarations resultType signature expression
+                        telescope <- case alignQueryTelescope checkedType core of
                             Left message -> uError (ErrTySpec location (Just "refinement formation") "refinement" (F.pprint signature) (PJ.text message))
                             Right alignment -> pure alignment
-                        let (meaning, support) = interpret logicalEmbeddings (definitions ++ owners) core
-                            expression' = F.sortSubstInExpr (F.mkSortSubst sorts) meaning
-                        collect logicalEmbeddings core checkedType
-                            (T.retainLogicSupport (F.syms expression') [(identifier, F.sortSubst (F.mkSortSubst sorts) sort) | (identifier, sort) <- support])
-                        pure expression'
+                        let owners = [(actual, F.EVar owner) | (owner, actual) <- T.queryValueOwners telescope, not (isCoVar actual)]
+                            (expression', support) = interpretCheckedPredicate interpret checked
+                            checked =
+                                T.CheckedPredicate
+                                    { T.predicateCore = core
+                                    , T.predicateSignature = checkedType
+                                    , T.predicateTelescope = telescope
+                                    , T.predicateReadback = expression'
+                                    , T.predicateDefinitions = definitions ++ owners
+                                    , T.predicateEmbeddings = logicalEmbeddings <> embeddings
+                                    , T.predicateSupport = support
+                                    , T.predicateLogicalParameters = parameters
+                                    }
+                        pure checked
                 let reserved = map fst wiredSortedSyms ++ [name | (name, _, _) <- measures] ++ map fst projections ++ [name | (name, _, _) <- instances] ++ map fst sources ++ map F.symbol captures ++ maybe [] (map fst . F.toListSEnv . F.seSort) native
                     named = freshenQueryTelescope bindSelf reserved ty
-                elaborateSpecType' query id named
+                elaborateSpecType' query collect id named
 
 freshenLogicalType :: SpecType -> TcRn SpecType
 -- Logical declarations distinguish synthetic variables by occurrence as
@@ -526,6 +575,9 @@ kindCheckLogicalType complete original = do
 -- These parameters interpret the logical language, not source class methods.
 -- Their result contracts preserve each original operator. They are local to
 -- the generated query and are never published as source assumptions.
+-- The body result belongs to the query's hole, not to a flattened telescope:
+-- local foralls may occur after arrows, and a future hole may itself be a
+-- function. Keep its checked nominal carrier until logical interpretation.
 primitiveQuery ::
     FC.ElabFlags ->
     Maybe F.SymEnv ->
@@ -536,10 +588,11 @@ primitiveQuery ::
     [(F.Symbol, TyCon, SpecType)] ->
     [(F.Symbol, Id)] ->
     F.SEnv F.Sort ->
+    Type ->
     SpecType ->
     F.Expr ->
-    TcRn (CoreExpr, SpecType, F.TCEmb TyCon, [(Id, F.Expr)])
-primitiveQuery flags native location embeddings measures projections instances sources declarations signature original = do
+    TcRn (CoreExpr, SpecType, F.TCEmb TyCon, [(Id, F.Expr)], [Id])
+primitiveQuery flags native location embeddings measures projections instances sources declarations resultType signature original = do
     (expression, (parameters, logicalEmbeddings, projectors)) <- State.runStateT (lower contextual) ([], mempty, [])
     (core, checkedType) <- elaborate parameters projectors expression
     -- GHC checks the complete telescope. Its exposed lambda prefix is still
@@ -554,7 +607,7 @@ primitiveQuery flags native location embeddings measures projections instances s
             ]
     if length actualParameters /= length parameters
         then die "generated primitive query lost its parameter prefix"
-        else pure (core, checkedType, logicalEmbeddings, parameterDefinitions ++ projectorDefinitions)
+        else pure (core, checkedType, logicalEmbeddings, parameterDefinitions ++ projectorDefinitions, actualParameters)
   where
     elaborate parameters projectors expression = do
         -- Source type variables scope over all primitive parameters as well.
@@ -583,7 +636,13 @@ primitiveQuery flags native location embeddings measures projections instances s
     -- annotate only the checking query; the authored refinement is unchanged.
     contextual =
         either (reject . PJ.vcat . map F.errMsg . F.errs) id $
-            SC.annotateExprEAt flags native environment "refinement formation" (Just F.boolSort) original
+            SC.annotateExprEAt
+                flags
+                native
+                environment
+                "refinement formation"
+                (Just (typeSort embeddings resultType))
+                original
       where
         -- These rows declare term values, including lexical captures. None
         -- declares a sort alias: a term label cannot give an FObj its meaning.
@@ -777,21 +836,12 @@ primitiveQuery flags native location embeddings measures projections instances s
             bridge <- freshParameter (rFun x (ofType sourceType) (equality carrier (F.EVar x))) denotation
             pure (applyQuery bridge expression)
 
-    -- Only the standard declarations identify these mathematical observations.
-    -- A same-spelled local/source binder is handled first and is never replaced.
-    role name = case F.symbolString (GM.dropModuleUnique name) of
-        "len" -> Just "len"
-        "GHC.Types_LHAssumptions.len" -> Just "len"
-        "GHC.Base_LHAssumptions.len" -> Just "len"
-        "listElts" -> Just "listElts"
-        "Data.Set_LHAssumptions.listElts" -> Just "listElts"
-        _ -> Nothing
-    isMeasure name = M.member name measureTypes || Mb.isJust (role name)
+    -- Resolution selected the declaration's actual owner. Printed roles and
+    -- equal spellings do not authorize borrowing another unit's declaration.
+    isMeasure name = M.member name measureTypes
     declaration name = case M.lookup name measureTypes of
         Just (_, ty) -> (name, ty)
-        Nothing -> case [(s, ty) | (s, _, ty) <- measures, role s == role name, role s /= Nothing] of
-            [entry] -> entry
-            _ -> die ("no unambiguous resolved measure declaration for " ++ F.showpp name)
+        Nothing -> die ("no resolved measure declaration for " ++ F.showpp name)
     selectMeasure name argument =
         let (resolved, declared) = declaration name
          in case [(receiver, ty) | (owner, receiver, ty) <- instances, owner == resolved] of
@@ -888,6 +938,7 @@ primitiveQuery flags native location embeddings measures projections instances s
     projectionInput (RAllT variable rest reft)
         | isTauto reft =
             (\result -> RAllT variable result reft) <$> projectionInput rest
+    projectionInput (RAllP predicate rest) = RAllP predicate <$> projectionInput rest
     projectionInput (RFun binder info domain _ reft)
         | isTauto reft =
             pure (RFun binder info domain (equality domain (F.EVar binder)) reft)
@@ -902,6 +953,9 @@ primitiveQuery flags native location embeddings measures projections instances s
             let (bridge, argument) = projectionValue rest
              in (RAllT variable bridge reft, argument)
         | otherwise = reject (PJ.text "first-class projection has a refined polymorphic telescope")
+    projectionValue (RAllP predicate rest) =
+        let (bridge, argument) = projectionValue rest
+         in (RAllP predicate bridge, argument)
     projectionValue ty = (rFun x ty (equality ty (F.EVar x)), ty)
 
     projector name = do
@@ -925,15 +979,16 @@ primitiveQuery flags native location embeddings measures projections instances s
         _
             | (F.EVar name, [argument]) <- application expression
             , not (isSource name)
-            , M.member name projectionCases -> do
+            , Just alternatives <- M.lookup name projectionCases -> do
                 lowered <- lower argument
                 selected <- selectMeasure name (Just lowered)
                 receiver <- operandType lowered
                 input <- projectionInput selected
                 denotation <- functionMeaning [(x, receiver)] (F.EVar x)
                 bridge <- freshParameter input denotation
-                helper <- projector name
-                pure (applyQuery helper (applyQuery bridge lowered))
+                -- Eliminate this receiver in its actual scope; a generalized
+                -- helper would infer fresh, unrelated predicate parameters.
+                pure $ \locals -> nlHsCase (applyQuery bridge lowered locals) (map fieldAlternative alternatives)
         F.EVar name | M.member name projectionCases -> do
             selected <- selectMeasure name Nothing
             helper <- projector name
@@ -1020,109 +1075,112 @@ primitiveQuery flags native location embeddings measures projections instances s
 -- dependent kinds. Class arguments remain givens, not ordinary value arrows.
 -- Existential evidence does not change a value's source type. Its lexical
 -- scope is opened as an explicit query binder when checking its body below.
-specTypeToQueryType :: SpecType -> Type
-specTypeToQueryType = go
-  where
-    go (RLit l) = LitTy l
-    go (RVar (RTV tv) _) = mkTyVarTy tv
-    go (RFun _ _ domain result _)
-        | isClassType domain = mkInvisFunTy (go domain) (go result)
-        | otherwise = mkVisFunTyMany (go domain) (go result)
-    go (RAllT (ty_var_value -> RTV tv) rest _) = mkSpecForAllTy tv (go rest)
-    go (RAllP _ rest) = go rest
-    go (RApp RTyCon{rtc_tc = tc} arguments _ _) = mkTyConApp tc (map go (filter notExprArg arguments))
-    go (REx _ _ result) = go result
-    go (RAppTy _ RExprArg{} _) = impossible Nothing "RExprArg in generated predicate telescope"
-    go (RAppTy function argument _) = mkAppTy (go function) (go argument)
-    go (RRTy _ _ _ rest) = go rest
-    go ty = panic Nothing ("Unsupported generated predicate telescope: " ++ F.showpp ty)
-
-elaborateSpecType'
-  :: (SpecType -> F.Expr -> TcRn F.Expr)
-  -> (SpecType -> SpecType)
-  -> SpecType
-  -> TcRn SpecType
+elaborateSpecType' ::
+    (Type -> SpecType -> F.Expr -> TcRn T.CheckedPredicate) ->
+    (T.CheckedPredicate -> TcRn ()) ->
+    (SpecType -> SpecType) ->
+    SpecType ->
+    TcRn T.CheckedSpecType
 -- The context has exactly one hole: the result of the enclosing telescope.
 -- Every query interprets its own checked binders, so sibling types need no
 -- reconciliation of GHC-generated dictionary names.
-elaborateSpecType' query scope t =
-  case t of
-    RVar variable reft -> refine (reft, t) (RVar variable)
-    RFun binder info domain result reft -> do
-      domain' <- elaborateSpecType' query scope domain
-      result' <- elaborateSpecType' query (scope . (\rest -> RFun binder info domain' rest reft)) result
-      refine (reft, RFun binder info domain' result' reft) (RFun binder info domain' result')
-    RAllT variable rest reft -> do
-      rest' <- elaborateSpecType' query (scope . (\result -> RAllT variable result reft)) rest
-      refine (reft, RVar (ty_var_value variable) mempty) (RAllT variable rest')
-    RAllP predicate rest ->
-      RAllP predicate <$> elaborateSpecType' query (scope . RAllP predicate) rest
-    RApp constructor arguments predicates reft
-      | isClass constructor -> pure t
-      | otherwise -> do
-          arguments' <- traverse (elaborateSpecType' query scope) arguments
-          refine (reft, RApp constructor arguments' predicates reft) (RApp constructor arguments' predicates)
-    RAppTy function argument reft -> do
-      function' <- elaborateSpecType' query scope function
-      argument' <- elaborateSpecType' query scope argument
-      refine (reft, RAppTy function' argument' reft) (RAppTy function' argument')
-    -- A witness scopes over the predicate, not the represented calling convention.
-    REx binder witness rest -> do
-      witness' <- elaborateSpecType' query scope witness
-      rest' <- elaborateSpecType' query (scope . (\result -> RFun binder defRFInfo witness' result mempty)) rest
-      pure (REx binder witness' rest')
-    RLit _ -> pure t
-    RExprArg _ -> impossible Nothing "RExprArg should not appear here"
-    RHole _ -> impossible Nothing "RHole should not appear here"
-    RRTy environment reft OCons rest ->
-      RRTy <$> elaborateConstraint scope environment <*> pure reft <*> pure OCons <*> elaborateSpecType' query scope rest
-    RRTy{} -> todo Nothing ("Not sure how to elaborate RRTy" ++ F.showpp t)
- where
-  -- OCons stores a lexical context followed by two subtype endpoints.
-  -- Its context scopes over those endpoints, independently of the payload.
-  elaborateConstraint context [(left, lhs), (right, rhs)] =
-      (\lhs' rhs' -> [(left, lhs'), (right, rhs')])
-          <$> elaborateSpecType' query context lhs
-          <*> elaborateSpecType' query context rhs
-  elaborateConstraint context ((binder, domain) : rest) = do
-      domain' <- elaborateSpecType' query context domain
-      rest' <- elaborateConstraint (context . (\result -> RFun binder defRFInfo domain' result mempty)) rest
-      pure ((binder, domain') : rest')
-  elaborateConstraint _ [] = impossible Nothing "Subtype obligation has fewer than two endpoints"
+elaborateSpecType' query collect scope t =
+    case t of
+        RVar variable reft -> refine (reft, t) (RVar variable)
+        RFun binder info domain result reft -> do
+            domain' <- elaborateSpecType' query collect scope domain
+            result' <- elaborateSpecType' query collect (scope . (\rest -> RFun binder info (T.ordinarySpecType domain') rest reft)) result
+            refine (reft, RFun binder info (T.ordinarySpecType domain') (T.ordinarySpecType result') reft) (RFun binder info domain' result')
+        RAllT variable rest reft -> do
+            rest' <- elaborateSpecType' query collect (scope . (\result -> RAllT variable result reft)) rest
+            refine (reft, RVar (ty_var_value variable) mempty) (RAllT variable rest')
+        RAllP predicate rest ->
+            RAllP predicate <$> elaborateSpecType' query collect (scope . RAllP predicate) rest
+        RApp constructor arguments predicates reft
+            | isClass constructor -> pure (T.logicalSpecType t)
+            | otherwise -> do
+                arguments' <- traverse (elaborateSpecType' query collect scope) arguments
+                predicates' <- traverse elaborateProperty predicates
+                refine (reft, RApp constructor (map T.ordinarySpecType arguments') (map (fmap T.ordinarySpecType) predicates') reft) (RApp constructor arguments' predicates')
+        RAppTy function argument reft -> do
+            function' <- elaborateSpecType' query collect scope function
+            argument' <- elaborateSpecType' query collect scope argument
+            refine (reft, RAppTy (T.ordinarySpecType function') (T.ordinarySpecType argument') reft) (RAppTy function' argument')
+        -- A witness scopes over the predicate, not the represented calling convention.
+        REx binder witness rest -> do
+            witness' <- elaborateSpecType' query collect scope witness
+            rest' <- elaborateSpecType' query collect (scope . (\result -> RFun binder defRFInfo (T.ordinarySpecType witness') result mempty)) rest
+            pure (REx binder witness' rest')
+        RLit literal -> pure (RLit literal)
+        RExprArg _ -> impossible Nothing "RExprArg should not appear here"
+        RHole _ -> impossible Nothing "RHole should not appear here"
+        RRTy environment reft OCons rest ->
+            RRTy <$> elaborateConstraint scope environment <*> pure (T.CheckedRefinement reft []) <*> pure OCons <*> elaborateSpecType' query collect scope rest
+        RRTy{} -> todo Nothing ("Not sure how to elaborate RRTy" ++ F.showpp t)
+  where
+    elaborateProperty (RProp binders body@RHole{}) = pure (RProp binders (T.logicalSpecType body))
+    elaborateProperty (RProp binders body) =
+        RProp binders <$> elaborateSpecType' query collect (scope . propertyContext) body
+      where
+        propertyContext result = foldr (\(owner, carrier) rest -> RFun owner defRFInfo (ofRSort carrier) rest mempty) result binders
 
-  boolType = RApp (RTyCon boolTyCon [] defaultTyConInfo) [] [] mempty :: SpecType
-  refine (original@(MkUReft (F.Reft (value, predicate)) abstract), valueType) rebuild
-      -- Inference placeholders have no source predicate to elaborate.
-      | T.isHole predicate || predicate == F.PTrue = pure (rebuild original)
-      | otherwise = do
-          let originalQuery = scope (rFun' (classRFInfo True) value valueType boolType)
-              occupied = querySourceSymbols originalQuery `S.union` F.syms predicate
-              (_, queryValue) = F.freshInNS value occupied
-              queryType = scope (rFun' (classRFInfo True) queryValue valueType boolType)
-          expression <- query (eraseCheckedRefinement queryType) (F.subst1 predicate (value, F.EVar queryValue))
-          pure (rebuild (MkUReft (F.Reft (value, F.subst1 expression (queryValue, F.EVar value))) abstract))
+    -- OCons stores a lexical context followed by two subtype endpoints.
+    -- Its context scopes over those endpoints, independently of the payload.
+    elaborateConstraint context [(left, lhs), (right, rhs)] =
+        (\lhs' rhs' -> [(left, lhs'), (right, rhs')])
+            <$> elaborateSpecType' query collect context lhs
+            <*> elaborateSpecType' query collect context rhs
+    elaborateConstraint context ((binder, domain) : rest) = do
+        domain' <- elaborateSpecType' query collect context domain
+        rest' <- elaborateConstraint (context . (\result -> RFun binder defRFInfo (T.ordinarySpecType domain') result mempty)) rest
+        pure ((binder, domain') : rest')
+    elaborateConstraint _ [] = impossible Nothing "Subtype obligation has fewer than two endpoints"
 
-  eraseCheckedRefinement (RAllT variable rest reft) = RAllT variable (eraseCheckedRefinement rest) reft
-  eraseCheckedRefinement (RAllP predicate rest) = RAllP predicate (eraseCheckedRefinement rest)
-  eraseCheckedRefinement (RFun binder info domain result reft)
-    | hasValueArgument result = RFun binder info domain (eraseCheckedRefinement result) reft
-    | otherwise = RFun binder info
-        (eraseRootContract domain)
-        (eraseRootContract result)
-        reft
-  eraseCheckedRefinement ty = eraseRootContract ty
+    boolType = RApp (RTyCon boolTyCon [] defaultTyConInfo) [] [] mempty :: SpecType
+    refine (original@(MkUReft (F.Reft (value, predicate)) abstract), valueType) rebuild
+        -- Inference placeholders have no source predicate to elaborate.
+        | T.isHole predicate || predicate == F.PTrue = pure (rebuild (T.CheckedRefinement original []))
+        | otherwise = do
+            let originalQuery = scope (rFun' (classRFInfo True) value valueType boolType)
+                occupied = querySourceSymbols originalQuery `S.union` F.syms predicate
+                (_, queryValue) = F.freshInNS value occupied
+                queryType = scope (rFun' (classRFInfo True) queryValue valueType boolType)
+            checked <- query (specTypeToQueryType boolType) (eraseCheckedRefinement queryType) (F.subst1 predicate (value, F.EVar queryValue))
+            resident <- case renameCheckedPredicateOwner (specTypeToQueryType valueType) queryValue value checked of
+                Left message -> do
+                    location <- getSrcSpanM
+                    uError (ErrTySpec location (Just "refinement formation") "refinement" (F.pprint queryType) (PJ.text message))
+                Right renamed -> pure renamed
+            collect resident
+            pure (rebuild (T.CheckedRefinement (MkUReft (F.Reft (value, F.PTrue)) abstract) [resident]))
 
-  -- Formation cannot assume the predicate currently being established. Its
-  -- represented value still has its independently elaborated child contracts.
-  -- Retain the value owner for children whose scope includes the container.
-  eraseRootContract ty =
-      let F.Reft (value, _) = rTypeReft ty
-       in strengthenWith (\_ replacement -> replacement) ty (MkUReft (F.Reft (value, F.PTrue)) mempty)
+    eraseCheckedRefinement (RAllT variable rest reft) = RAllT variable (eraseCheckedRefinement rest) reft
+    eraseCheckedRefinement (RAllP predicate rest) = RAllP predicate (eraseCheckedRefinement rest)
+    eraseCheckedRefinement (RFun binder info domain result reft)
+        | hasValueArgument result = RFun binder info domain (eraseCheckedRefinement result) reft
+        | otherwise =
+            RFun
+                binder
+                info
+                (eraseRootContract domain)
+                (eraseRootContract result)
+                reft
+    eraseCheckedRefinement ty = eraseRootContract ty
 
-  hasValueArgument (RAllT _ rest _) = hasValueArgument rest
-  hasValueArgument (RAllP _ rest) = hasValueArgument rest
-  hasValueArgument RFun{} = True
-  hasValueArgument _ = False
+    -- Formation cannot assume the concrete predicate being established. The
+    -- independent abstract membership and child contracts still determine
+    -- where that source predicate must be admitted.
+    eraseRootContract :: SpecType -> SpecType
+    eraseRootContract ty =
+        strengthenWith
+            (\original _ -> original{ur_reft = F.Reft (F.reftBind $ ur_reft original, F.PTrue)})
+            ty
+            mempty
+
+    hasValueArgument (RAllT _ rest _) = hasValueArgument rest
+    hasValueArgument (RAllP _ rest) = hasValueArgument rest
+    hasValueArgument RFun{} = True
+    hasValueArgument _ = False
 
 -- | Embed fixpoint expressions into parsed haskell expressions.
 --   It allows us to bypass the GHC parser and use arbitrary symbols

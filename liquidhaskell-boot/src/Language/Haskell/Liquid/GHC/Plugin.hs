@@ -19,6 +19,7 @@ import qualified Liquid.GHC.API         as O
 import           Liquid.GHC.API         as GHC hiding (Type)
 import           GHC.Data.FastString    (LexicalFastString (..))
 import           GHC.Driver.Session    (targetPlatform)
+import           GHC.Unit.Module.ModSummary (ms_textual_imps)
 import GHC.Cmm.Utils (mAX_PTR_TAG)
 import GHC.Platform (platformWordSizeInBits)
 import qualified Text.PrettyPrint.HughesPJ               as PJ
@@ -51,6 +52,8 @@ import           Control.Exception (SomeException, fromException, someExceptionC
 import           GHC.Data.IOEnv (IOEnvFailure)
 import           Control.Exception.Context
 import           Control.Monad.IO.Class (MonadIO)
+import qualified Control.Monad.State.Strict as State
+import Data.Foldable (toList)
 
 import           Data.Coerce
 import           Data.Function                            ((&))
@@ -76,6 +79,7 @@ import           Language.Fixpoint.Types           hiding ( errs
 import qualified Language.Haskell.Liquid.Measure         as Ms
 import           Language.Haskell.Liquid.Parse
 import           Language.Haskell.Liquid.Transforms.ANF
+import Language.Haskell.Liquid.Bare.Elaborate (alignQueryTelescope)
 import           Language.Haskell.Liquid.Transforms.QuestionMark
 import           Language.Haskell.Liquid.Types.Errors
 import           Language.Haskell.Liquid.Types.PrettyPrint
@@ -498,16 +502,26 @@ isIgnore sp = any ((== "--skip-module") . F.val) (pragmas sp)
 --------------------------------------------------------------------------------
 
 -- | Loads the specs of direct dependencies and /their/ dependencies as well.
-loadDependencies :: Config -> [Module] -> TcM (HM.HashMap StableModule LoadedSpec)
-loadDependencies currentModuleConfig mods = do
-  hscEnv    <- env_top <$> getEnv
-  totality  <- SpecFinder.findTotalitySpec hscEnv currentModuleConfig
-  deps <- SpecFinder.findRelevantSpecs currentModuleConfig hscEnv (mods <> totality)
-  redundant <- liftIO $ configToRedundantDependencies hscEnv currentModuleConfig
+loadDependencies :: Config -> ModSummary -> [Module] -> TcM (HM.HashMap StableModule LoadedSpec)
+loadDependencies currentModuleConfig summary mods = do
+    hscEnv <- env_top <$> getEnv
+    totality <- SpecFinder.findTotalitySpec hscEnv currentModuleConfig
+    -- Package re-exports can give a written import a different defining Module.
+    -- The defining owner identifies its interface; the written name identifies
+    -- its companion assumptions. Import aliases are neither of these names.
+    written <- fmap concat $ forM (ms_textual_imps summary) $ \(_, pkg, name) -> do
+        found <- liftIO $ findImportedModule hscEnv (unLoc name) pkg
+        pure $ case found of
+            GHC.Found _ mdl | mdl `elem` mods -> [(mdl, unLoc name)]
+            _ -> []
+    let canonical = [(mdl, moduleName mdl) | mdl <- mods, mdl `notElem` map fst written]
+        policy = [(mdl, moduleName mdl) | mdl <- totality]
+    deps <- SpecFinder.findRelevantSpecs currentModuleConfig hscEnv (written <> canonical <> policy)
+    redundant <- liftIO $ configToRedundantDependencies hscEnv currentModuleConfig
 
-  debugLog $ "Redundant dependencies ==> " ++ show redundant
+    debugLog $ "Redundant dependencies ==> " ++ show redundant
 
-  pure $ foldl' (flip HM.delete) deps redundant
+    pure $ foldl' (flip HM.delete) deps redundant
 
 data LiquidHaskellContext = LiquidHaskellContext {
     lhGlobalCfg        :: Config
@@ -543,7 +557,7 @@ processModule LiquidHaskellContext{..} = do
   let bareSpec0       = lhInputSpec
 
   withPragmas lhGlobalCfg (Ms.pragmas bareSpec0) $ \moduleCfg -> do
-    selectedDeps <- loadDependencies moduleCfg lhRelevantModules
+    selectedDeps <- loadDependencies moduleCfg lhModuleSummary lhRelevantModules
     let dependencies = TargetDependencies $ HM.map (\(LoadedSpec _ _ spec) -> spec) selectedDeps
 
     debugLog $ "Found " <> show (HM.size $ getDependencies dependencies) <> " dependencies:"
@@ -647,12 +661,14 @@ processModule LiquidHaskellContext{..} = do
 -- The ordinary constraint generator checks it at its owning binding group.
 normalizeRefinementChecks :: Config -> HscEnv -> ModGuts -> TargetSrc -> TargetSpec -> IO (TargetSrc, TargetSpec)
 normalizeRefinementChecks cfg hscEnv modGuts src spec
-    | null checks = pure (src, spec)
+    | null checks && null methodPredicates = pure (src, spec)
     | otherwise = do
-        normalizedCbs <- anormalizeExprBinds cfg hscEnv modGuts (map locatedRefinementExpr checks)
-        unless (length normalizedCbs == length checks) $
+        normalizedCbs <- anormalizeExprBinds cfg hscEnv modGuts (map locatedRefinementExpr checks ++ map predicateCore methodPredicates)
+        unless (length normalizedCbs == length checks + length methodPredicates) $
             GHC.panic "Refinement normalization changed the number of obligations"
-        let normalized = zipWith normalizedCheck checks normalizedCbs
+        let (checkCbs, methodCbs) = splitAt (length checks) normalizedCbs
+            normalized = zipWith normalizedCheck checks checkCbs
+            methods = State.evalState (mapM normalizeMethod $ gsMethods sig) methodCbs
             queryImports = filter (isExternalName . getName) (LH.importVars normalizedCbs)
             source =
                 src
@@ -663,16 +679,35 @@ normalizeRefinementChecks cfg hscEnv modGuts src spec
                 spec
                     { gsName =
                         (gsName spec)
-                            { gsTcEmbeds = mconcat (map refinementCheckEmbeds checks) <> gsTcEmbeds (gsName spec)
+                            { gsTcEmbeds = mconcat (map predicateEmbeddings methodPredicates ++ map (predicateEmbeddings . F.val . refinementCheckPredicate) checks) <> gsTcEmbeds (gsName spec)
                             }
-                    , gsSig = sig{gsReftChecks = normalized}
+                    , gsSig = sig{gsReftChecks = normalized, gsMethods = methods}
                     }
         pure (source, checkedSpec)
   where
     sig = gsSig spec
     checks = gsReftChecks sig
+    methodPredicates = concatMap (sources . snd) (gsMethods sig)
+    sources method = concatMap (concatMap checkedPredicates . toList . F.val) [ty | Just ty <- [tyInstance method, tyClass method]]
+    normalizeMethod :: (Var, MethodType (F.Located CheckedSpecType)) -> State.State [CoreBind] (Var, MethodType (F.Located CheckedSpecType))
+    normalizeMethod (owner, method) = do
+        instanceType <- traverse (traverse $ traverse normalizeRefinement) (tyInstance method)
+        classType <- traverse (traverse $ traverse normalizeRefinement) (tyClass method)
+        pure (owner, method{tyInstance = instanceType, tyClass = classType})
+    normalizeRefinement :: CheckedRefinement -> State.State [CoreBind] CheckedRefinement
+    normalizeRefinement refinement = do
+        predicates <- mapM normalizePredicate (checkedPredicates refinement)
+        pure refinement{checkedPredicates = predicates}
+    normalizePredicate :: CheckedPredicate -> State.State [CoreBind] CheckedPredicate
+    normalizePredicate predicate = State.state $ \remaining -> case remaining of
+        NonRec _ core : rest
+            | exprType core `eqType` exprType (predicateCore predicate)
+            , Right telescope <- alignQueryTelescope (predicateSignature predicate) core
+            , map snd (queryValueOwners telescope) == map snd (queryValueOwners $ predicateTelescope predicate) ->
+                (predicate{predicateCore = core}, rest)
+        _ -> GHC.panic "A native predicate normalized to a recursive binding"
     locatedRefinementExpr check =
-        case LH.fSrcSpan (F.loc (refinementCheckType check)) of
+        case LH.fSrcSpan (F.loc (refinementCheckPredicate check)) of
             RealSrcSpan realSpan _ ->
                 Tick
                     (SourceNote realSpan (LexicalFastString (fsLit "Liquid refinement")))

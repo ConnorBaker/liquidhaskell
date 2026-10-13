@@ -11,8 +11,9 @@ module Language.Haskell.Liquid.Constraint.Template (
 , safeFromAsserted
 , topSpecType
 , derivedVar
-, extender
 , extenderWith
+, extenderAfterBodyWith
+, sourceCallableIdentity
 , recursiveHypothesis
 , recursiveCallable
 ) where
@@ -37,6 +38,8 @@ import           Language.Haskell.Liquid.Constraint.Types
 import           Language.Haskell.Liquid.Constraint.Env ( lookupREnv, (+=) )
 import           Language.Haskell.Liquid.Constraint.Monad (addPost, addW)
 import           Language.Haskell.Liquid.Constraint.Fresh (refreshArgsTop, freshTyExpr)
+import           Language.Haskell.Liquid.Constraint.Init (defaultTopVars)
+import qualified Language.Haskell.Liquid.Bare.Axiom as Axiom
 import           Language.Haskell.Liquid.UX.Config
 
 -- Template
@@ -107,20 +110,43 @@ topSpecType x t = do
 derivedVar :: TargetSrc -> Var -> Bool
 derivedVar src x = S.member x (giDerVars src)
 
-extender :: F.Symbolic a => CGEnv -> (a, Template SpecType) -> CG CGEnv
-extender = extenderWith id
-
--- Transform the selected assumption, including the reflected signature that
--- takes precedence over an asserted template.
+-- Pre-body hypotheses use the independently admitted callable, when present,
+-- rather than treating an asserted checking target as an established result.
 extenderWith :: F.Symbolic a => (SpecType -> SpecType) -> CGEnv -> (a, Template SpecType) -> CG CGEnv
 extenderWith f γ (x, Asserted t)
   = case lookupREnv (F.symbol x) (assms γ) of
       Just t' -> γ += ("extender", F.symbol x, f t')
       _       -> γ += ("extender", F.symbol x, f t)
-extenderWith f γ (x, Assumed t)
-  = γ += ("extender", F.symbol x, f t)
-extenderWith _ γ _
-  = return γ
+extenderWith f γ (x, Assumed t) =
+    γ += ("extender", F.symbol x, f t)
+extenderWith _ γ _ =
+    return γ
+
+-- Post-body extension carries the returned, postprocessed checking template.
+-- The ordinary assumption selection above still governs pre-body hypotheses.
+-- Original Assumed roles and rejected expected goals retain that trust/cut;
+-- generating a body constraint never establishes their authored postcondition.
+extenderAfterBodyWith :: (SpecType -> SpecType) -> CGEnv -> (Var, Template SpecType, Template SpecType) -> CG CGEnv
+extenderAfterBodyWith f env (owner, original, checked)
+    | F.symbol owner `S.member` S.map (F.symbol . F.val) (gsFail (gsTerm (giSpec (cgInfo env)))) =
+        extenderWith publish env (owner, checked)
+    | Assumed{} <- original = extenderWith publish env (owner, checked)
+    | owner `elem` defaultTopVars (cgInfo env) = extenderWith publish env (owner, checked)
+    | otherwise = case checked of
+        Asserted ty -> env += ("checked body", F.symbol owner, publish ty)
+        Internal ty -> env += ("checked internal body", F.symbol owner, publish ty)
+        _ -> extenderWith publish env (owner, checked)
+  where
+    publish = f . sourceCallableIdentity (getConfig env) (gsSig (giSpec (cgInfo env))) owner
+
+-- A registered source call names this same value's result. Decorating an
+-- established callable preserves its input telescope and all proved results;
+-- the registration supplies no independent result contract or body equation.
+sourceCallableIdentity :: Config -> GhcSpecSig -> Var -> SpecType -> SpecType
+sourceCallableIdentity cfg signatures owner ty
+    | Just _ <- lookup owner (gsRefSigs signatures) =
+        Axiom.aty (Axiom.addSingletonApp (typeclass cfg) (F.symbol owner) ty)
+    | otherwise = ty
 
 -- Structurally checked recursion retains its result induction hypotheses;
 -- explicit no-termination mode uses the same interface interpretation.

@@ -5,6 +5,7 @@ module Language.Haskell.Liquid.Constraint.Termination (
   TCheck(..)
 , mkTCheck
 , doTermCheck
+, structuralTerminationAuthorized
 , makeTermEnvs
 , makeDecrIndex
 , checkIndex
@@ -27,12 +28,12 @@ import           Text.PrettyPrint.HughesPJ ( (<+>), text )
 import qualified Language.Haskell.Liquid.GHC.Misc                    as GM
 import qualified Language.Fixpoint.Types            as F
 import qualified Language.Fixpoint.SortCheck        as FC
-import           Language.Haskell.Liquid.Constraint.Types (CG, CGInfo (..), CGEnv (..), FEnv (..), SubC (..), makeRecInvariants)
+import           Language.Haskell.Liquid.Constraint.Types (CG, CGInfo (..), CGEnv (..), FEnv (..), SubC, SubCWith (..), makeRecInvariants)
 import           Language.Haskell.Liquid.Bare.Class (instanceDictionaryOwners)
 import           Language.Haskell.Liquid.Types.Specs
 import           Language.Haskell.Liquid.Constraint.Monad (addC, addWarning)
 import           Language.Haskell.Liquid.Constraint.Env (addSortBind, setBind, setTRec)
-import Language.Haskell.Liquid.Constraint.Template (Template (..), extender, recursiveCallable, recursiveHypothesis, unTemplate, varTemplate)
+import Language.Haskell.Liquid.Constraint.Template (Template (..), extenderAfterBodyWith, recursiveCallable, recursiveHypothesis, unTemplate, varTemplate)
 import           Language.Haskell.Liquid.Types.Errors
 import           Language.Haskell.Liquid.Types.Fresh
 import           Language.Haskell.Liquid.Types.Visitors (letVars)
@@ -63,12 +64,20 @@ mkTCheck tc is
   | otherwise = NoCheck
 
 doTermCheck :: Config -> GHC.Bind GHC.Var -> CG Bool
-doTermCheck cfg bind = do
+doTermCheck cfg bind = fst <$> terminationChecks cfg bind
+
+-- Structural success licenses result induction only when ordinary termination
+-- checking is enabled and no member skipped the structural certificate.
+structuralTerminationAuthorized :: Config -> GHC.Bind GHC.Var -> CG Bool
+structuralTerminationAuthorized cfg bind = snd <$> terminationChecks cfg bind
+
+terminationChecks :: Config -> GHC.Bind GHC.Var -> CG (Bool, Bool)
+terminationChecks cfg bind = do
     lazyVs <- gets specLazy
     termVs <- gets specTmVars
     let skip = any (\x -> S.member x lazyVs || nocheck x) xs
-    let chk = not (structuralTerm cfg) || any (`S.member` termVs) xs
-    return $ chk && not skip
+    let structural = structuralTerm cfg && all (not . (`S.member` termVs)) xs
+    return (not structural && not skip, terminationCheck cfg && structural && not skip)
   where
     nocheck = GM.isEmbeddedDictVar
     xs = GHC.bindersOf bind
@@ -319,7 +328,7 @@ consCBSourceTys consBind γ allXes =
     checkIntroduction env (owner, body) = do
         target <- varTemplate env (owner, Just body)
         checked <- consBind False env (owner, body, target)
-        extender env (owner, checked)
+        extenderAfterBodyWith id env (owner, target, checked)
 
 -- Recognize an actual dictionary constructor under its instance telescope.
 -- The complete field application, not its polymorphic owner's type, decides
@@ -409,6 +418,7 @@ consCBWithExprs consBind γ xes aliases canonical = do
     declarations <- forM xes $ \(owner, body) -> varTemplate γ (owner, Just body)
     authored <- gets termExprs
     autoenv <- gets autoSize
+    sizeMeasure <- gets (autoSizeMeasure . giSpec . ghcI)
     let sourceTypes = unTemplate <$> declarations
     metrics <- forM (zip xes declarations) $ \((owner, body), target) ->
         case M.lookup owner authored of
@@ -422,7 +432,7 @@ consCBWithExprs consBind γ xes aliases canonical = do
                 pure $ do
                     i <- index
                     input <- parameter
-                    pure (owner, [F.dummyLoc (mkDecrFun autoenv input (binders !! i))])
+                    pure (owner, [F.dummyLoc (mkDecrFun sizeMeasure autoenv input (binders !! i))])
     checkedMetrics <- case sequence metrics of
         Nothing -> refuse missingMetric >> pure Nothing
         Just xtes -> case metricError xtes sourceTypes of
@@ -433,8 +443,7 @@ consCBWithExprs consBind γ xes aliases canonical = do
     aliasDeclarations <- forM aliases $ \(owner, body) -> varTemplate γ (owner, Just body)
     aliasTargets <- mapM (T.mapM refreshArgs) aliasDeclarations
     aliasCallables <- sequence $ zipWith (recursiveCallable γ) (map fst aliases) (unTemplate <$> aliasTargets)
-    let xts = zip xs targets
-        owners = xs ++ map fst aliases
+    let owners = xs ++ map fst aliases
         sourcePrefixes =
             [(owner, length (collectArguments (length (arguments ty)) body)) | ((owner, body), ty) <- zip xes sourceTypes]
         prefix owner = safeFromJust "Termination: missing canonical source prefix" (lookup (canonical owner) sourcePrefixes)
@@ -462,8 +471,10 @@ consCBWithExprs consBind γ xes aliases canonical = do
         ownerInvariants owner env arguments
             | owner `M.member` authored = env
             | otherwise = makeRecInvariants env arguments
-    mapM_ (uncurry $ consBind True) (zip environments (zip3 xs es targets))
-    checked <- foldM extender γ xts
+    completed <- forM (zip environments (zip3 xs es targets)) $ \(environment, binding@(owner, _, target)) -> do
+        actual <- consBind True environment binding
+        pure (owner, target, actual)
+    checked <- foldM (extenderAfterBodyWith id) γ completed
     foldM checkAlias checked (zip aliases aliasTargets)
   where
     -- Both sources describe ranks, not interchangeable input carriers. Infer
@@ -514,4 +525,4 @@ consCBWithExprs consBind γ xes aliases canonical = do
     arguments = fst5 . bkArrowDeep . unOCons
     checkAlias env ((owner, body), target) = do
         checked <- consBind False env (owner, body, target)
-        extender env (owner, checked)
+        extenderAfterBodyWith id env (owner, target, checked)

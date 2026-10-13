@@ -119,15 +119,9 @@ module Language.Haskell.Liquid.Types.RType (
   , RFInfo(..), defRFInfo, mkRFInfo, classRFInfo
 
   -- * Converting to and from refinements
-  , ConcreteReft(..)
   , Meet(..)
   , Top(..)
   , IsReft(..)
-  , isTauto
-  , mapReftField
-  , ofReft
-  , toReft
-  , toUReft
   , trueReft
   )
   where
@@ -157,6 +151,7 @@ import           Liquid.GHC.API as Ghc hiding ( Expr
                                                                , brackets
                                                                )
 import           Data.String
+import qualified Data.Kind as Kind
 import           GHC.Generics
 
 import           Control.DeepSeq
@@ -167,7 +162,6 @@ import           Data.Hashable
 import qualified Data.HashMap.Strict                    as M
 import qualified Data.List                              as L
 import           Data.Maybe                             (mapMaybe)
-import           Data.List                              as L (nub)
 import qualified Data.HashSet                           as S
 import           Text.PrettyPrint.HughesPJ              hiding (first, (<>))
 import           Language.Fixpoint.Misc
@@ -406,21 +400,28 @@ type Predicate = PredicateV Symbol
 type PredicateV v = PredicateBV Symbol v
 newtype PredicateBV b v = Pr [UsedPVarBV b v]
   deriving (Generic, Data, Show)
-  deriving (B.Binary, Hashable) via Generically (PredicateBV b v)
+  deriving B.Binary via Generically (PredicateBV b v)
 
 mapPredicateV :: (v -> v') -> PredicateV v -> PredicateV v'
 mapPredicateV f (Pr xs) = Pr (map (mapPVarV f (const NoReft)) xs)
 
 -- | A map traversal that collects the local variables in scope
 emapPredicateVM :: Monad m => ([Symbol] -> v -> m v') -> PredicateV v -> m (PredicateV v')
-emapPredicateVM f (Pr xs) = Pr <$> mapM (emapPVarVM f (\_ _ -> pure NoReft)) xs
+emapPredicateVM f (Pr xs) = Pr <$> traverse used xs
+  where
+    -- A use's formal labels identify declaration coordinates; they do not
+    -- bind its actual expressions. Declaration telescopes use emapPVarVM.
+    used PV{..} = PV pname NoReft <$> traverse actual pargs
+    actual (_, name, expression) = (NoReft, name,) <$> emapExprVM f expression
 
 instance (Ord b, Ord v) => Eq (PredicateBV b v) where
-  (Pr vs) == (Pr ws)
-      = and $ (length vs' == length ws') : [v == w | (v, w) <- zip vs' ws']
-        where
-          vs' = L.sort vs
-          ws' = L.sort ws
+  left == right = predicateApplications left == predicateApplications right
+
+instance (Ord b, Ord v, Hashable b, Hashable v) => Hashable (PredicateBV b v) where
+  hashWithSalt salt = hashWithSalt salt . predicateApplications
+
+predicateApplications :: (Ord b, Ord v) => PredicateBV b v -> [(b, [ExprBV b v])]
+predicateApplications (Pr ps) = L.nub . L.sort $ [(pname p, thd3 <$> pargs p) | p <- ps]
 
 instance NFData Predicate where
   rnf _ = ()
@@ -429,15 +430,23 @@ instance Monoid Predicate where
   mempty  = pdTrue
   mappend = (<>)
 
-instance Eq b => Semigroup (PredicateBV b v) where
+instance Semigroup (PredicateBV b v) where
   p <> p' = pdAnd [p, p']
 
 instance (Ord b, F.Fixpoint b, Hashable b, F.PPrint b, Ord v, F.Fixpoint v, F.PPrint v) => F.PPrint (PredicateBV b v) where
   pprintTidy _ (Pr [])  = text "True"
   pprintTidy k (Pr pvs) = hsep $ punctuate (text "&") (F.pprintTidy k <$> pvs)
 
-instance (Semigroup (F.ReftBV b v), Eq b) => Semigroup (UReftBV b v) where
-  MkUReft x y <> MkUReft x' y' = MkUReft (x <> x') (y <> y')
+instance (F.Binder v, F.Refreshable v) => Semigroup (UReftBV v v) where
+  MkUReft left predicates <> MkUReft right predicates' =
+    let leftRoot = F.reftBind left
+        rightRoot = F.reftBind right
+        concrete = F.meetReftWithScope
+          (S.delete leftRoot (F.syms predicates))
+          (S.delete rightRoot (F.syms predicates')) left right
+        root = F.reftBind concrete
+     in MkUReft concrete
+          (F.subst1 predicates (leftRoot, F.EVar root) <> F.subst1 predicates' (rightRoot, F.EVar root))
 
 instance Monoid UReft where
   mempty  = MkUReft mempty mempty
@@ -447,8 +456,8 @@ instance Monoid UReft where
 pdTrue :: PredicateBV b v
 pdTrue         = Pr []
 
-pdAnd :: (Foldable t, Eq b) => t (PredicateBV b v) -> PredicateBV b v
-pdAnd ps       = Pr (nub $ concatMap pvars ps)
+pdAnd :: Foldable t => t (PredicateBV b v) -> PredicateBV b v
+pdAnd ps       = Pr (concatMap pvars ps)
 
 pvars :: PredicateBV b v -> [UsedPVarBV b v]
 pvars (Pr pvs) = pvs
@@ -1162,8 +1171,7 @@ type UReftV v = UReftBV F.Symbol v
 -- | A combined refinement carrying both a first-order predicate and a
 -- conjunction of abstract-refinement (predicate-variable) applications.
 -- This is the @r@ parameter of 'RTypeBV' in fully-elaborated types:
--- @SpecType = 'RRType' RReft@ where @RReft = UReft F.Reft =
--- UReftBV Symbol Symbol F.Reft@.
+-- @SpecType = 'RRType' RReft@ where @RReft = UReftBV Symbol Symbol@.
 --
 -- Example: the type @Int\<p m\>@ where @p :: x:Int -> z:Int -> Bool@ is an
 -- abstract refinement quantified by an enclosing 'RAllP', applied with
@@ -1189,6 +1197,8 @@ type UReftV v = UReftBV F.Symbol v
 --   i.e. a conjunction of predicate-variable applications.
 --   Each 'UsedPVarBV' records which predicate variable is used (via @pname@),
 --   and the actual argument expressions (@pargs@) at this use site (see 'PVarBV').
+--   The value binder scopes over these actuals as well as the concrete body;
+--   formal argument labels are declaration metadata, not use-site binders.
 --
 -- During constraint generation, @ur_pred@ is eliminated by
 -- 'replacePredsWithRefs': each predicate-variable application is converted
@@ -1215,7 +1225,7 @@ mapUReftV f g (MkUReft r p) = MkUReft (g r) (mapPredicateV f p)
 emapUReftVM
   :: Monad m
   => ([Symbol] -> v -> m v') -> (F.ReftV v -> m (F.ReftV v')) -> UReftV v -> m (UReftV v')
-emapUReftVM f g (MkUReft r p) = MkUReft <$> g r <*> emapPredicateVM f p
+emapUReftVM f g (MkUReft r p) = MkUReft <$> g r <*> emapPredicateVM (f . (F.reftBind r :)) p
 
 type role NoReftBV phantom phantom
 type NoReft = NoReftB Symbol
@@ -1332,44 +1342,39 @@ class Semigroup r => Meet r where
 class Top r where
   top :: r -> r
 
--- | The universe of refinement types that can be used in RTypes.
-data ConcreteReft r b v where
-  ConcreteNoReft :: ConcreteReft (NoReftBV b v) b v
-  ConcreteReft :: F.ReftBV b v -> ConcreteReft (F.ReftBV b v) b v
-  ConcreteUReft :: UReftBV b v -> ConcreteReft (UReftBV b v) b v
-
--- | Types that can be constructed from a 'F.ReftBV'.
+-- | A refinement's concrete field, full abstract-predicate view, and root
+-- scope. Instances must satisfy these laws (up to capture-safe alpha-renaming):
 --
--- Only three types can be 'IsReft': 'NoReftBV', 'F.ReftBV', and 'UReftBV'.
+-- * @top undefined@ is defined and denotes true. 'ofReft' introduces no
+--   abstract predicates. 'toReft' projects only the concrete field;
+--   'toUReft' also preserves abstract predicates.
+-- * @reftBinder r = Just b@ means @b = F.reftBind (toReft r)@. Projection
+--   must not force predicate bodies or additional interpretation payloads.
+-- * @Nothing@ means no refinement: no free symbols and substitution is the
+--   identity. It is not an unknown binder: 'RTypeBV' skips substitution here.
+-- * A root-preserving 'mapReftField' commutes with concrete projection
+--   and preserves abstract predicates. Root changes use 'renameReftRoot'.
+--   'F.Subable' refreshes the concrete
+--   root and must transport retained interpretations in their actual scopes.
+-- * A 'Meet' instance denotes conjunction after aligning concrete roots.
+--   'isTauto' may return True only when the full refinement denotes true.
 --
--- 'ofConcreteReft' and 'toConcreteReft' must be inverses of each other.
---
--- In order to allow distinguishing the @r@ type when no value is present
--- (e.g. in @ofReft@ or @trueReft@), 'toConcreteReft' must be non-strict.
---
+-- Additional interpretations must follow substitution and conjunction.
+-- Arbitrary field maps must not retain incompatible source ownership. An
+-- erased checking view must retain every obligation; a concrete projection
+-- alone is not a full interpretation of an enriched refinement instance.
 class (F.Binder (ReftBind r), Top r) => IsReft r where
   type ReftVar r
   type ReftBind r
-  ofConcreteReft :: ConcreteReft r (ReftBind r) (ReftVar r) -> r
-  toConcreteReft :: r -> ConcreteReft r (ReftBind r) (ReftVar r)
-
-ofReft :: forall r. IsReft r => F.ReftBV (ReftBind r) (ReftVar r) -> r
-ofReft r = case toConcreteReft @r (error "ofReft") of
-  ConcreteNoReft -> NoReft
-  ConcreteReft _ -> r
-  ConcreteUReft _ -> MkUReft r pdTrue
-
-toReft :: IsReft r => r -> F.ReftBV (ReftBind r) (ReftVar r)
-toReft r0 = case toConcreteReft r0 of
-   ConcreteNoReft -> F.trueReft
-   ConcreteReft r -> r
-   ConcreteUReft (MkUReft r _) -> r
-
-toUReft :: IsReft r => r -> UReftBV (ReftBind r) (ReftVar r)
-toUReft r0 = case toConcreteReft r0 of
-   ConcreteNoReft -> MkUReft F.trueReft pdTrue
-   ConcreteReft r -> MkUReft r pdTrue
-   ConcreteUReft r -> r
+  ofReft :: F.ReftBV (ReftBind r) (ReftVar r) -> r
+  toReft :: r -> F.ReftBV (ReftBind r) (ReftVar r)
+  toUReft :: r -> UReftBV (ReftBind r) (ReftVar r)
+  reftBinder :: r -> Maybe (ReftBind r)
+  isTauto :: Eq (ReftVar r) => r -> Bool
+  mapReftField :: (F.ReftBV (ReftBind r) (ReftVar r) -> F.ReftBV (ReftBind r) (ReftVar r)) -> r -> r
+  -- | Alpha-rename a whole refinement to a fresh root, not just its concrete
+  -- field. Unlike field mapping this operation requires a resolved namespace.
+  renameReftRoot :: (ReftBind r ~ ReftVar r, F.Refreshable (ReftVar r)) => r -> ReftBind r -> r
 
 instance Top (NoReftBV b v) where
   top _ = NoReft
@@ -1378,47 +1383,44 @@ instance F.Binder b => Top (F.ReftBV b v) where
 instance F.Binder b => Top (UReftBV b v) where
   top _ = MkUReft F.trueReft pdTrue
 
--- | A refinement type that accepts all elements of its base type.
---
--- This is a generalization of 'F.trueReft' for the other types that instantiate
--- 'IsReft'.
 trueReft :: forall r. IsReft r => r
-trueReft = case toConcreteReft @r (error "trueReft") of
-  ConcreteNoReft -> top (error "trueReft: ConcreteNoReft")
-  ConcreteReft _ -> top (error "trueReft: ConcreteReft")
-  ConcreteUReft _ -> top (error "trueReft: ConcreteUReft")
-
-isTauto :: (IsReft r, Eq (ReftVar r)) => r -> Bool
-isTauto r0 = case toConcreteReft r0 of
-  ConcreteNoReft -> True
-  ConcreteReft r -> F.isTautoReft r
-  ConcreteUReft (MkUReft r (Pr ps)) -> F.isTautoReft r && null ps
-
-mapReftField :: IsReft r => (F.ReftBV (ReftBind r) (ReftVar r) -> F.ReftBV (ReftBind r) (ReftVar r)) -> r -> r
-mapReftField f r0 = case toConcreteReft r0 of
-  ConcreteNoReft -> ofConcreteReft ConcreteNoReft
-  ConcreteReft r -> ofConcreteReft (ConcreteReft (f r))
-  ConcreteUReft (MkUReft r p) -> ofConcreteReft (ConcreteUReft (MkUReft (f r) p))
+trueReft = top (error "trueReft")
 
 instance F.Binder b => IsReft (UReftBV b v) where
   type ReftVar (UReftBV b v) = v
   type ReftBind (UReftBV b v) = b
-  ofConcreteReft (ConcreteUReft r) = r
-  toConcreteReft = ConcreteUReft
+  ofReft r = MkUReft r pdTrue
+  toReft (MkUReft r _) = r
+  toUReft = id
+  reftBinder (MkUReft r _) = Just (F.reftBind r)
+  isTauto (MkUReft r (Pr ps)) = F.isTautoReft r && null ps
+  mapReftField f (MkUReft r p) = MkUReft (f r) p
+  renameReftRoot (MkUReft r@(F.Reft (old, _)) p) new =
+    MkUReft (renameReftRoot r new) (F.subst1 p (old, F.EVar new))
 
 instance (F.Binder v, F.Fixpoint v, F.Refreshable v) => Meet (F.ReftBV v v) where
 
 instance F.Binder b => IsReft (F.ReftBV b v) where
   type ReftVar (F.ReftBV b v) = v
   type ReftBind (F.ReftBV b v) = b
-  toConcreteReft = ConcreteReft
-  ofConcreteReft (ConcreteReft r) = r
+  ofReft = id
+  toReft = id
+  toUReft r = MkUReft r pdTrue
+  reftBinder r = Just (F.reftBind r)
+  isTauto = F.isTautoReft
+  mapReftField f = f
+  renameReftRoot (F.Reft (old, body)) new = F.Reft (new, F.subst1 body (old, F.EVar new))
 
-instance F.Binder b => IsReft (NoReftBV b v) where
+instance F.Binder b => IsReft (NoReftBV b (v :: Kind.Type)) where
   type ReftVar (NoReftBV b v) = v
   type ReftBind (NoReftBV b v) = b
-  toConcreteReft _ = ConcreteNoReft
-  ofConcreteReft ConcreteNoReft = NoReft
+  ofReft _ = NoReft
+  toReft _ = F.trueReft
+  toUReft _ = MkUReft F.trueReft pdTrue
+  reftBinder _ = Nothing
+  isTauto _ = True
+  mapReftField _ _ = NoReft
+  renameReftRoot _ _ = NoReft
 
 instance Top t => Top (RefB b τ t) where
   top (RProp args t) = RProp args (top t)
@@ -1435,12 +1437,16 @@ instance Monoid F.Reft where
 
 instance Meet (NoReftBV b v)
 
-instance (Semigroup (F.ReftBV b v), Eq b, Eq v) => Meet (UReftBV b v)
+instance (F.Binder v, F.Refreshable v) => Meet (UReftBV v v)
 
 instance (F.Refreshable v, Hashable v) => F.Subable (UReftBV v v) where
   type Variable (UReftBV v v) = v
-  syms (MkUReft r p)     = F.syms r `S.union` F.syms p
-  substr ns s (MkUReft r z) = MkUReft (F.substr ns s r) (F.substr ns s z)
+  syms (MkUReft r p) = F.syms r `S.union` S.delete (F.reftBind r) (F.syms p)
+  substr ns s (MkUReft r z) =
+    let r' = F.substr ns s r
+        root = F.reftBind r'
+        scoped = F.extendSubstWithVar s (F.reftBind r) root
+     in MkUReft r' (F.substr (S.insert root ns) scoped z)
 
 instance Meet Predicate
 

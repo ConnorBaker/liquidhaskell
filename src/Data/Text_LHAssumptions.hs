@@ -108,8 +108,10 @@ assume Data.Text.append
 -- compareText compares bounded byte slices without decoding UTF-8. Its
 -- unchecked array comparison still requires bounds, but not tutf8. Returning
 -- an input preserves that input's properties; it does not validate its bytes.
+-- The refined instance head is the dictionary's carrier, so every Ord method
+-- and polymorphic dictionary use has the same bounded-slice domain.
 {-@
-instance Ord Text where
+instance Ord ({t:Text | tbounds t}) where
   assume min :: x:{Text | tbounds x} -> y:{Text | tbounds y}
              -> {v:Text | v == x || v == y}
   assume max :: x:{Text | tbounds x} -> y:{Text | tbounds y}

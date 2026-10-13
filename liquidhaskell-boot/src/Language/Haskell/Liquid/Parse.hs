@@ -754,7 +754,7 @@ bRProp syms' epr  = RProp ss $ bRVar (BTV $ dummyLoc dummyName) (Pr []) r
     (ss, (v, _))  = (init symsf, last symsf)
     symsf         = [(y, s) | ((_, s), y) <- syms']
     su            = mkSubstLocSymbol val [(x, EVar $ dummyLoc y) | ((x, _), y) <- syms', x /= v]
-    r             = Reft (v, substExprV val su epr)
+    r             = Reft (v, substParsedExpr su epr)
 
 mkSubstLocSymbol :: Hashable b => (v -> b) -> [(b, ExprBV b v)] -> KVarSubst b v
 mkSubstLocSymbol toB = toKVarSubst . M.fromList . reverse . filter notTrivial
@@ -844,45 +844,33 @@ strengthenUReft
   :: BareTypeParsed -> UReftV LocSymbol -> BareTypeParsed
 strengthenUReft = strengthenWith meetUReft
   where
-    meetUReft (MkUReft r0 (Pr p0)) (MkUReft r1 (Pr p1)) =
-       MkUReft (meetReftV r0 r1) (Pr $ p0 <> p1)
-
-    meetReftV :: ReftV LocSymbol -> ReftV LocSymbol -> ReftV LocSymbol
-    meetReftV (Reft (v, ra)) (Reft (v', ra'))
-      | v == v'          = Reft (v , pAnd [ra, ra'])
-      | v == dummySymbol = Reft (v', pAnd [ra', substExprV val (toKVarSubst $ M.fromList [(v , EVar (dummyLoc v'))]) ra])
-      | otherwise        = Reft (v , pAnd [ra, substExprV val (toKVarSubst $ M.fromList [(v', EVar (dummyLoc v))]) ra'])
-
-substExprV :: Hashable b => (v -> b) -> KVarSubst b v -> ExprBV b v -> ExprBV b v
-substExprV toB su0 = go
-  where
-    go (EApp f e) = EApp (go f) (go e)
-    go (ELam x e) = ELam x (substExprV toB (removeSubst su0 (fst x)) e)
-    go (ECoerc a t e) = ECoerc a t (go e)
-    go (ENeg e) = ENeg (go e)
-    go (EBin op e1 e2) = EBin op (go e1) (go e2)
-    go (EIte p e1 e2) = EIte (go p) (go e1) (go e2)
-    go (ECst e so) = ECst (go e) so
-    go (EVar x) = appSubst su0 x
-    go (PAnd ps) = PAnd $ map go ps
-    go (POr  ps) = POr $ map go ps
-    go (PNot p) = PNot (go p)
-    go (PImp p1 p2) = PImp (go p1) (go p2)
-    go (PIff p1 p2) = PIff (go p1) (go p2)
-    go (PAtom r e1 e2) = PAtom r (go e1) (go e2)
-    go (PKVar k tsu su') = PKVar k tsu (su' `appendSubst` su0)
-    go (PAll _ _) = panic Nothing "substExprV: PAll"
-    go (PExist _ _) = panic Nothing "substExprV: PExist"
-    go p = p
-
-    appSubst su x = Mb.fromMaybe (EVar x) (M.lookup (toB x) (fromKVarSubst su))
-
-    removeSubst su x = toKVarSubst $ M.delete x $ fromKVarSubst su
-
-    appendSubst s1 s2 = toKVarSubst $ M.union s1' s2'
+    meetUReft (MkUReft (Reft (v, ra)) (Pr p0)) (MkUReft (Reft (v', ra')) (Pr p1)) =
+       MkUReft (Reft (root, pAnd [rebase v ra, rebase v' ra']))
+         (Pr $ (rebasePred v <$> p0) <> (rebasePred v' <$> p1))
       where
-        s1' = substExprV toB s2 <$> fromKVarSubst s1
-        s2' = fromKVarSubst s2
+        leftFree = S.delete v (parsedExprSymbols ra `S.union` predSymbols p0)
+        rightFree = S.delete v' (parsedExprSymbols ra' `S.union` predSymbols p1)
+        -- Parsed placeholders are dummySymbol, not LF's wildcard value owner.
+        preferred = if v == dummySymbol then v' else v
+        opposite = if v == dummySymbol then leftFree else rightFree
+        root
+          | v == v' || not (preferred `S.member` opposite) = preferred
+          | otherwise = snd (freshInNS preferred (leftFree `S.union` rightFree))
+        rebase old e
+          | old == root = e
+          | otherwise = substParsedExpr (toKVarSubst $ M.singleton old (EVar $ dummyLoc root)) e
+        rebasePred old p = p { pargs = [(t, x, rebase old e) | (t, x, e) <- pargs p] }
+        predSymbols ps = S.unions [parsedExprSymbols e | p <- ps, (_, _, e) <- pargs p]
+
+-- Only the scope calculation projects locations; the shared action retains
+-- each untouched occurrence and synthesizes locations solely for fresh names.
+parsedExprSymbols :: ExprV LocSymbol -> S.HashSet Symbol
+parsedExprSymbols = exprSymbolsSet . fmap val
+
+substParsedExpr :: KVarSubst Symbol LocSymbol -> ExprV LocSymbol -> ExprV LocSymbol
+substParsedExpr su e = rapierSubstExprWith val dummyLoc scope (fromKVarSubst su) e
+  where
+    scope = parsedExprSymbols e `S.union` S.unions (parsedExprSymbols <$> M.elems (fromKVarSubst su))
 
 
 reftUReft :: ReftV v -> UReftV v
@@ -1550,13 +1538,13 @@ nullaryConPatP = nilPatP <|> ((,[]) <$> dataConLHNameP)
 mkTupPat :: Foldable t => Located (t a) -> (Located LHName, t a)
 mkTupPat lzs =
     let tupledDC = GHC.tupleDataCon GHC.Boxed (length (val lzs))
-     in (makeGHCLHName (GHC.getName tupledDC) (symbol tupledDC) <$ lzs, val lzs)
+     in (val (makeGHCLHNameLocated tupledDC) <$ lzs, val lzs)
 
 mkNilPat :: Located t -> (Located LHName, [t1])
-mkNilPat lx     = (makeGHCLHName (GHC.getName GHC.nilDataCon) (symbol GHC.nilDataCon) <$ lx, [])
+mkNilPat lx     = (val (makeGHCLHNameLocated GHC.nilDataCon) <$ lx, [])
 
 mkConsPat :: t1 -> Located t -> t1 -> (Located LHName, [t1])
-mkConsPat x lc y = (makeGHCLHName (GHC.getName GHC.consDataCon) (symbol GHC.consDataCon) <$ lc, [x, y])
+mkConsPat x lc y = (val (makeGHCLHNameLocated GHC.consDataCon) <$ lc, [x, y])
 
 -------------------------------------------------------------------------------
 --------------------------------- Predicates ----------------------------------

@@ -6,6 +6,7 @@ module CompilerFixture (
     Expectation (..),
     Compiled (..),
     configuredCompiler,
+    withPackageDatabase,
     copyFixture,
     writeFixture,
     compile,
@@ -27,7 +28,7 @@ import System.Timeout (timeout)
 import Test.Tasty.HUnit (assertBool, assertFailure, (@?=))
 import Text.Read (readMaybe)
 
-data Compiler = Compiler FilePath String [(String, String)]
+data Compiler = Compiler FilePath String [(String, String)] [String]
 
 data Optimization = O0 | O2 deriving (Show)
 
@@ -42,6 +43,7 @@ data Expectation
     | TerminationCheckAt [Int]
     | FailureAt [Int]
     | FormationRefusal Int String
+    | DependencyAmbiguity String [String]
 
 data Compiled = Compiled
     { compiledDirectory :: FilePath
@@ -66,7 +68,19 @@ configuredCompiler = do
     unit <- case words output of
         [one] -> pure one
         _ -> assertFailure ("expected exactly one installed liquidhaskell unit: " ++ output) >> fail "ambiguous plugin unit"
-    pure (Compiler ghc unit clean)
+    pure (Compiler ghc unit clean [])
+
+-- Keep the selected compiler and plugin unit; only extend its package search
+-- environment for the lifetime of the caller's temporary fixture bracket.
+withPackageDatabase :: Compiler -> FilePath -> [FilePath] -> IO Compiler
+withPackageDatabase (Compiler ghc unit environment arguments) database configurations = do
+    let tool = takeDirectory ghc </> "ghc-pkg"
+        run arguments = do
+            (status, output) <- command environment Nothing tool arguments
+            assertBool output (status == ExitSuccess)
+    run ["init", database]
+    mapM_ (\configuration -> run ["--package-db", database, "register", configuration]) configurations
+    pure $ Compiler ghc unit environment $ arguments ++ ["-package-db", database, "-hide-all-plugin-packages"]
 
 copyFixture :: (FilePath -> IO FilePath) -> FilePath -> FilePath -> String -> IO ()
 copyFixture fixture relative directory name = do
@@ -83,26 +97,27 @@ writeFixture relative directory name text = do
     writeFile (directory </> name ++ ".hs") text
 
 compile :: Compiler -> CheckingMode -> Optimization -> Backend -> FilePath -> String -> [FilePath] -> [String] -> Expectation -> IO Compiled
-compile (Compiler ghc unit environment) checking optimization backend directory name imports options expected = do
+compile (Compiler ghc unit environment packageArguments) checking optimization backend directory name imports options expected = do
     let objects = directory </> "objects"
         arguments =
-            [ "-c"
-            , "-" ++ show optimization
-            , "-fforce-recomp"
-            , "-XGHC2024"
-            , "-no-user-package-db"
-            , "-hide-package"
-            , "liquidhaskell"
-            , "-plugin-package-id"
-            , unit
-            , "-fplugin=LiquidHaskell"
-            , "-fdiagnostics-color=never"
-            , -- Keep compiler scratch files under the fixture's cleanup bracket.
-              "-tmpdir"
-            , objects
-            , "-i"
-            , "-i."
-            ]
+            packageArguments
+                ++ [ "-c"
+                   , "-" ++ show optimization
+                   , "-fforce-recomp"
+                   , "-XGHC2024"
+                   , "-no-user-package-db"
+                   , "-hide-package"
+                   , "liquidhaskell"
+                   , "-plugin-package-id"
+                   , unit
+                   , "-fplugin=LiquidHaskell"
+                   , "-fdiagnostics-color=never"
+                   , -- Keep compiler scratch files under the fixture's cleanup bracket.
+                     "-tmpdir"
+                   , objects
+                   , "-i"
+                   , "-i."
+                   ]
                 ++ case backend of
                     ObjectCode -> []
                     InterfaceOnly -> ["-fno-code", "-fwrite-interface"]
@@ -132,7 +147,11 @@ compile (Compiler ghc unit environment) checking optimization backend directory 
         not $
             any
                 (`isInfixOf` map toLower output)
-                ["<<timeout>>", "internal error", "segmentation fault", "stack overflow", "heap exhausted", "<command line>", "<no location info>"]
+                ( ["<<timeout>>", "internal error", "segmentation fault", "stack overflow", "heap exhausted", "<command line>"]
+                    ++ case expected of
+                        DependencyAmbiguity _ _ -> []
+                        _ -> ["<no location info>"]
+                )
     case expected of
         Safe -> do
             safeResult context status results diagnostics
@@ -153,6 +172,19 @@ compile (Compiler ghc unit environment) checking optimization backend directory 
             assertBool context (not (any (\entry -> take 1 entry `elem` [["SAFE"], ["UNSAFE"]]) results))
             emitted <- doesFileExist (objects </> name ++ ".hi")
             assertBool (context ++ "\nmalformed source emitted an interface") (not emitted)
+        DependencyAmbiguity moduleName providers -> do
+            let ambiguities =
+                    [ unlines (takeWhile (not . null) block)
+                    | block@(line : _) <- tails (lines output)
+                    , "ambiguous module name" `isInfixOf` map toLower line
+                    , moduleName `isInfixOf` line
+                    ]
+            assertBool context (status == ExitFailure 1)
+            assertBool context (not ("panic" `isInfixOf` map toLower output))
+            assertBool context (any (\block -> all (`isInfixOf` block) providers) ambiguities)
+            assertBool context (null results)
+            emitted <- doesFileExist (objects </> name ++ ".hi")
+            assertBool (context ++ "\nambiguous dependency emitted an interface") (not emitted)
     pure (Compiled directory name)
   where
     verdict wanted [actual : count : "constraints" : "checked)" : decoration] =
@@ -183,7 +215,7 @@ checkingOptions checking =
 -- The boot plugin can load without the assumptions package, but strict checking
 -- must refuse that configuration before checking or publishing the source.
 assertMissingTotalityPolicy :: Compiler -> Optimization -> FilePath -> String -> IO ()
-assertMissingTotalityPolicy (Compiler ghc _ environment) optimization directory name = do
+assertMissingTotalityPolicy (Compiler ghc _ environment packageArguments) optimization directory name = do
     (packageStatus, packageOutput) <- command environment Nothing (takeDirectory ghc </> "ghc-pkg") ["--global", "field", "liquidhaskell-boot", "id", "--simple-output"]
     packageStatus @?= ExitSuccess
     boot <- case words packageOutput of
@@ -216,7 +248,7 @@ assertMissingTotalityPolicy (Compiler ghc _ environment) optimization directory 
                 ++ map ("-fplugin-opt=LiquidHaskellBoot:" ++) (strictOptions ++ ["--higherorder"])
                 ++ ["-o", objects </> name ++ ".o", "-ohi", objects </> name ++ ".hi", name ++ ".hs"]
     createDirectoryIfMissing True objects
-    (status, output) <- command environment (Just directory) ghc arguments
+    (status, output) <- command environment (Just directory) ghc (packageArguments ++ arguments)
     let context = name ++ " / " ++ show optimization ++ "\n" ++ output
         diagnostic = "LiquidHaskell totality policy is unavailable; expose the liquidhaskell package with its compiled LH assumptions."
     assertBool context (status == ExitFailure 1)
@@ -232,7 +264,7 @@ assertMissingTotalityPolicy (Compiler ghc _ environment) optimization directory 
 -- External dependencies need not carry a Liquid interface. Keep this boundary
 -- distinct from the verifier's SAFE judgment and explicitly check its absence.
 compileHaskell :: Compiler -> Optimization -> FilePath -> String -> [String] -> IO Compiled
-compileHaskell tool@(Compiler ghc _ environment) optimization directory name options = do
+compileHaskell tool@(Compiler ghc _ environment packageArguments) optimization directory name options = do
     let objects = directory </> "objects"
     createDirectoryIfMissing True objects
     (status, output) <-
@@ -256,6 +288,7 @@ compileHaskell tool@(Compiler ghc _ environment) optimization directory name opt
               , name ++ ".hs"
               ]
                 ++ options
+                ++ packageArguments
             )
     assertBool output (status == ExitSuccess)
     let compiled = Compiled directory name
@@ -263,25 +296,25 @@ compileHaskell tool@(Compiler ghc _ environment) optimization directory name opt
     pure compiled
 
 assertPublication :: Compiler -> Compiled -> Bool -> IO ()
-assertPublication (Compiler ghc _ environment) compiled expected = do
+assertPublication (Compiler ghc _ environment packageArguments) compiled expected = do
     let name = compiledModule compiled
         interface = compiledDirectory compiled </> "objects" </> name ++ ".hi"
-    (status, output) <- command environment Nothing ghc ["--show-iface", interface]
+    (status, output) <- command environment Nothing ghc (packageArguments ++ ["--show-iface", interface])
     status @?= ExitSuccess
     let annotations = [line | line <- lines output, ("Module target " ++ name ++ " annotated by ") `isPrefixOf` line, "of type PayloadMarker" `isInfixOf` line]
     length annotations @?= if expected then 1 else 0
 
 assertSourceNameAbsent :: Compiler -> Compiled -> String -> IO ()
-assertSourceNameAbsent (Compiler ghc _ environment) compiled name = do
+assertSourceNameAbsent (Compiler ghc _ environment packageArguments) compiled name = do
     let interface = compiledDirectory compiled </> "objects" </> compiledModule compiled ++ ".hi"
-    (status, output) <- command environment Nothing ghc ["--show-iface", interface]
+    (status, output) <- command environment Nothing ghc (packageArguments ++ ["--show-iface", interface])
     status @?= ExitSuccess
     assertBool ("logical-only private name survived in GHC interface: " ++ name ++ "\n" ++ output) (not $ name `isInfixOf` output)
 
 assertSourceNamePresent :: Compiler -> Compiled -> String -> IO ()
-assertSourceNamePresent (Compiler ghc _ environment) compiled name = do
+assertSourceNamePresent (Compiler ghc _ environment packageArguments) compiled name = do
     let interface = compiledDirectory compiled </> "objects" </> compiledModule compiled ++ ".hi"
-    (status, output) <- command environment Nothing ghc ["--show-iface", interface]
+    (status, output) <- command environment Nothing ghc (packageArguments ++ ["--show-iface", interface])
     status @?= ExitSuccess
     assertBool ("runtime-referenced private name absent from GHC interface: " ++ name ++ "\n" ++ output) (name `isInfixOf` output)
 

@@ -9,9 +9,7 @@
 {-# LANGUAGE TypeOperators #-}
 module Language.Haskell.Liquid.Types.Names
   ( CompatibleBinder(..)
-  , lenLocSymbol
   , anyTypeSymbol
-  , propSymbol
   , getPropIndex
   , selfSymbol
   , tyTupleSizedSymbol
@@ -66,15 +64,12 @@ import qualified Liquid.GHC.API as GHC
 
 import GHC.Types (Any)
 
-propSymbol :: Symbol
-propSymbol = "Language.Haskell.Liquid.ProofCombinators.prop"
-
-getPropIndex :: ReftV Symbol -> Maybe (ExprV Symbol)
-getPropIndex (Reft (v, PAtom Eq (EApp (EVar n) (EVar v')) idx))
-  | n == propSymbol
+getPropIndex :: Maybe Symbol -> ReftV Symbol -> Maybe (ExprV Symbol)
+getPropIndex (Just owner) (Reft (v, PAtom Eq (EApp (EVar n) (EVar v')) idx))
+  | n == owner
   , v == v'
   = Just idx
-getPropIndex _ = Nothing
+getPropIndex _ _ = Nothing
 
 -- | Highly temporary class as a compatability layer to express that a binder,
 -- especially type variables @tv@, are in the same namespace as another binder.
@@ -87,14 +82,6 @@ instance CompatibleBinder Symbol Symbol
 instance CompatibleBinder (Located Symbol) (Located Symbol)
 instance CompatibleBinder Symbol (Located Symbol) where
   coerceBinder (Loc _ _ s) = s
-
--- | The size measure applied to values of a type marked @{-@ autosize T @-}@.
---
--- It is declared in @GHC.Base_LHAssumptions@, so it must be spelled with that
--- qualification here: the solver only knows the resolved name, and an
--- unqualified occurrence is rejected as a free variable.
-lenLocSymbol :: Located Symbol
-lenLocSymbol = dummyLoc $ symbol ("GHC.Base_LHAssumptions.autolen" :: String)
 
 anyTypeSymbol :: Symbol
 anyTypeSymbol = symbol (show ''Any)
@@ -319,7 +306,7 @@ makeGHCLHNameFromId x =
               GHC.DataConWrapId dc -> GHC.getName dc
               GHC.DataConWorkId dc -> GHC.getName dc
               _ -> GHC.getName x
-     in makeGHCLHName n (symbol n)
+     in makeGHCLHName n (symbol $ GHC.displayNameFS n)
 
 makeLocalLHName :: Symbol -> LHName
 makeLocalLHName s = LHNResolved (LHRLocal s) s
@@ -330,9 +317,9 @@ makeLogicLHName s m r = LHNResolved (LHRLogic (LogicName s m r)) s
 makeGeneratedLogicLHName :: Symbol -> LHName
 makeGeneratedLogicLHName s = LHNResolved (LHRLogic (GeneratedLogicName s)) s
 
-makeGHCLHNameLocated :: (GHC.NamedThing a, Symbolic a) => a -> Located LHName
+makeGHCLHNameLocated :: GHC.NamedThing a => a -> Located LHName
 makeGHCLHNameLocated x =
-    makeGHCLHName (GHC.getName x) (symbol x) <$ locNamedThing x
+    makeGHCLHName (GHC.getName x) (symbol $ GHC.displayNameFS $ GHC.getName x) <$ locNamedThing x
 
 makeGHCLHNameLocatedFromId :: GHC.Id -> Located LHName
 makeGHCLHNameLocatedFromId x =
@@ -380,27 +367,9 @@ updateLHNameSymbol f (LHNUnresolved n s) = LHNUnresolved n (f s)
 -- names must match exactly the symbol for the corresponding Haskell function.
 -- Otherwise, LH would fail to link the two at various places where it is needed.
 lhNameToResolvedSymbol :: LHName -> Symbol
-lhNameToResolvedSymbol (LHNResolved (LHRLogic (LogicName s om mReflectionOf)) _) =
-    let m = maybe om (\n -> fromMaybe om (GHC.nameModule_maybe n)) mReflectionOf
-        msymbol = Text.pack $ GHC.moduleNameString $ GHC.moduleName m
-     in symbol $ mconcat [msymbol, ".", symbolText s]
-        {-
-        TODO: Adding a prefix for the unit would allow LH to deal with
-              -XPackageImports. This prefix should be added here and in
-              the Symbolic instance of Name.
-        munique =
-          Text.dropEnd 2 $ -- Remove padding of two characters "=="
-          Base64.extractBase64 $
-          Base64.encodeBase64 $
-          ByteString.toStrict $
-          Builder.toLazyByteString $
-          Builder.int32BE $
-          fromIntegral $
-          hash $
-          GHC.unitIdString $
-          GHC.moduleUnitId m
-     in symbol $ mconcat ["u", munique, "##", msymbol, ".", symbolText s]
-          -}
+lhNameToResolvedSymbol (LHNResolved (LHRLogic (LogicName _ _ (Just owner))) _) = symbol owner
+lhNameToResolvedSymbol (LHNResolved (LHRLogic (LogicName occurrence origin Nothing)) _) =
+    symbol $ mconcat [symbolText (symbol $ GHC.qualifiedModuleFS origin), ".", symbolText occurrence]
 lhNameToResolvedSymbol (LHNResolved (LHRLogic (GeneratedLogicName s)) _) = s
 lhNameToResolvedSymbol (LHNResolved (LHRLocal s) _) = s
 lhNameToResolvedSymbol (LHNResolved (LHRGHC n) _) = symbol n

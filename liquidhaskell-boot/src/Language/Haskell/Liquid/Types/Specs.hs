@@ -24,6 +24,9 @@ module Language.Haskell.Liquid.Types.Specs (
   -- * TargetSpec
   -- $targetSpec
   , TargetSpec(..)
+  , lookupLogicMeasure
+  , lookupMeasureOwner
+  , autoSizeMeasure
   -- * BareSpec
   -- $bareSpec
   , BareSpec
@@ -217,6 +220,40 @@ data TargetSpec = TargetSpec
 instance HasConfig TargetSpec where
   getConfig = gsConfig
 
+-- A qualified reference selects a registered declaration, not a unitless
+-- solver spelling. Distinct unit owners are ambiguous in this lookup.
+lookupLogicMeasure :: ModuleName -> F.Symbol -> GhcSpecData -> Maybe F.Symbol
+lookupLogicMeasure qualifier occurrence catalog =
+    lookupMeasureOwner
+        qualifier
+        occurrence
+        [ F.val (msName declaration)
+        | declaration <- gsMeasures catalog
+        , lhNameToResolvedSymbol (F.val (msName declaration)) `S.member` registered
+        ]
+  where
+    registered = S.fromList (map fst (gsMeas catalog))
+
+-- The caller supplies declarations admitted to its measure environment.
+-- Selection preserves the declaration's unit and rejects ambiguous owners.
+lookupMeasureOwner :: ModuleName -> F.Symbol -> [LHName] -> Maybe F.Symbol
+lookupMeasureOwner qualifier occurrence declarations =
+    case S.toList candidates of
+        [owner] -> Just owner
+        _ -> Nothing
+  where
+    candidates =
+        S.fromList
+            [ owner
+            | declaration@(LHNResolved (LHRLogic (LogicName name origin Nothing)) _) <- declarations
+            , name == occurrence
+            , moduleName origin == qualifier
+            , let owner = lhNameToResolvedSymbol declaration
+            ]
+
+autoSizeMeasure :: TargetSpec -> Maybe F.LocSymbol
+autoSizeMeasure = fmap F.dummyLoc . lookupLogicMeasure (mkModuleName "GHC.Base_LHAssumptions") (F.symbol ("autolen" :: String)) . gsData
+
 -- | The collection of GHC 'Var's that a 'TargetSpec' needs to verify (or skip).
 data GhcSpecVars = SpVar
   { gsTgtVars    :: ![Var]                        -- ^ Top-level Binders To Verify (empty means ALL binders)
@@ -252,7 +289,7 @@ data GhcSpecSig = SpSig
   , gsInSigs   :: ![(Var, LocSpecType)]           -- ^ Auto generated Signatures
   , gsNewTypes :: ![(TyCon, LocSpecType)]         -- ^ Mapping of 'newtype' type constructors with their refined types.
   , gsDicts    :: !(DEnv Var LocSpecType)            -- ^ Refined Classes from Instances
-  , gsMethods  :: ![(Var, MethodType LocSpecType)]   -- ^ Refined Classes from Classes
+  , gsMethods  :: ![(Var, MethodType (F.Located CheckedSpecType))]   -- ^ Refined Classes from Classes
   , gsTexprs   :: ![(Var, LocSpecType, [F.Located F.Expr])]  -- ^ Lexicographically ordered expressions for termination
   , gsRelation :: ![(Var, Var, LocSpecType, LocSpecType, RelExpr, RelExpr)]
   , gsAsmRel   :: ![(Var, Var, LocSpecType, LocSpecType, RelExpr, RelExpr)]
@@ -271,17 +308,16 @@ data GhcSpecSig = SpSig
 -- the refinement @x:Int -> {v:Int | v > x}@ generates @\x v -> v > x@.
 -- Elaboration is implemented in 'Language.Haskell.Liquid.Bare.Elaborate.elaborateSpecTypeWithPrimitives'.
 --
--- 'refinementCheckExpr' stores that open function as GHC Core,
--- 'refinementCheckType' is its checking telescope, and 'refinementCheckOwner'
--- identifies the source binding whose actual lexical environment checks it.
+-- The predicate retains the original checked Core, nominal telescope and its
+-- exact readback interpretation. 'refinementCheckExpr' is the normalized
+-- formation-check expression; normalization must not replace the retained
+-- source correspondence by an association guessed from logical expressions.
+-- The owner identifies the actual lexical checking environment.
 
 data RefinementCheck = RefinementCheck
   { refinementCheckOwner :: !Var
   , refinementCheckExpr :: !CoreExpr
-  , refinementCheckType :: !LocSpecType
-  -- Query-owned interpretations of opaque logical carriers. They are not
-  -- source datatypes and are never serialized in a lifted specification.
-  , refinementCheckEmbeds :: !(F.TCEmb TyCon)
+  , refinementCheckPredicate :: !(F.Located CheckedPredicate)
   }
 
 instance Show RefinementCheck where

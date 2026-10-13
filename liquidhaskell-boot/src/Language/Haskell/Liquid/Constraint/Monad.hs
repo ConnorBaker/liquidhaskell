@@ -15,8 +15,14 @@ import           Language.Haskell.Liquid.Types.Errors
 import           Language.Haskell.Liquid.Types.RefType
 import           Language.Haskell.Liquid.Types.RType
 import           Language.Haskell.Liquid.Types.Types
+import           Language.Haskell.Liquid.Types.Fresh (fresh, refresh)
+import           Language.Haskell.Liquid.Types.RTypeOp (ofRSort, stripRTypeBase)
+import           Language.Haskell.Liquid.Types.PredType (pvarRType, substPVar, replacePredsWithRefs, pVartoRConc)
 import           Language.Haskell.Liquid.Constraint.Types
 import           Language.Haskell.Liquid.Constraint.Env
+import           Language.Haskell.Liquid.Constraint.Fresh (addKVars)
+import           Language.Haskell.Liquid.UX.Config (getConfig, typeclass)
+import qualified Language.Fixpoint.Types as F
 import           Language.Fixpoint.Misc hiding (errorstar)
 import           Language.Haskell.Liquid.GHC.Misc -- (concatMapM)
 import           Liquid.GHC.API as Ghc hiding (panic, showPpr)
@@ -71,6 +77,40 @@ addPost _ t
 addW   :: WfC -> CG ()
 --------------------------------------------------------------------------------
 addW !w = modify $ \s -> s { hsWfs = w : hsWfs s }
+
+-- | Instantiate a universally quantified predicate with a fresh, well-formed
+-- refinement in its current lexical environment.
+freshPredRef :: CGEnv -> PVar RSort -> CG SpecProp
+freshPredRef γ (PV _ rsort as) =
+    do
+        root <- refresh (typeclass (getConfig γ)) (mempty :: UReft)
+        args <- mapM (const fresh) as
+        let targs = [(x, s) | (x, (s, _, _)) <- zip args as]
+            t = ofRSort rsort `strengthen` root
+        case stripRTypeBase t of
+            Nothing -> errorP "freshPredRef carrier has no value refinement root: " (showpp rsort)
+            Just _ -> return ()
+        γ' <- foldM (+=) γ [("freshPredRef", x, ofRSort τ) | (x, τ) <- targs]
+        addKVars PredInstE t
+        addW $ WfC γ' t
+        return $ RProp targs (RHole root)
+
+-- | Introduce a rigid predicate and its formal arguments in lexical scope.
+addPToEnv :: CGEnv -> PVar RSort -> CG CGEnv
+addPToEnv γ π
+  = do γπ <- γ += ("addSpec1", pname π, pvarRType π)
+       foldM (+=) γπ [("addSpec2", x, ofRSort t) | (t, x, _) <- pargs π]
+
+-- | Open a universal predicate with a fresh rigid name, preserving shadowed
+-- predicate binders and the identities in authored annotations.
+openPredicate :: CGEnv -> PVar RSort -> SpecType -> CG (CGEnv, SpecType)
+openPredicate γ p t = do
+    name <- fresh
+    let rigid = p{pname = name}
+        renamed = substPVar p rigid t
+        body = fmap (replacePredsWithRefs (uPVar rigid, pVartoRConc rigid)) renamed
+    γ' <- addPToEnv γ rigid
+    return (γ', body)
 
 --------------------------------------------------------------------------------
 -- | Add a warning

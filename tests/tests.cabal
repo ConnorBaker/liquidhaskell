@@ -2895,12 +2895,19 @@ test-suite plugin-boundary-tests
   other-modules:
     CompilerFixture
     ConstructorTests
+    DeclaredAliasFixtures
+    EmbeddingSortTests
     ImportedBodyTests
+    NativeJudgmentTests
+    NativeRefinementFixtures
     OpaqueIdentityTests
     Paths_tests
     PublicationTests
     QueryAssertions
     SourceJudgmentTests
+    SourceImportTests
+    SourceVariantFixtures
+    StructuralRecursionTests
 
   autogen-modules: Paths_tests
   build-depends:

@@ -285,11 +285,11 @@ checkTargetSpec formationTemplates originalMeasures specs src env cbs tsp
       -- but make sure that all the specs are checked.
       -- ++ checkRefinedClasses                        rClasses rInsts
       <> runReader (checkSizeFun native emb env (gsTconsP (gsName tsp))) ef
-      <> checkPlugged (catMaybes [fmap (F.dropSym 2 $ GM.simplesymbol x,) (getMethodType t) | (x, t) <- gsMethods (gsSig tsp)])
+      <> checkPlugged (catMaybes [fmap (\ty -> (F.dropSym 2 $ GM.simplesymbol x, fmap ordinarySpecType ty)) (getMethodType t) | (x, t) <- gsMethods (gsSig tsp)])
       <> checkRewrites tsp
       <> if allowUnsafeConstructors $ getConfig tsp
         then mempty
-        else checkConstructorRefinement (gsTySigs $ gsSig tsp)
+        else checkConstructorRefinement (lookupLogicMeasure (Ghc.mkModuleName "Language.Haskell.Liquid.ProofCombinators") "prop" (gsData tsp)) (gsTySigs $ gsSig tsp)
 
   _rClasses = concatMap Ms.classes specs
   _rInsts = concatMap Ms.rinstance specs
@@ -322,8 +322,8 @@ mkElabFlags (Just slv) = FC.mkElabFlags slv False
 -- > {-@ T :: x:Int -> { v:T | True } @-} -- Should be fine
 -- > {-@ T :: x:Int -> { v:T | prop v = True } @-} -- Should be fine
 --
-checkConstructorRefinement :: [(Var, LocSpecType)] -> Diagnostics
-checkConstructorRefinement = mconcat . map checkOne
+checkConstructorRefinement :: Maybe F.Symbol -> [(Var, LocSpecType)] -> Diagnostics
+checkConstructorRefinement propOwner = mconcat . map checkOne
   where
     checkOne (s, ty) | isCtorName s
                      , not $ validRef $ getRetTyRef $ val ty
@@ -338,7 +338,7 @@ checkConstructorRefinement = mconcat . map checkOne
     validRef (F.Reft (_, F.PTrue))
                       = True
     -- Prop foo from ProofCombinators
-    validRef n = isJust $ getPropIndex n
+    validRef n = isJust $ getPropIndex propOwner n
 
     isCtorName x = case idDetails x of
       DataConWorkId _ -> True
@@ -666,60 +666,57 @@ checkTcArity RTyCon{ rtc_tc = tc } givenArity
 
 
 checkAbstractRefs :: SpecType -> Maybe Doc
-checkAbstractRefs rt = go rt
+checkAbstractRefs rt = go [] rt
   where
-    penv = mkPEnv rt
+    go penv t@(RAllT _ t1 r) = check penv (toRSort t :: RSort) r <|> go penv t1
+    go penv (RAllP p t) = go (p : penv) t
+    go penv t@(RApp c ts rs r) = check penv (toRSort t :: RSort) r <|> efold (go penv) ts <|> go' penv c rs
+    go penv t@(RFun _ _ t1 t2 r) = check penv (toRSort t :: RSort) r <|> go penv t1 <|> go penv t2
+    go penv t@(RVar _ r) = check penv (toRSort t :: RSort) r
+    go penv (REx _ t1 t2) = go penv t1 <|> go penv t2
+    go penv t@(RAppTy t1 t2 r) = check penv (toRSort t :: RSort) r <|> go penv t1 <|> go penv t2
+    go penv (RRTy xts _ _ t) = efold (go penv) (snd <$> xts) <|> go penv t
+    go _ (RLit _) = Nothing
+    go _ (RExprArg _) = Nothing
+    go _ (RHole _) = Nothing
 
-    go t@(RAllT _ t1 r)   = check (toRSort t :: RSort) r <|>  go t1
-    go (RAllP _ t)        = go t
-    go t@(RApp c ts rs r) = check (toRSort t :: RSort) r <|>  efold go ts <|> go' c rs
-    go t@(RFun _ _ t1 t2 r) = check (toRSort t :: RSort) r <|> go t1 <|> go t2
-    go t@(RVar _ r)       = check (toRSort t :: RSort) r
-    go (REx _ t1 t2)      = go t1 <|> go t2
-    go t@(RAppTy t1 t2 r) = check (toRSort t :: RSort) r <|> go t1 <|> go t2
-    go (RRTy xts _ _ t)   = efold go (snd <$> xts) <|> go t
-    go (RLit _)          = Nothing
-    go (RExprArg _)       = Nothing
-    go (RHole _)          = Nothing
+    go' penv c rs = L.foldl' (\acc (x, y) -> acc <|> checkOne' penv x y) Nothing (zip rs (rTyConPVs c))
 
-    go' c rs = L.foldl' (\acc (x, y) -> acc <|> checkOne' x y) Nothing (zip rs (rTyConPVs c))
-
-    checkOne' (RProp xs (RHole _)) p
-      | or [s1 /= s2 | ((_, s1), (s2, _, _)) <- zip xs (pargs p)]
-      = Just $ text "Wrong Arguments in" <+> pprint p
-      | length xs /= length (pargs p)
-      = Just $ text "Wrong Number of Arguments in" <+> pprint p
-      | otherwise
-      = Nothing
-    checkOne' (RProp xs t) p
-      | pvType p /= toRSort t
-      = Just $ text "Unexpected Sort in" <+> pprint p
-      | or [s1 /= s2 | ((_, s1), (s2, _, _)) <- zip xs (pargs p)]
-      = Just $ text "Wrong Arguments in" <+> pprint p
-      | length xs /= length (pargs p)
-      = Just $ text "Wrong Number of Arguments in" <+> pprint p
-      | otherwise
-      = go t
-
+    checkOne' _ (RProp xs (RHole _)) p
+        | or [s1 /= s2 | ((_, s1), (s2, _, _)) <- zip xs (pargs p)] =
+            Just $ text "Wrong Arguments in" <+> pprint p
+        | length xs /= length (pargs p) =
+            Just $ text "Wrong Number of Arguments in" <+> pprint p
+        | otherwise =
+            Nothing
+    checkOne' penv (RProp xs t) p
+        | pvType p /= toRSort t =
+            Just $ text "Unexpected Sort in" <+> pprint p
+        | or [s1 /= s2 | ((_, s1), (s2, _, _)) <- zip xs (pargs p)] =
+            Just $ text "Wrong Arguments in" <+> pprint p
+        | length xs /= length (pargs p) =
+            Just $ text "Wrong Number of Arguments in" <+> pprint p
+        | otherwise =
+            go penv t
 
     efold f = L.foldl' (\acc x -> acc <|> f x) Nothing
 
-    check s (MkUReft _ (Pr ps)) = L.foldl' (\acc pp -> acc <|> checkOne s pp) Nothing ps
+    check penv s (MkUReft _ (Pr ps)) = L.foldl' (\acc pp -> acc <|> checkOne penv s pp) Nothing ps
 
-    checkOne s p | pvType' p /= s
-                 = Just $ text "Incorrect Sort:\n\t"
-                       <+> text "Abstract refinement with type"
-                       <+> pprint (pvType' p)
-                       <+> text "is applied to"
-                       <+> pprint s
-                       <+> text "\n\t In" <+> pprint p
-                 | otherwise
-                 = Nothing
-
-    mkPEnv (RAllT _ t _) = mkPEnv t
-    mkPEnv (RAllP p t)   = p:mkPEnv t
-    mkPEnv _             = []
-    pvType' p          = Misc.safeHead (showpp p ++ " not in env of " ++ showpp rt) [pvType q | q <- penv, pname p == pname q]
+    checkOne penv s p =
+        case [q | q <- penv, pname p == pname q] of
+            [] -> Just $ text "Unbound abstract refinement" <+> pprint p
+            q : _
+                | pvType q /= s ->
+                    Just $
+                        text "Incorrect Sort:\n\t"
+                            <+> text "Abstract refinement with type"
+                            <+> pprint (pvType q)
+                            <+> text "is applied to"
+                            <+> pprint s
+                            <+> text "\n\t In"
+                            <+> pprint p
+                | otherwise -> Nothing
 
 checkReft ::
     (PPrint r, IsReft r, ReftBind r ~ F.Symbol, ReftVar r ~ F.Symbol, SubsTy RTyVar (RType RTyCon RTyVar NoReft) r) =>

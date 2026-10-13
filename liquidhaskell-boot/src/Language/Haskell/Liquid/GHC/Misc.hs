@@ -33,6 +33,7 @@ import           Liquid.GHC.API            as Ghc hiding
 import qualified Liquid.GHC.API            as Ghc (GenLocated (L))
 import           GHC.Tc.Gen.Expr                            (tcCheckPolyExpr)
 import           GHC.Tc.Solver                              (simplifyTop)
+import qualified GHC.Driver.Session                        as Session
 import           GHC.Types.Literal                          (LitNumType(LitNumBigNat))
 
 
@@ -856,7 +857,7 @@ Unlike rho inference, this retains the quantified type variables and all
 evidence belonging to that scope in the resulting Core expression.
 -}
 elabRnExprWithType :: LHsExpr GhcPs -> Type -> TcRn CoreExpr
-elabRnExprWithType rdr_expr expected = do
+elabRnExprWithType rdr_expr expected = updTopEnv generatedFlags $ do
     (rn_expr, _fvs) <- rnLExpr rdr_expr
     failIfErrsM
     (tc_expr, wanted) <- captureTopConstraints $ tcCheckPolyExpr rn_expr expected
@@ -876,6 +877,17 @@ elabRnExprWithType rdr_expr expected = do
             if exprType result `eqType` expected
                 then pure result
                 else panic Nothing "Generated predicate elaboration changed its expected type"
+  where
+    -- Telescope parameters are generated, often intentionally unused. This
+    -- local environment leaves authored source flags and all errors unchanged.
+    generatedFlags env =
+        env
+            { hsc_dflags =
+                foldl
+                    Session.wopt_unset
+                    (hsc_dflags env)
+                    [Session.Opt_WarnNameShadowing, Session.Opt_WarnUnusedLocalBinds, Session.Opt_WarnUnusedMatches]
+            }
 
 -- | inlineEvidenceLets will check traverse a Core expression and inline
 --   the definition of let bindings which serve as evidence variables.

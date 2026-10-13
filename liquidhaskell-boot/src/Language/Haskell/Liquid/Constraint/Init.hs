@@ -33,7 +33,7 @@ import           Language.Haskell.Liquid.Constraint.Env
 import           Language.Haskell.Liquid.WiredIn               (dictionaryVar)
 import qualified Language.Haskell.Liquid.GHC.SpanStack         as Sp
 import           Language.Haskell.Liquid.GHC.Misc             ( hasBaseTypeVar, isDataConId) -- dropModuleNames, simplesymbol)
-import           Liquid.GHC.API               as Ghc
+import           Liquid.GHC.API               as Ghc hiding (panic)
 import           Language.Fixpoint.Misc
 import           Language.Haskell.Liquid.Constraint.Types
 
@@ -52,26 +52,25 @@ import           Language.Haskell.Liquid.Types.Visitors
 import           Language.Haskell.Liquid.UX.Config
 
 --------------------------------------------------------------------------------
--- Ordered source declarations before query-local freshening. Duplicate rows
--- remain distinct; this product contains no query state or checking result.
-type DefaultTypes = ([(Var, SpecType)], [(Var, SpecType)], [(Var, SpecType)])
+-- Ordered native declarations and the counter following their initial freshening.
+-- Duplicate rows remain distinct; no checking obligations or results are cached.
+type DefaultTypes = (([(Var, SpecType)], [(Var, SpecType)], [(Var, SpecType)]), Integer)
 
-prepareDefaultTypes :: TyConMap -> F.TCEmb TyCon -> [Var] -> [Var] -> DefaultTypes
-prepareDefaultTypes tyi tce imports constructors =
-    (schemas imports, schemas constructors, schemas (filter isConLikeId imports))
+prepareDefaultTypes :: Bool -> Integer -> TyConMap -> F.TCEmb TyCon -> [Var] -> [Var] -> DefaultTypes
+prepareDefaultTypes allowTC seed tyi tce imports constructors = (schemas, next)
   where
-    schemas :: [Var] -> [(Var, SpecType)]
-    schemas owners = [(owner, addTyConInfo tce tyi (ofType (varType owner))) | owner <- owners]
+    ~(schemas, next) = runState preparation seed
+    preparation = (,,) <$> freshen imports <*> freshen constructors <*> freshen (filter isConLikeId imports)
+    freshen :: [Var] -> State Integer [(Var, SpecType)]
+    freshen = mapM (\owner -> (owner,) <$> true allowTC (addTyConInfo tce tyi (ofType (varType owner))))
 
 initEnv :: DefaultTypes -> [(Var, SpecType)] -> TargetInfo -> CG CGEnv
 --------------------------------------------------------------------------------
-initEnv ~(defaultSchemas, constructorSchemas, importedConstructorSchemas) callables info
+initEnv ~((defaults, dcsty, dcsty'), next) callables info
   = do let tce   = gsTcEmbeds (gsName sp)
-       let dcs   = map fst constructorSchemas
-       let dcs'  = map fst importedConstructorSchemas
-       defaults <- mapM (traverse (true allowTC)) defaultSchemas
-       dcsty    <- mapM (traverse (true allowTC)) constructorSchemas
-       dcsty'   <- mapM (traverse (true allowTC)) importedConstructorSchemas
+       let dcs   = map fst dcsty
+       let dcs'  = map fst dcsty'
+       modify $ \s -> s {freshIndex = next}
        (hs,f0)  <- refreshHoles allowTC $ grty info                           -- asserted refinements     (for defined vars)
        f0' <- refreshArgs' =<< grtyTop info -- default TOP reftype      (for exported vars without spec)
        f1       <- refreshArgs'   defaults                            -- default TOP reftype      (for all vars)
@@ -81,9 +80,9 @@ initEnv ~(defaultSchemas, constructorSchemas, importedConstructorSchemas) callab
        f3       <- addPolyInfo' <$> refreshArgs' (vals gsAsmSigs (gsSig sp))                 -- assumed refinedments     (with `assume`)
        f40      <- strengthenDc <$> refreshArgs' (vals gsCtors (gsData sp)) -- constructor refinements  (for measures)
        f5       <- refreshArgs' $ vals gsInSigs (gsSig sp)                   -- internal refinements     (from Haskell measures)
-       fi       <- refreshArgs' $ catMaybes $ [(x,) . val <$> getMethodType mt | (x, mt) <- gsMethods $ gsSig $ giSpec info ]
-       (invs1, f41) <- traverse refreshArgs' $ makeAutoDecrDataCons dcsty  (gsAutosize (gsTerm sp)) dcs
-       (invs2, f42) <- traverse refreshArgs' $ makeAutoDecrDataCons dcsty' (gsAutosize (gsTerm sp)) dcs'
+       fi       <- refreshArgs' $ catMaybes $ [(x,) . ordinarySpecType . val <$> getMethodType mt | (x, mt) <- gsMethods $ gsSig $ giSpec info ]
+       (invs1, f41) <- traverse refreshArgs' $ makeAutoDecrDataCons (autoSizeMeasure sp) dcsty  (gsAutosize (gsTerm sp)) dcs
+       (invs2, f42) <- traverse refreshArgs' $ makeAutoDecrDataCons (autoSizeMeasure sp) dcsty' (gsAutosize (gsTerm sp)) dcs'
        let f4    = mergeDataConTypes tce (mergeDataConTypes tce f40 (f41 ++ f42)) (filter (isDataConId . fst) (f2 ++ f3))
        let tx    = first F.symbol . addRInv ialias . predsUnify sp
        f6       <- map tx . addPolyInfo' <$> refreshArgs' (vals gsRefSigs (gsSig sp))
@@ -153,26 +152,28 @@ addPolyInfo t = mkUnivs (go <$> as) ps t'
 --   @dcts@ gives the unrefined type of every constructor, @specenv@ the types
 --   declared @autosize@ and @dcs@ the constructors in scope. Constructors of a
 --   type that was not declared @autosize@ are left alone.
-makeAutoDecrDataCons :: [(Id, SpecType)] -> S.HashSet TyCon -> [Id] -> ([LocSpecType], [(Id, SpecType)])
-makeAutoDecrDataCons dcts specenv dcs
+makeAutoDecrDataCons :: Maybe F.LocSymbol -> [(Id, SpecType)] -> S.HashSet TyCon -> [Id] -> ([LocSpecType], [(Id, SpecType)])
+makeAutoDecrDataCons sizeMeasure dcts specenv dcs
   = (simplify rsorts, tys)
   where
     (rsorts, tys) = unzip $ concatMap go tycons
     tycons      = L.nub $ mapMaybe idTyCon dcs
 
     go tycon
-      | S.member tycon specenv =  zipWith (makeSizedDataCons specenv dcts) (tyConDataCons tycon) [0..]
+      | S.member tycon specenv =  zipWith (makeSizedDataCons sizeMeasure specenv dcts) (tyConDataCons tycon) [0..]
     go _
       = []
 
     simplify invs = dummyLoc . (`strengthen` invariant) .  fmap (const mempty) <$> L.nub invs
-    invariant = MkUReft (F.Reft (F.vv_, F.PAtom F.Ge (lenOf F.vv_) (F.ECon $ F.I 0)) ) mempty
+    invariant = MkUReft (F.Reft (F.vv_, F.PAtom F.Ge (lenOf sizeMeasure F.vv_) (F.ECon $ F.I 0)) ) mempty
 
 idTyCon :: Id -> Maybe TyCon
 idTyCon = fmap dataConTyCon . Ghc.isDataConId_maybe
 
-lenOf :: F.Symbol -> F.Expr
-lenOf x = F.mkEApp lenLocSymbol [F.EVar x]
+lenOf :: Maybe F.LocSymbol -> F.Symbol -> F.Expr
+lenOf sizeMeasure x = F.mkEApp owner [F.EVar x]
+  where
+    owner = fromMaybe (panic Nothing "Missing or ambiguous autosize measure declaration") sizeMeasure
 
 -- | Refines the result type of @x'@, the @n@-th constructor of its type, with
 --   an equation that puts its size at @n@ plus the size of every field whose
@@ -182,18 +183,18 @@ lenOf x = F.mkEApp lenLocSymbol [F.EVar x]
 --   Every autosized field counts, so the size grows along an edge between two
 --   mutually recursive types. A field of a type that is not autosized has no
 --   @autolen@ of its own and contributes nothing.
-makeSizedDataCons :: S.HashSet TyCon -> [(Id, SpecType)] -> DataCon -> Integer -> (RSort, (Id, SpecType))
-makeSizedDataCons specenv dcts x' n = (toRSort $ ty_res trep, (x, fromRTypeRep trep{ty_res = tres}))
+makeSizedDataCons :: Maybe F.LocSymbol -> S.HashSet TyCon -> [(Id, SpecType)] -> DataCon -> Integer -> (RSort, (Id, SpecType))
+makeSizedDataCons sizeMeasure specenv dcts x' n = (toRSort $ ty_res trep, (x, fromRTypeRep trep{ty_res = tres}))
     where
       x      = dataConWorkId x'
       st     = fromMaybe (impossible Nothing "makeSizedDataCons: this should never happen") $ L.lookup x dcts
       trep   = toRTypeRep st
-      tres   = ty_res trep `strengthen` MkUReft (F.Reft (F.vv_, F.PAtom F.Eq (lenOf F.vv_) computelen)) mempty
+      tres   = ty_res trep `strengthen` MkUReft (F.Reft (F.vv_, F.PAtom F.Eq (lenOf sizeMeasure F.vv_) computelen)) mempty
 
       recarguments = filter (autosized . fst) (zip (ty_args trep) (ty_binds trep))
       autosized (RApp c _ _ _) = S.member (rtc_tc c) specenv
       autosized _              = False
-      computelen   = foldr (F.EBin F.Plus) (F.ECon $ F.I n) (lenOf .  snd <$> recarguments)
+      computelen   = foldr (F.EBin F.Plus) (F.ECon $ F.I n) (lenOf sizeMeasure .  snd <$> recarguments)
 
 mergeDataConTypes ::  F.TCEmb TyCon -> [(Var, SpecType)] -> [(Var, SpecType)] -> [(Var, SpecType)]
 mergeDataConTypes tce xts yts = merge (L.sortBy f xts) (L.sortBy f yts)
@@ -338,55 +339,60 @@ infoLits litF selF info = F.fromListSEnv $ importedLits ++ cbLits ++ measLits
 -- strict record with its own obligations; updating a prebuilt record would
 -- demand the base target's unselected obligations before replacing them.
 initCGI :: Config -> TargetInfo -> TargetInfo -> CGInfo
-initCGI cfg base = \info -> CGInfo {
-    fEnv          = F.emptySEnv
-  , hsCs          = []
-  , hsWfs         = []
-  , fixCs         = []
-  , fixWfs        = []
-  , freshIndex    = 0
-  , dataConTys    = []
-  , binds         = F.emptyBindEnv
-  , localRewrites = mempty
-  , ebinds        = []
-  , annotMap      = AI M.empty
-  , newTyEnv      = newTypes
-  , tyConInfo     = tyi
-  , tyConEmbed    = tce
-  , kuts          = mempty
-  , kvPacks       = mempty
-  , cgLits        = literals
-  , cgConsts      = constants
-  , cgADTs        = gsADTs nspc
-  , termExprs     = metrics
-  , specLVars     = gsLvars (gsVars spc)
-  , specLazy      = lazyOwners
-  , specTmVars    = gsNonStTerm tspc
-  , tcheck        = terminationCheck cfg
-  , cgiTypeclass  = typeclass cfg
-  , pruneRefs     = pruneUnsorted cfg
-  , logErrors     = []
-  , kvProf        = emptyKVProf
-  , recCount      = 0
-  , bindSpans     = M.empty
-  , autoSize      = gsAutosize tspc
-  , allowHO       = higherOrderFlag cfg
-  , ghcI          = info
-  , unsorted      = F.notracepp "UNSORTED" $ F.makeTemplates $ gsUnsorted $ gsData (giSpec info)
-  , hsHoles      = M.empty
-  , hsANFHoles   = M.empty
-  , hsHolesExprs = M.empty
-  , refinementChecksByOwner = M.fromListWith (++)
-      [(refinementCheckOwner check, [check]) | check <- gsReftChecks (gsSig (giSpec info))]
-  , visitedRefinementOwners = S.empty
-  }
+initCGI cfg base = \info ->
+    CGInfo
+        { fEnv = F.emptySEnv
+        , hsCs = []
+        , hsWfs = []
+        , fixCs = []
+        , fixWfs = []
+        , freshIndex = 0
+        , dataConTys = []
+        , admittedInterfaces = mempty
+        , interfaceEndpoints = []
+        , binds = F.emptyBindEnv
+        , localRewrites = mempty
+        , ebinds = []
+        , annotMap = AI M.empty
+        , newTyEnv = newTypes
+        , tyConInfo = tyi
+        , tyConEmbed = tce
+        , kuts = mempty
+        , kvPacks = mempty
+        , cgLits = literals
+        , cgConsts = constants
+        , cgADTs = gsADTs nspc
+        , termExprs = metrics
+        , specLVars = gsLvars (gsVars spc)
+        , specLazy = lazyOwners
+        , specTmVars = gsNonStTerm tspc
+        , tcheck = terminationCheck cfg
+        , cgiTypeclass = typeclass cfg
+        , pruneRefs = pruneUnsorted cfg
+        , logErrors = []
+        , kvProf = emptyKVProf
+        , recCount = 0
+        , bindSpans = M.empty
+        , autoSize = gsAutosize tspc
+        , allowHO = higherOrderFlag cfg
+        , ghcI = info
+        , unsorted = F.notracepp "UNSORTED" $ F.makeTemplates $ gsUnsorted $ gsData (giSpec info)
+        , hsHoles = M.empty
+        , hsANFHoles = M.empty
+        , hsHolesExprs = M.empty
+        , refinementChecksByOwner =
+            M.fromListWith
+                (++)
+                [(refinementCheckOwner check, [check]) | check <- gsReftChecks (gsSig (giSpec info))]
+        , visitedRefinementOwners = S.empty
+        }
   where
-    tce        = gsTcEmbeds nspc
-    tspc       = gsTerm spc
-    spc        = giSpec base
-    tyi        = gsTyconEnv nspc
-    nspc       = gsName spc
-    notFn      = isNothing . F.functionSort
+    tce = gsTcEmbeds nspc
+    tspc = gsTerm spc
+    spc = giSpec base
+    tyi = gsTyconEnv nspc
+    nspc = gsName spc
+    notFn = isNothing . F.functionSort
     newTypes = M.fromList (fmap val <$> gsNewTypes (gsSig spc))
     literals = infoLits (gsMeas . gsData) (const True) base
     constants = infoLits (gsMeas . gsData) notFn base

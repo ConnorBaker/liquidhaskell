@@ -7,12 +7,16 @@ import Data.Generics (everywhere, mkT)
 import qualified Data.HashMap.Strict as M
 import qualified Data.HashSet as S
 import Data.List (isInfixOf)
-import Data.Maybe (isJust, isNothing)
+import Data.Maybe (isJust, isNothing, maybeToList)
 import Data.String (fromString)
+import qualified GHC.Builtin.Types as G (charTy, mkListTy)
+import qualified GHC.Core.Type as G (mkVisFunTyMany)
 import qualified GHC.Types.Unique.Supply as Unique
 import qualified Language.Fixpoint.Types as F
-import Language.Haskell.Liquid.Bare.Class (classMethodField, instanceDictionaryOwners, makeMethodTypes)
+import Language.Haskell.Liquid.Bare.Class (classMethodField, instanceDictionaryOwners, makeMethodTypes, nominalEqualitySubstitution)
 import Language.Haskell.Liquid.Bare.Plugged (makePluggedDataCon)
+import qualified Language.Haskell.Liquid.Bare.Resolve as Resolve
+import qualified Language.Haskell.Liquid.Bare.Types as Bare
 import qualified Language.Haskell.Liquid.GHC.Misc as GM
 import Language.Haskell.Liquid.Measure (constructorSourceMatch, constructorWorkerType, makeConstructorBox)
 import qualified Language.Haskell.Liquid.Transforms.CoreToLogic as Logic
@@ -37,7 +41,8 @@ tests compileToCore =
     withResource prepare (const (pure ())) $ \fixture ->
         testGroup
             "method telescope"
-            [ testCase "omitted instance context" $ do
+            [ predicateResolverTests
+            , testCase "omitted instance context" $ do
                 f@(Fixture _ _ _ _ actual) <- fixture
                 _ <- check f =<< dropContext 2 actual
                 pure ()
@@ -45,6 +50,33 @@ tests compileToCore =
                 f@(Fixture _ _ _ _ actual) <- fixture
                 _ <- check f actual
                 pure ()
+            , testCase "nominal evidence chains have one order-independent image" $ do
+                Fixture _ dictionary _ _ _ <- fixture
+                let (variables, _, _, _) = G.tcSplitDFunTy (G.varType dictionary)
+                [a, b] <- pure variables
+                let equations = [(G.TyVarTy a, G.TyVarTy b), (G.TyVarTy a, G.charTy)]
+                    checkImage pairs = do
+                        substitution <- maybe (assertFailure "nominal equality chain refused" >> pure []) pure (nominalEqualitySubstitution variables pairs)
+                        mapM_ (\variable -> assertBool "chain image is not Char" (maybe False (`G.eqType` G.charTy) (lookup variable substitution))) variables
+                mapM_ checkImage [equations, reverse equations, [(G.TyVarTy a, G.TyVarTy b), (G.TyVarTy b, G.charTy)]]
+            , testCase "nominal evidence refuses rigid conflict and recursive image" $ do
+                Fixture _ dictionary _ _ _ <- fixture
+                let (variables, _, _, _) = G.tcSplitDFunTy (G.varType dictionary)
+                a : _ <- pure variables
+                assertBool "rigid unequal carriers admitted" (isNothing (nominalEqualitySubstitution variables [(G.intTy, G.charTy)]))
+                assertBool "recursive carrier image admitted" (isNothing (nominalEqualitySubstitution variables [(G.TyVarTy a, G.mkListTy (G.TyVarTy a))]))
+                assertBool "non-DFun coordinate bound" (isNothing (nominalEqualitySubstitution [] [(G.TyVarTy a, G.charTy)]))
+            , testCase "imported equality-chain fields agree in either source order" $
+                mapM_ checkEqualityCarrier ["a ~ b, a ~ Char", "a ~ Char, a ~ b"]
+            , testCase "imported admission retains context without replacing the selector" $ do
+                Fixture _ dictionary selector _ actual <- fixture
+                supplied <- dropContext 2 actual
+                let declarations = dfromList [(dictionary, M.singleton (F.symbol (G.getOccString selector)) (RISig (F.dummyLoc supplied)))]
+                    methods = makeMethodTypes mempty False declarations [] [] []
+                Just obligation <- pure (lookup selector methods)
+                assertBool "imported obligation became a callable selector assumption" (isNothing (getMethodType obligation))
+                Just signature <- pure (tyInstance obligation)
+                assertBool "imported method lost its instance context or method-local forall" (toType False (ordinarySpecType $ F.val signature) `G.eqType` toType False actual)
             , testCase "constructor source carrier retains nested polymorphic evidence" $ do
                 dc <- semigroupConstructor =<< fixture
                 assertBool
@@ -194,6 +226,38 @@ tests compileToCore =
                     Right _ -> assertFailure "an abstract predicate escaped its type-variable scope"
             ]
   where
+    checkEqualityCarrier context = do
+        program <-
+            compileToCore "EqualityCarrier" $
+                unlines
+                    [ "{-# LANGUAGE TypeFamilies, FlexibleInstances, UndecidableInstances #-}"
+                    , "module EqualityCarrier where"
+                    , "class Carrier a where keep :: a -> a"
+                    , "instance (" ++ context ++ ") => Carrier [a] where keep x = x"
+                    ]
+        [dictionary] <- pure [owner | (owner, _) <- G.flattenBinds program, G.isDFunId owner]
+        owners <- maybe (assertFailure "missing equality dictionary owners" >> pure []) pure (instanceDictionaryOwners program dictionary)
+        [(selector, implementation)] <- pure owners
+        let carrier = G.mkListTy G.charTy
+            field = ofType (G.mkVisFunTyMany carrier carrier) :: SpecType
+            declarations = dfromList [(dictionary, M.singleton (F.symbol (G.getOccString selector)) (RISig (F.dummyLoc field)))]
+        Just imported <- pure (lookup selector (makeMethodTypes mempty False declarations [] [] []))
+        mapM_
+            ( \signature -> do
+                let (_, _, _, body) = bkUnivClass' (ordinarySpecType $ F.val signature)
+                assertBool "equality-chain field failed to specialize to String" (toType False body `G.eqType` toType False field)
+            )
+            (maybeToList (tyInstance imported) ++ maybeToList (tyClass imported))
+        -- This is not source-carrier transport: an imported admission projection
+        -- must not silently admit the same concrete schema as a local callable
+        -- whose actual GHC result remains [a] under equality evidence.
+        let local = lookup implementation (makeMethodTypes mempty False declarations [] [] program) >>= tyInstance
+        rejected <- try (evaluate (maybe G.intTy (toType False . ordinarySpecType . F.val) local)) :: IO (Either Error G.Type)
+        case rejected of
+            Left ErrMismatch{} -> pure ()
+            Left err -> assertFailure ("wrong local equality-carrier refusal: " ++ F.showpp err)
+            Right _ -> assertFailure "unsupported local equality source-carrier transport admitted"
+
     prepare = do
         program <-
             compileToCore "InstanceContextMethod" $
@@ -265,8 +329,8 @@ semigroupConstructor (Fixture _ dictionary _ _ _) =
 
 invoke :: Fixture -> SpecType -> IO SpecType
 invoke (Fixture program dictionary selector method _) supplied =
-    maybe (fail "missing actual method result") (pure . F.val) $
-        lookup method (makeMethodTypes mempty False declarations [] program) >>= tyInstance
+    maybe (fail "missing actual method result") (pure . ordinarySpecType . F.val) $
+        lookup method (makeMethodTypes mempty False declarations [] [] program) >>= tyInstance
   where
     declarations =
         dfromList
@@ -312,3 +376,93 @@ assertScoped
             "predicate sort escapes the method forall"
             (all ((== ty_var_value variable) . ty_var_value) (concatMap freeTyVars (ptype predicate : [s | (s, _, _) <- pargs predicate])))
 assertScoped _ _ = assertFailure "method predicate, evidence, or dependent arrow moved out of its telescope position"
+
+predicateResolverTests :: TestTree
+predicateResolverTests =
+    testGroup
+        "lexical predicate resolution"
+        [ testCase "nested predicate defaults keep both lexical owners" $
+            case resolvePredicateScope (predicateScope False) of
+                Right (RAllP _ (RFun _ _ (RAllP _ inner) sibling _)) -> do
+                    predicateArguments inner @?= [("outer", ["outerArgument"]), ("inner", ["innerArgument"])]
+                    predicateArguments sibling @?= [("outer", ["outerArgument"])]
+                _ -> assertFailure "resolution changed the predicate telescope"
+        , testCase "callback shadowing does not change a sibling owner" $
+            case resolvePredicateScope predicateShadow of
+                Right (RAllP _ (RFun _ _ (RAllP _ inner) sibling _)) -> do
+                    predicateArguments inner @?= [("same", ["innerPosition"])]
+                    predicateArguments sibling @?= [("same", ["outerPosition"])]
+                _ -> assertFailure "resolution changed the shadowing telescope"
+        , testCase "a callback predicate cannot escape into a sibling" $ do
+            refusal <-
+                try (evaluate (either (length . show) (length . F.showpp) (resolvePredicateScope (predicateScope True)))) ::
+                    IO (Either UserError Int)
+            case refusal of
+                Left (ErrUnbPred span predicate) -> do
+                    span @?= GM.sourcePosSrcSpan predicateSourcePos
+                    assertBool "wrong predicate escaped" ("inner" `isInfixOf` show predicate)
+                Left err -> assertFailure ("wrong resolver diagnostic: " ++ show err)
+                Right _ -> assertFailure "callback predicate escaped its lexical body"
+        , testCase "predicate resolution refuses excess actuals before substitution" $ do
+            let supplied = [(NoReft, name, F.EVar name) | name <- ["first", "second"]]
+                body = RVar predicateVariable (MkUReft mempty (Pr [PV "p" NoReft supplied]))
+                signature = RAllP (predicateBinder "p" "declared") body
+            refusal <-
+                try (evaluate (either (length . show) (length . F.showpp) (resolvePredicateScope signature))) ::
+                    IO (Either UserError Int)
+            case refusal of
+                Left err@(ErrOther span _) -> do
+                    span @?= GM.sourcePosSrcSpan predicateSourcePos
+                    assertBool "wrong argument-count diagnostic" ("expects at most 1 arguments, but is given 2" `isInfixOf` F.showpp err)
+                Left err -> assertFailure ("wrong resolver diagnostic: " ++ show err)
+                Right _ -> assertFailure "resolution silently truncated predicate actuals"
+        ]
+
+predicateSourcePos :: F.SourcePos
+predicateSourcePos = F.dummyPos "PredicateOwner.hs"
+
+resolvePredicateScope :: BareType -> Resolve.Lookup SpecType
+resolvePredicateScope = Resolve.ofBareTypeE environment predicateSourcePos Nothing
+  where
+    unused = error "lexical predicate fixture does not use GHC lookup"
+    environment = Bare.RE unused unused unused unused unused [] defConfig unused unused unused
+
+predicateVariable :: BTyVar
+predicateVariable = BTV (F.dummyLoc "a")
+
+predicateBinder :: F.Symbol -> F.Symbol -> BPVar
+predicateBinder name argument =
+    PV name (RVar predicateVariable NoReft) [(RVar predicateVariable NoReft, argument, F.EVar argument)]
+
+predicateUse :: [F.Symbol] -> BareType
+predicateUse names =
+    RVar predicateVariable (MkUReft mempty (Pr [PV name NoReft [] | name <- names]))
+
+predicateScope :: Bool -> BareType
+predicateScope escapes =
+    RAllP
+        (predicateBinder "outer" "outerArgument")
+        ( RFun
+            "callback"
+            defRFInfo
+            (RAllP (predicateBinder "inner" "innerArgument") (predicateUse ["outer", "inner"]))
+            (predicateUse [if escapes then "inner" else "outer"])
+            mempty
+        )
+
+predicateShadow :: BareType
+predicateShadow =
+    RAllP
+        (predicateBinder "same" "outerPosition")
+        ( RFun
+            "callback"
+            defRFInfo
+            (RAllP (predicateBinder "same" "innerPosition") (predicateUse ["same"]))
+            (predicateUse ["same"])
+            mempty
+        )
+
+predicateArguments :: SpecType -> [(F.Symbol, [F.Symbol])]
+predicateArguments (RVar _ (MkUReft _ (Pr predicates))) =
+    [(pname predicate, [name | (_, name, _) <- pargs predicate]) | predicate <- predicates]
+predicateArguments _ = []

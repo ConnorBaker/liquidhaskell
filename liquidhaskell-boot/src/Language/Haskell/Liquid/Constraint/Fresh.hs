@@ -17,6 +17,8 @@ module Language.Haskell.Liquid.Constraint.Fresh
   , freshTyExpr
   , trueTy
   , addKuts
+  , addKVars
+  , specTypeKVars
   )
   where
 

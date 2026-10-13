@@ -737,12 +737,10 @@ expandApp l re es
 -------------------------------------------------------------------------------
 -- | Replace Predicate Arguments With Existentials ----------------------------
 -------------------------------------------------------------------------------
-txExpToBind   :: SpecType -> SpecType
+txExpToBind :: SpecType -> SpecType
 -------------------------------------------------------------------------------
 txExpToBind t =
-  evalState (expToBindT t) (ExSt 0 M.empty πs)
-  where
-    πs        = M.fromList [(pname p, p) | p <- ty_preds $ toRTypeRep t ]
+    evalState (expToBindT t) (ExSt 0 M.empty M.empty)
 
 data ExSt = ExSt { fresh :: Int
                  , emap  :: M.HashMap F.Symbol (RSort, F.Expr)
@@ -762,8 +760,13 @@ expToBindT (RFun x i t1 t2 r)
 expToBindT (RAllT a t r)
   = do t' <- expToBindT t
        expToBindRef r >>= addExists . RAllT a t'
-expToBindT (RAllP p t)
-  = fmap (RAllP p) (expToBindT t)
+expToBindT (RAllP p t) =
+    do
+        predicates <- gets pmap
+        modify $ \st -> st{pmap = M.insert (pname p) p predicates}
+        t' <- expToBindT t
+        modify $ \st -> st{pmap = predicates}
+        return $ RAllP p t'
 expToBindT (RApp c ts rs r)
   = do ts' <- mapM expToBindT ts
        rs' <- mapM expToBindReft rs

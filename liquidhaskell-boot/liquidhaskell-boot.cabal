@@ -14,6 +14,7 @@ category:           Language
 homepage:           https://github.com/ucsd-progsys/liquidhaskell
 build-type:         Simple
 tested-with:        GHC == 9.14.1
+extra-source-files: ghc-api-tests/fixtures/EmbeddingOwner.hs
 
 source-repository head
   type:     git
@@ -211,15 +212,22 @@ test-suite ghc-api-tests
   main-is:          GhcApiTests.hs
   hs-source-dirs:   ghc-api-tests
   other-modules:
+    CachedNativePrefixTests
+    CheckedPredicateOwnerTests
     ConstraintGenerationTests
     DefaultSchemaSharingTests
+    EmbeddingSortTests
+    PrivateReflectTests
     FamilyPredicateTests
     LogicSupportTests
     MeasureApplicabilityTests
     MethodAdmissionTests
     MethodTelescopeTests
+    NativeJudgmentTests
     QualifierDecompositionTests
     QueryTelescopeTests
+    RefinementRepresentationTests
+    SplitJudgmentTests
     RewriteDependencyTests
     SpecClosureTests
     TypeLiteralIdentityTests
@@ -229,6 +237,7 @@ test-suite ghc-api-tests
                   , deepseq
                   , ghc
                   , ghc-paths
+                  , hashable
                   , liquid-fixpoint
                   , liquidhaskell-boot
                   , mtl
