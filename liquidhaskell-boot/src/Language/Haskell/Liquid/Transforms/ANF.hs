@@ -35,7 +35,8 @@ import qualified Text.Printf as Printf
 import           Data.Hashable
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HM
-import GHC.Core.Coercion (mkCoVarCo)
+import GHC.Core.Coercion (isReflCo, mkAppCo, mkCoVarCo, mkSymCo)
+import GHC.Core.TyCo.Rep (Coercion (AppCo, TransCo))
 import qualified GHC.Core.Opt.Arity as Arity
 import qualified GHC.Core.Subst as Subst
 import GHC.Core.Type (ForAllTyBinder)
@@ -280,6 +281,13 @@ normalize γ (Cast e co)
         let body = Core.mkCastMCo (App (Var function) converted) resultCoercion
         normalize γ $ Case e function target [Alt DEFAULT [] (Lam argument body)]
 
+-- A composed coercion crosses each intermediate representation in turn. Check
+-- every newtype introduction or elimination at its own boundary, and give each
+-- step its own meaning, instead of treating the whole path as opaque evidence.
+normalize γ (Cast e co)
+  | Just (first, second) <- splitCoercionComposition co
+  = normalize γ (Cast (Cast e first) second)
+
 normalize γ (Cast e τ)
   = do e' <- normalizeName γ e
        return $ Cast e' τ
@@ -508,3 +516,17 @@ incrCaseDepth _       γ = γ
 
 at :: AnfEnv -> CoreTickish -> AnfEnv
 at γ tt = γ { aeSrcSpan = Sp.push (Sp.Tick tt) (aeSrcSpan γ)}
+
+-- | Split a composed coercion at its intermediate type. Symmetry reverses the
+-- composition, and applying a composition to a reflexive argument applies each
+-- step to it; a non-reflexive argument would not meet at the intermediate type.
+splitCoercionComposition :: Coercion -> Maybe (Coercion, Coercion)
+splitCoercionComposition (TransCo first second) = Just (first, second)
+splitCoercionComposition (SymCo co) = do
+  (first, second) <- splitCoercionComposition co
+  pure (mkSymCo second, mkSymCo first)
+splitCoercionComposition (AppCo function argument)
+  | isReflCo argument = do
+      (first, second) <- splitCoercionComposition function
+      pure (mkAppCo first argument, mkAppCo second argument)
+splitCoercionComposition _ = Nothing

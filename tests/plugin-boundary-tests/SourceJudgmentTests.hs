@@ -711,6 +711,13 @@ tests fixture compiler optimization =
                   ("NewtypeEvidenceBad", UnsafeAt [16])
                 , ("NewtypeRangeBad", UnsafeAt [16])
                 , ("NewtypeProjectionBad", UnsafeAt [16])
+                , -- A constructor application is a cast; its expected refinement
+                  -- is an obligation, never a premise of the cast.
+                  ("NewtypeCastExpectedBad", UnsafeAt [12, 16])
+                , -- Composed coercions are checked and interpreted at each
+                  -- intermediate newtype boundary.
+                  ("NewtypeComposedDomainGood", Safe)
+                , ("NewtypeComposedDomainBad", UnsafeAt [13])
                 ]
             )
         ,
