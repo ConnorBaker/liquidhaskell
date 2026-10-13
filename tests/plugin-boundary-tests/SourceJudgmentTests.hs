@@ -419,6 +419,8 @@ tests fixture compiler optimization =
                 , ("TotalityPureThrow", UnsafeAt [7])
                 , ("TotalityCaughtThrowIO", Safe)
                 , ("TotalityErrorUnreachable", Safe)
+                , ("TotalityUndefined", UnsafeAt [6])
+                , ("TotalityUndefinedUnreachable", Safe)
                 ]
             )
         ,
