@@ -1068,6 +1068,20 @@ primitiveQuery flags native location embeddings measures projections instances s
         F.EVar name | isSource name -> pure (variable name)
         _
             | (F.EVar name, [argument]) <- application expression
+            , isSource name
+            , isMeasure name -> do
+                -- A source function with a measure (a lifted function or a
+                -- field selector) applied to a logical carrier has no source
+                -- value to consume; it denotes its logical observation.
+                lowered <- lower argument
+                logical <- logicalOperand lowered
+                if logical
+                    then measureApplication name lowered
+                    else do
+                        argument' <- if logicalInteger argument then integerArgument (variable name) lowered else pure lowered
+                        pure (applyQuery (variable name) argument')
+        _
+            | (F.EVar name, [argument]) <- application expression
             , not (isSource name)
             , Just alternatives <- M.lookup name projectionCases -> do
                 lowered <- lower argument
