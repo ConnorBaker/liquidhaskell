@@ -320,8 +320,10 @@ resolveDecls mName tc mds  = F.notracepp msg $
   where
     msg                    = "resolveDecls" ++ F.showpp (mName, tc)
     isMyDef                = (mName ==)             . fst
-    isHomeDef              = (tcHome ==) . F.symbol . fst
-    tcHome                 = GM.takeModuleNames (F.symbol tc)
+    -- The home module is the TyCon's defining module. Its symbol also names
+    -- the defining unit, which a specification's module name does not carry.
+    isHomeDef              = (tcHome ==) . Just . getModName . fst
+    tcHome                 = Ghc.moduleName <$> Ghc.nameModule_maybe (Ghc.getName tc)
     isLHAssumptionsDef     = L.isSuffixOf "_LHAssumptions" . Ghc.moduleNameString . getModName . fst
 
 groupDataCons :: [(Ghc.TyCon, (ModName, DataPropDecl))]
