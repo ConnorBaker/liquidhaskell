@@ -361,9 +361,13 @@ checkSourceTarget info = do
         F.Safe _ -> True
         _ -> False
 
-    -- Ordinary source checking retains its existing qualifier policy. Admission
-    -- additionally mines candidates from its own body/formation/truth constraints;
-    -- neither candidate source changes which predicates are assumptions or goals.
+    -- Authored checking (a direct group, or a body after its admission) keeps
+    -- the ordinary qualifier policy: explicit qualifiers and those scraped from
+    -- signatures and aliases. Only independent queries, which infer a callable
+    -- or row without an authored target (admission, declarations, compatibility
+    -- and interface proofs), additionally mine candidates from their own
+    -- body/formation/truth constraints. Neither candidate source changes which
+    -- predicates are assumptions or goals.
     query suffix compatibilityRows callables available interfaces declarations group obligation bodyless = do
         let stage = stageInfo callables available declarations group obligation bodyless
             initialize = if obligation == IndependentBodyAndFormation then sourceInitializer else authoredInitializer
@@ -387,7 +391,7 @@ checkSourceTarget info = do
             -- inference additionally observes these prepared result KVars.
             requestedTypes = map snd prepared ++ [F.val ty | (_, method) <- interfaceEndpoints cgi, ty <- Mb.catMaybes [tyInstance method, tyClass method]]
             fcfg = baseConfig{FC.noslice = FC.noslice baseConfig || any (not . null . specTypeKVars) requestedTypes}
-            scraping = if obligation == AuthoredBody then FC.No else FC.Both
+            scraping = if obligation == IndependentBodyAndFormation then FC.Both else FC.No
             finfo = original{F.quals = F.sortNub (giQuals enriched (fEnv cgi) ++ Horn.scrapeFInfo fcfg scraping original)}
         F.Result{resStatus = r0, resSolution = solCuts, resNonCutsSolution = solNonCuts, resScopes = scopes} <- solve fcfg finfo
         let rawResult = (ci_var . snd <$> r0) `addErrors` (Nothing <$ logErrors cgi)
