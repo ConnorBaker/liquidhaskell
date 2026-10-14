@@ -10,7 +10,8 @@ signals b = if b then 1 : rest else rest
   where rest = [2, 9]
 
 {-@ splitLast :: xs : [a]
-      -> {v : Maybe ([a], a) | isJust v => len (fst (fromJust v)) == len xs - 1} @-}
+      -> {v : Maybe ([a], a) | (isJust v <=> len xs > 0)
+                            && (isJust v => len (fst (fromJust v)) == len xs - 1)} @-}
 splitLast :: [a] -> Maybe ([a], a)
 splitLast [] = Nothing
 splitLast (x : xs) = case splitLast xs of

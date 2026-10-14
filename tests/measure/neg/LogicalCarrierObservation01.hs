@@ -6,7 +6,8 @@ module LogicalCarrierObservation01 (splitLast) where
 import Data.Maybe ()
 
 {-@ splitLast :: xs : [a]
-      -> {v : Maybe ([a], a) | isJust v => len (fst (fromJust v)) == len xs} @-}
+      -> {v : Maybe ([a], a) | (isJust v <=> len xs > 0)
+                            && (isJust v => len (fst (fromJust v)) == len xs)} @-}
 splitLast :: [a] -> Maybe ([a], a)
 splitLast [] = Nothing
 splitLast (x : xs) = case splitLast xs of
