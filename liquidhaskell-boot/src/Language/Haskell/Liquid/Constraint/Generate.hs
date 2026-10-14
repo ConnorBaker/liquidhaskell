@@ -1304,8 +1304,8 @@ consEAppUsing :: (CGEnv -> CoreExpr -> CG SpecType) -> CGEnv -> CoreExpr -> CG S
 consEAppUsing synthesize γ e'@(App e a@(Type τ)) =
     do
         RAllT α te _ <- checkAll ("Non-all TyApp with expr", e) γ <$> synthesize γ e
-        -- Runtime dictionaries are checked arguments. Their constructor-field
-        -- variance, not a class-name whitelist, constrains instantiation.
+        -- Runtime dictionaries are checked arguments. Their fields, not a
+        -- class-name whitelist, constrain instantiation (see knownDictionary).
         t <-
             if not (nopolyinfer (getConfig γ)) && isPos α
                 then freshTyType (typeclass (getConfig γ)) TypeInstE e τ
@@ -1325,13 +1325,13 @@ consEAppUsing synthesize γ e'@(App e a@(Type τ)) =
 consEAppUsing synthesize γ e'@(App e a) | Just aDict <- getExprDict γ a =
     case getExprFun e a >>= dhasinfo (dlookup (denv γ) aDict) of
         Just riSig | recursiveFields aDict -> do
-            actual <- ordinaryApplication
+            actual <- selectorApplication
             -- Keep the named instance contract as well as the current recursive
             -- field bound. Returning the latter also checks partial/value uses.
             addC (SubC γ (fromRISig riSig) actual) "recursive dictionary selector contract"
             return actual
         Just riSig -> do
-            actual <- ordinaryApplication
+            actual <- selectorApplication
             addC (SubC γ (fromRISig riSig) actual) "dictionary selector contract"
             return $ fromRISig riSig
         _ -> ordinaryApplication
@@ -1340,6 +1340,9 @@ consEAppUsing synthesize γ e'@(App e a) | Just aDict <- getExprDict γ a =
         isJust (recursiveDictionary γ a)
             || maybe False (isJust . recursiveDictionary γ) (M.lookup (F.symbol aDict) (lcb γ))
     ordinaryApplication = snd <$> consEAppWith synthesize γ e' e (argExpr γ a) (\γ' -> sourceArgument γ' e' a)
+    -- The selected method's contract is the result; the dictionary's other
+    -- fields are unused here, so it keeps the ordinary dictionary judgment.
+    selectorApplication = snd <$> consEAppWith synthesize γ e' e (argExpr γ a) (\γ' -> cconsE γ' a)
 consEAppUsing synthesize γ e'@(App e a) =
     do
         (γ', t) <- consEAppWith synthesize γ e' e (argExpr γ $ simplify a) (\γ' -> sourceArgument γ' e' a)
@@ -1394,7 +1397,12 @@ sourceArgumentAt γ origin argument expected = do
         Just (owner, interface) -> do
             actual <- synthesizeInterface owner interface γ argument
             cconsType γ argument actual expected
-        Nothing -> cconsE γ argument expected
+        Nothing
+            | Var dictionary <- argument
+            , Just contracts <- dlookup (denv γ) dictionary -> do
+                actual <- consE γ argument >>= instantiatePreds γ >>= addPost γ
+                knownDictionary γ contracts actual expected
+            | otherwise -> cconsE γ argument expected
   where
     admittedField interfaces constructor index = do
         dictionary <- cgVar γ
@@ -1413,6 +1421,48 @@ sourceArgumentAt γ origin argument expected = do
     atIndex values index = case drop index values of
         value : _ -> Just value
         [] -> Nothing
+
+-- A dictionary is its fields; its class arguments are not runtime values. A
+-- known instance's method field has the instance contract, else the class
+-- field at the dictionary's own (possibly refined) head. Each must refine the
+-- class field at the expected arguments. A superclass field that is itself a
+-- known instance is checked the same way. Other dictionaries, and classes
+-- whose fields depend on one another, keep the class constructor's variance.
+knownDictionary :: CGEnv -> M.HashMap F.Symbol (RISig SpecType) -> SpecType -> SpecType -> CG ()
+knownDictionary γ contracts (RApp c heads ps r) expected@(RApp c' arguments _ _)
+    | c == c'
+    , Just cls <- tyConClass_maybe (rtc_tc c)
+    , Just own <- fields cls heads
+    , Just goals <- fields cls arguments
+    , let checks = zipWith3 (field cls) (classAllSelIds cls) own goals
+    , and [toType False t `eqType` toType False goal | (Right t, goal) <- checks] = do
+        addC (SubC γ (RApp c arguments ps r) expected) "known dictionary value"
+        forM_ checks $ \(check, goal) -> case check of
+            Left (superclass, actual') -> knownDictionary γ superclass actual' goal
+            Right t -> do
+                -- Class constructor fields may carry dummy binders.
+                actual' <- refreshArgs t
+                goal' <- refreshArgs goal
+                addC (SubC γ actual' goal') "known dictionary method"
+  where
+    fields cls ts = do
+        let worker = dataConWorkId (classDataCon cls)
+            (αs, _, body) = bkUniv (fromMaybe (ofType (varType worker)) (γ ?= F.symbol worker))
+        guard (length αs == length ts)
+        let instantiated = L.foldl' (\t (α, a) -> subsTyVarMeetWith (emb γ) (ty_var_value α, a) t) body (zip (map fst αs) ts)
+            representation = toRTypeRep instantiated
+            args = ty_args representation
+        guard (length args == length (classAllSelIds cls))
+        -- Fields are checked independently, so none may name another field.
+        guard (all (S.null . S.intersection (S.fromList (filter (/= F.dummySymbol) (ty_binds representation))) . F.syms) args)
+        pure args
+    field cls selector own goal
+        | selector `elem` classSCSelIds cls
+        , [superclass] <- [d | (d, _) <- M.toList dictionaries, varType d `eqType` toType False own] =
+            (Left (dictionaries M.! superclass, own), goal)
+        | otherwise = (Right (maybe own fromRISig (dhasinfo (Just contracts) selector)), goal)
+    DEnv dictionaries = denv γ
+knownDictionary γ _ actual expected = addC (SubC γ actual expected) "dictionary argument"
 
 synthesizeInterface :: Var -> SpecType -> CGEnv -> CoreExpr -> CG SpecType
 synthesizeInterface owner interface γ expression = case expression of
