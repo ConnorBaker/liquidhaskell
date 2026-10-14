@@ -14,6 +14,7 @@ module Language.Haskell.Liquid.Bare.Class
   , instanceDictionaryOwners
   , classMethodField
   , nominalEqualitySubstitution
+  , dictionaryEqualitySubstitution
   )
   where
 
@@ -110,20 +111,11 @@ makeMethodTypes embs allowTC (DEnv hm) dictionaryTypes cls cbs =
     -- e.g. forall a. a ~ Char => IsString [a]. Admission uses that evidence's
     -- specialization, while the callable dictionary keeps its actual telescope.
     specializeEquality dictionary argument =
-        case nominalEqualitySubstitution variables equalities of
+        case dictionaryEqualitySubstitution dictionary of
             Just substitution -> foldl (flip (subsTyVarMeetWith embs)) argument [(rTyVar variable, ofType image) | (variable, image) <- substitution]
             Nothing -> Ex.throw (ErrOther location (text "Unsupported nominal equality specialization for instance dictionary") :: Error)
       where
-        (variables, context, _, _) = Ghc.tcSplitDFunTy (Ghc.varType dictionary)
         location = maybe (Ghc.getSrcSpan dictionary) GM.fSrcSpan (M.lookup dictionary dictionaryTypeMap)
-        equalities = [pair | predicate <- context, Just pair <- [equality predicate]]
-        equality predicate
-            | Just (Ghc.Nominal, left, right) <- Ghc.getEqPredTys_maybe predicate = Just (left, right)
-            | Just (constructor, arguments) <- Ghc.splitTyConApp_maybe predicate
-            , constructor `elem` [Ghc.eqTyCon, Ghc.heqTyCon]
-            , right : left : _ <- reverse arguments =
-                Just (left, right)
-            | otherwise = Nothing
 
     owners dictionary =
         Mb.fromMaybe
@@ -171,6 +163,21 @@ makeMethodTypes embs allowTC (DEnv hm) dictionaryTypes cls cbs =
 -- order. GHC's conservative family unification is not itself an equality proof:
 -- require the image to discharge every pair and to be idempotent before using
 -- the existing scoped refinement substitutions. Only the DFun's variables bind.
+-- | The images that a DFun's nominal equality evidence fixes for its own type
+--   variables, e.g. @a := Char@ for @forall a. a ~ Char => IsString [a]@.
+dictionaryEqualitySubstitution :: Ghc.Var -> Maybe [(Ghc.TyVar, Ghc.Type)]
+dictionaryEqualitySubstitution dictionary = nominalEqualitySubstitution variables equalities
+  where
+    (variables, context, _, _) = Ghc.tcSplitDFunTy (Ghc.varType dictionary)
+    equalities = [pair | predicate <- context, Just pair <- [equality predicate]]
+    equality predicate
+        | Just (Ghc.Nominal, left, right) <- Ghc.getEqPredTys_maybe predicate = Just (left, right)
+        | Just (constructor, arguments) <- Ghc.splitTyConApp_maybe predicate
+        , constructor `elem` [Ghc.eqTyCon, Ghc.heqTyCon]
+        , right : left : _ <- reverse arguments =
+            Just (left, right)
+        | otherwise = Nothing
+
 nominalEqualitySubstitution :: [Ghc.TyVar] -> [(Ghc.Type, Ghc.Type)] -> Maybe [(Ghc.TyVar, Ghc.Type)]
 nominalEqualitySubstitution variables equalities = do
     substitution <- Ghc.tcUnifyTys bind (map fst equalities) (map snd equalities)

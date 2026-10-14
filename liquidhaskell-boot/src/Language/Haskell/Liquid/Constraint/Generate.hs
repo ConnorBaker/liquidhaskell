@@ -72,7 +72,7 @@ import qualified Language.Haskell.Liquid.Measure as Measure
 import Language.Haskell.Liquid.Transforms.CoreToLogic (LogicM, NewtypeCoercion (..), castToLg, coreToLogic, newtypeCoercionDataCon, runToLogic, weakenResult)
 import           Language.Haskell.Liquid.Bare.DataType (dataConMap, makeDataConChecker, makeDataConSelector)
 import           Language.Haskell.Liquid.Bare.Misc (simpleSymbolVar)
-import Language.Haskell.Liquid.Bare.Class (instanceDictionaryOwners)
+import Language.Haskell.Liquid.Bare.Class (dictionaryEqualitySubstitution, instanceDictionaryOwners)
 import GHC.Core.Map.Expr (eqCoreExpr)
 import GHC.Core (mkVarApps)
 import Language.Haskell.Liquid.UX.Config (
@@ -761,14 +761,21 @@ consCB NoCheck γ (Rec xes)
          [(owner, original, actual) | ((owner, original), actual) <- zip xts checked]
 
 consCB _ γ (NonRec x def)
-  | Just (w, τ) <- grepDictionary def
+  | Just (w, τ0) <- grepDictionary def
   , Just d      <- dlookup (denv γ) w
-  = do st       <- mapM (trueTy (typeclass (getConfig γ))) τ
+  , Just fixed  <- dictionaryEqualitySubstitution w
+  = do -- An instance specification is stated at the head that the DFun's
+       -- equality evidence fixes (IsString [Char] for a ~ Char => IsString [a]):
+       -- the fixed variables are not quantified in its method types.
+       let (variables, _, _, _) = Ghc.tcSplitDFunTy (varType w)
+           τ = [t | (α, t) <- zip variables τ0, α `notElem` map fst fixed] ++ drop (length variables) τ0
+       st       <- mapM (trueTy (typeclass (getConfig γ))) τ
        mapM_ addW (WfC γ <$> st)
        let xts   = dmap (fmap (f st)) d
        γ'       <- consCBNonRec γ x def
        return $ γ' { denv = dinsert (denv γ') x xts }
    where
+    f []      te             = te
     f [t']    (RAllT α te _) = subsTyVarMeetWith (emb γ) (ty_var_value α, t') te
     f (t':ts) (RAllT α te _) = f ts $ subsTyVarMeetWith (emb γ) (ty_var_value α, t') te
     f _ _ = impossible Nothing "consCB on Dictionary: this should not happen"
