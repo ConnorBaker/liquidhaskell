@@ -64,7 +64,7 @@ tests fixture compiler optimization =
                         "concrete list equations retain their input domain"
                         "ImportedByteProducer"
                         importedByteProducer
-                        [ ("ImportedByteBound", importedByteClient "ImportedByteBound" "{w:Word8 | w <= 127}" "[w]", UnsafeAt [8])
+                        [ ("ImportedByteBound", importedByteClient "ImportedByteBound" "{w:Word8 | w <= 127}" "[w]", Safe)
                         , ("ImportedByteBad", importedByteClient "ImportedByteBad" "Word8" "[w]", UnsafeAt [8])
                         , ("ImportedByteWitness", importedByteClient "ImportedByteWitness" "Word8" "if w <= 127 then [w] else []", Safe)
                         ]
