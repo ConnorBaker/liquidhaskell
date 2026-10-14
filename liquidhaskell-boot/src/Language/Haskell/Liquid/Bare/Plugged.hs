@@ -117,7 +117,7 @@ makePluggedDataCon allowTC embs tyi ldcp
     ownerSorts        :: [(RTyVar, RSort)]
     ownerSorts        = [(source, RVar target NoReft) | (source, target) <- ownerVars]
 
-    dcArgs = if isClassDc then dataConRuntimeFields dcp else reverse $ filter (not . isEmbeddedClass . snd) (dcpTyArgs dcp)
+    dcArgs = if isClassDc then dataConRuntimeFields dcp else reverse $ filter (not . (if allowTC then isEmbeddedClass else isClassType) . snd) (dcpTyArgs dcp)
     dcVars            = if isGADT
                           then padGADVars $ L.nub (dcpFreeTyVars dcp ++ concatMap (map ty_var_value . freeTyVars) (dcpTyRes dcp:(snd <$> dcArgs)))
                           else dcpFreeTyVars dcp
