@@ -22,7 +22,7 @@ import           Control.Monad (guard)
 import qualified Data.Maybe as Mb
 import qualified Language.Fixpoint.Types.Visitor as Vis
 import qualified GHC.Core.FVs as G (exprsSomeFreeVarsList)
-import qualified GHC.Builtin.Names as G (eqClassName, ordClassName, numClassName, int8TyConName, int16TyConName, int32TyConName, int64TyConName, word8TyConName, word16TyConName, word32TyConName, word64TyConName)
+import qualified GHC.Builtin.Names as G (eqClassName, ordClassName, numClassName, integralClassName, int8TyConName, int16TyConName, int32TyConName, int64TyConName, word8TyConName, word16TyConName, word32TyConName, word64TyConName)
 import qualified GHC.Builtin.Types as G (integerTyConName, intTyConName, wordTyConName)
 import qualified GHC.Types.Name.Set as G (emptyNameSet, extendNameSet, elemNameSet)
 
@@ -156,7 +156,7 @@ knownInstanceOperations info
     methods = M.fromList
         [ (F.symbol op, (Ghc.getName cls, Ghc.occNameString (Ghc.getOccName op)))
         | cls <- closure [cls | (_, cls, _) <- dfuns]
-        , Ghc.getName cls `elem` [G.eqClassName, G.ordClassName, G.numClassName]
+        , Ghc.getName cls `elem` [G.eqClassName, G.ordClassName, G.numClassName, G.integralClassName]
         , op <- Ghc.classMethods cls
         ]
     carrierWidth tc
@@ -181,6 +181,9 @@ knownInstanceOperations info
                     then F.EBin F.Minus (F.EBin F.Mod (F.EBin F.Plus e (F.expr h)) (F.expr m)) (F.expr h)
                     else F.EBin F.Mod e (F.expr m)
         _ -> e
+    unsigned tc = case carrierWidth tc of
+        Just (Just (False, _)) -> True
+        _ -> False
     inRange tc k = case carrierWidth tc of
         Just (Just (True, bits)) -> negate (2 ^ (bits - 1)) <= k && k < 2 ^ (bits - 1)
         Just (Just (False, bits)) -> 0 <= k && k < (2 :: Integer) ^ bits
@@ -203,6 +206,16 @@ knownInstanceOperations info
         ("negate", [a]) -> Just (wrap tc (F.ENeg a))
         ("fromInteger", [F.ECon (F.I k)]) | inRange tc k -> Just (F.ECon (F.I k))
         ("fromInteger", [a]) -> Just (wrap tc a)
+        -- On an unsigned carrier (operands in [0, 2^n)), quot/div and rem/mod
+        -- coincide with the theory's Euclidean division and modulus for every
+        -- nonzero divisor; a zero divisor raises, so its value is unobserved.
+        -- Signed truncation and flooring differ from Euclidean division and
+        -- stay uninterpreted.
+        (method, [a, b])
+            | unsigned tc
+            , method `elem` ["quot", "div"] -> Just (F.EBin F.Div a b)
+            | unsigned tc
+            , method `elem` ["rem", "mod"] -> Just (F.EBin F.Mod a b)
         _ -> Nothing
 
 makeAxiomEnvironment :: [(Var, LocSpecType)] -> TargetInfo -> [(Var, SpecType)] -> M.HashMap F.SubcId (F.SubC Cinfo) -> F.AxiomEnv
