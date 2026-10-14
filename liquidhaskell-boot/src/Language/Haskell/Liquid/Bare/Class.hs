@@ -17,6 +17,10 @@ module Language.Haskell.Liquid.Bare.Class
   )
   where
 
+import GHC.Core.TyCon (isVisibleTyConBinder)
+import qualified GHC.Core.Unify as Unify
+import qualified GHC.Core.Type as GhcType
+import qualified GHC.Types.Var as GhcVar
 import           Data.Bifunctor
 import qualified Data.Maybe                                 as Mb
 import qualified Data.List                                  as L
@@ -338,8 +342,8 @@ mkClassE env sigEnv _myName name (RClass cc ss as ms) tc = do
     ss'    <- mapM (mkConstr   env sigEnv name) ss
     meths  <- mapM (makeMethod env sigEnv name) ms'
     let vts = [ (m, v, t) | (m, kv, t) <- meths, v <- Mb.maybeToList (plugSrc kv) ]
-    let sts = [(val s, classMethodField tc αs t) | (s, _) <- ms | (_, _, t) <- meths]
-    let dcp = DataConP l dc αs [] (val <$> ss') (reverse sts) rt False (F.symbol name) l'
+    let sts = [(val s, classMethodField tc (implicit ++ αs) t) | (s, _) <- ms | (_, _, t) <- meths]
+    let dcp = DataConP l dc (implicit ++ αs) [] (val <$> ss') (reverse sts) rt False (F.symbol name) l'
     return  $ F.notracepp msg (dcp, vts)
   where
     c = btc_tc cc
@@ -350,7 +354,12 @@ mkClassE env sigEnv _myName name (RClass cc ss as ms) tc = do
     αs = bareRTyVar <$> as
     as' = [rVar $ GM.symbolTyVar $ F.symbol a | a <- as]
     ms' = [(s, rFun "" (RApp cc (flip RVar mempty <$> as) [] mempty) <$> t) | (s, t) <- ms]
-    rt = rApp tc as' [] trueReft
+    -- The authored head names only visible parameters. GHC's dictionary
+    -- constructor also binds the class's implicit (e.g. generalized kind)
+    -- parameters; they are owned by the constructor, not by any method.
+    implicitVars = [Ghc.binderVar b | b <- Ghc.tyConBinders tc, not (isVisibleTyConBinder b)]
+    implicit = rTyVar <$> implicitVars
+    rt = rApp tc ((rVar <$> implicitVars) ++ as') [] trueReft
 
 mkConstr :: Bare.Env -> Bare.SigEnv -> ModName -> LocBareType -> Bare.Lookup LocSpecType
 mkConstr env sigEnv name = fmap (fmap dropUniv) . Bare.cookSpecTypeE env sigEnv name Bare.GenTV
@@ -488,12 +497,26 @@ resolveDictionaries env = mapM $ \ri -> do
              -- instances. Read the instance environment after forcing it.
              Ghc.liftIO $ Ex.evaluate (Ghc.seqTypes tys)
              instEnvs <- Ghc.tcGetInstEnvs
-             case Ghc.lookupInstEnv False instEnvs cls tys of
+             case Ghc.lookupInstEnv False instEnvs cls (classArguments tc tys) of
                -- Is it ok to pick the first match?
                ((clsInst, _) : _, _, _) ->
                  pure $ Ghc.is_dfun clsInst
                ([], _, _) ->
                  panic (Just $ GM.fSrcSpan $ btc_tc c) "cannot find class instance"
+
+-- | An authored instance head names only the visible class arguments. The
+-- implicit (e.g. generalized kind) arguments are determined by their kinds.
+classArguments :: Ghc.TyCon -> [Ghc.Type] -> [Ghc.Type]
+classArguments tc tys =
+    case Unify.tcMatchTys (map GhcVar.varType visible) (map GhcType.typeKind tys) of
+        Just su | length visible == length tys -> go su (Ghc.tyConBinders tc) tys
+        _ -> tys
+  where
+    visible = [Ghc.binderVar b | b <- Ghc.tyConBinders tc, isVisibleTyConBinder b]
+    go su (b : bs) args
+        | isVisibleTyConBinder b, a : rest <- args = a : go su bs rest
+        | otherwise = GhcType.substTyVar su (Ghc.binderVar b) : go su bs args
+    go _ [] args = args
 
 dropUniv :: SpecType -> SpecType
 dropUniv t = t' where (_,_,t') = bkUniv t
