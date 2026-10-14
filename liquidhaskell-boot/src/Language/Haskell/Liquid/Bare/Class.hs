@@ -390,8 +390,11 @@ makeSpecDictionaries ::
     Bare.SigEnv ->
     (ModName, Ms.BareSpec) ->
     [(ModName, Ms.BareSpec)] ->
-    Ghc.TcRn ([RInstance LocBareType], DEnv Ghc.Var LocSpecType, [(Ghc.Var, LocSpecType)])
+    Ghc.TcRn ([RInstance LocBareType], DEnv Ghc.Var LocSpecType, DEnv Ghc.Var LocSpecType, [(Ghc.Var, LocSpecType)])
 -------------------------------------------------------------------------------
+-- The module's own instance declarations, then those it may use: its own and
+-- imported ones. An imported declaration is a premise its owner established
+-- (or, under --compile-spec, trusted); only the declaring module checks it.
 makeSpecDictionaries env sigEnv spec0 specs =
     do
         (instances, specDicts, dictionaryTypes) <- makeSpecDictionary env sigEnv spec0
@@ -404,6 +407,7 @@ makeSpecDictionaries env sigEnv spec0 specs =
             [] -> pure ()
         pure
             ( instances
+            , dfromList specDicts
             , dfromList $ specDicts ++ concatMap (\(_, dictionaries, _) -> dictionaries) imported
             , allDictionaryTypes
             )

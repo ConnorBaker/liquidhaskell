@@ -349,7 +349,7 @@ makeGhcSpec0 boxes stratNames cfg ghcTyLookupEnv tcg instEnvs lenv localVars src
       (dgChecks, imported) = withDiagnostics $ do
         selected <- rawAsmSigs queryEnv name ((name, mySpec) : M.toList iSpecs2)
         pure [(owner, Bare.cookSpecType queryEnv sigEnv origin (Bare.LqTV owner) ty) | (origin, owner, ty) <- selected, origin /= name]
-      (_, _, dictionaryTypes) = dictionaries
+      (_, _, _, dictionaryTypes) = dictionaries
       dictionaryOwners = S.fromList (map fst dictionaryTypes)
       localOwners = S.fromList (letVars (_giCbs src))
       checkedSig =
@@ -1442,7 +1442,7 @@ makeAutoInst env spec
 
 ----------------------------------------------------------------------------------------
 makeSpecSig
-  :: ([RInstance LocBareType], DEnv Ghc.Var LocSpecType, [(Ghc.Var, LocSpecType)])
+  :: ([RInstance LocBareType], DEnv Ghc.Var LocSpecType, DEnv Ghc.Var LocSpecType, [(Ghc.Var, LocSpecType)])
   -> [Ghc.Name]
   -> Config
   -> ModName
@@ -1455,7 +1455,7 @@ makeSpecSig
   -> [Ghc.CoreBind]
   -> Bare.Lookup ([RInstance LocBareType], GhcSpecSig, [(Ghc.Var, (Int, LocSpecType))], [(Ghc.Var, LocSpecType)], [Ghc.Var])
 ----------------------------------------------------------------------------------------
-makeSpecSig (instances, dicts, dictionaryTypes) stratNames cfg name mySpec specs env sigEnv tycEnv measEnv cbs = do
+makeSpecSig (instances, declared, dicts, dictionaryTypes) stratNames cfg name mySpec specs env sigEnv tycEnv measEnv cbs = do
   mySigs     <- makeTySigs  env sigEnv name mySpec
   assumptions <- rawAsmSigs env name allSpecs
   let localOwners = S.fromList (letVars cbs)
@@ -1483,7 +1483,7 @@ makeSpecSig (instances, dicts, dictionaryTypes) stratNames cfg name mySpec specs
         , gsRefSigs = []
         , gsDicts = dicts
         , -- , gsMethods  = if noclasscheck cfg then [] else Bare.makeMethodTypes dicts (Bare.meClasses  measEnv) cbs
-          gsMethods = if noclasscheck cfg then [] else Bare.makeMethodTypes (Bare.sigEmbs sigEnv) (typeclass cfg) dicts dictionaryTypes (Bare.meClasses measEnv) cbs
+          gsMethods = if noclasscheck cfg then [] else Bare.makeMethodTypes (Bare.sigEmbs sigEnv) (typeclass cfg) declared dictionaryTypes (Bare.meClasses measEnv) cbs
         , gsInSigs = mempty
         , gsNewTypes = newTys
         , gsTexprs = [(v, t, es) | (v, t, Just es) <- mySigs]

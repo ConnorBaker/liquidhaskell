@@ -503,8 +503,9 @@ type RDEnv = DEnv Var SpecType
 -- several dictionaries. Synthetic obligations have no source field origin.
 data MethodType t
     = MT {tyInstance :: !(Maybe t), tyClass :: !(Maybe t), methodOrigin :: !(Maybe (Var, Var))}
-    | -- Imported per-instance schemas constrain dictionary admission; they are
-      -- not replacement callable types for the universal class selectors.
+    | -- A per-instance schema this module declares for an imported dictionary
+      -- constrains dictionary admission. Only the declaring module checks it;
+      -- it is not a replacement callable type for the universal class selector.
       ImportedMethod {tyInstance :: !(Maybe t), tyClass :: !(Maybe t), methodOrigin :: !(Maybe (Var, Var))}
     deriving (Show, Functor, Foldable, Traversable)
 
