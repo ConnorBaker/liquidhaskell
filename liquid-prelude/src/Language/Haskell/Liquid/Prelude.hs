@@ -106,9 +106,12 @@ crash = undefined
 force :: Bool
 force = True
 
+-- An arbitrary Int: clients learn nothing about the result. The concrete
+-- choice is total; the stated signature keeps it from being exported.
 {-# NOINLINE choose #-}
+{-@ choose :: Int -> Int @-}
 choose :: Int -> Int
-choose = undefined
+choose _ = 0
 
 -------------------------------------------------------------------
 ----------- Modular Arithmetic Wrappers ---------------------------
