@@ -14,6 +14,7 @@ module Language.Haskell.Liquid.Types.Fresh
   , refreshVV
   , refreshArgs
   , refreshHoles
+  , isValueNode
   , refreshArgsSub
   , refreshArgsSubWith
   )
@@ -166,8 +167,13 @@ refreshRefType _ t =
 -- that constructor is applied. Preserve existing non-value annotations.
 refreshValueReft :: (Freshable m r) => Bool -> RRType r -> r -> m r
 refreshValueReft allowTC t r
-    | isTYPEorCONSTRAINT (typeKind (toType False (toRSort t))) = refresh allowTC r
+    | isValueNode t = refresh allowTC r
     | otherwise = return r
+
+-- | Whether a type node classifies term values (rather than, e.g., an
+-- unsaturated type constructor argument of a higher kind).
+isValueNode :: RRType r -> Bool
+isValueNode t = isTYPEorCONSTRAINT (typeKind (toType False (toRSort t)))
 
 refreshRef :: (Freshable f Integer, Freshable f r, IsReft r, F.Subable r, F.Variable r ~ F.Symbol, ReftBind r ~ F.Symbol, ReftVar r ~ F.Symbol)
            => Bool -> Ref τ (RType RTyCon RTyVar r) -> f (Ref τ (RRType r))

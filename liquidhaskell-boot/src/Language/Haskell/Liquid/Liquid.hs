@@ -39,6 +39,7 @@ import qualified Language.Haskell.Liquid.Transforms.CoreToLogic as CoreToLogic
 import qualified Language.Haskell.Liquid.Measure as Measure
 import           Language.Haskell.Liquid.Types.Names (lhNameToResolvedSymbol, makeGHCLHNameLocatedFromId)
 import           Language.Haskell.Liquid.Types.RTypeOp (foldReft)
+import           Language.Haskell.Liquid.Types.Fresh (isValueNode)
 import           Language.Haskell.Liquid.Constraint.Publication
 import           Language.Haskell.Liquid.Constraint.Generate
 import           Language.Haskell.Liquid.Constraint.Fresh (specTypeKVars)
@@ -52,7 +53,7 @@ import           Language.Haskell.Liquid.UX.Annotate (mkOutput)
 import qualified Language.Haskell.Liquid.Termination.Structural as ST
 import qualified Language.Haskell.Liquid.GHC.Misc          as GM
 import           Liquid.GHC.API as GHC hiding (text, vcat, ($+$), (<+>))
-import Language.Haskell.Liquid.Types.RType (SpecType, LocSpecType, RTypeBV (..))
+import Language.Haskell.Liquid.Types.RType (SpecType, LocSpecType, RReft, RTypeBV (..))
 
 -- RefCore annotations and complete raw publication evidence are separate
 -- from the reported expected-failure result.
@@ -779,7 +780,20 @@ independentResult (RAllT a t _) = RAllT a (independentResult t) mempty
 independentResult (RAllP p t) = RAllP p (independentResult t)
 independentResult (RFun x i input result _) =
   RFun x i input (independentResult result) mempty
-independentResult t = fmap (const (uTop (F.Reft (F.vv_, hole)))) t
+-- Only value nodes receive an inference hole: a refinement on a higher-kinded
+-- argument would migrate onto the values of the constructor it is applied to.
+independentResult t = holes t
+  where
+    holes :: SpecType -> SpecType
+    holes ty = case ty of
+      RApp c ts rs _ -> RApp c (map holes ts) (fmap (fmap (const inferred)) <$> rs) (valueHole ty)
+      RAppTy f a _ -> RAppTy (holes f) (holes a) (valueHole ty)
+      RVar a _ -> RVar a (valueHole ty)
+      _ -> fmap (const inferred) ty
+    inferred :: RReft
+    inferred = uTop (F.Reft (F.vv_, hole))
+    valueHole :: SpecType -> RReft
+    valueHole node = if isValueNode node then inferred else mempty
 
 
 updTargetInfoTermVars    :: TargetInfo -> TargetInfo
