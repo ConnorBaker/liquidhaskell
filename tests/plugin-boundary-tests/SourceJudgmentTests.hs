@@ -29,6 +29,23 @@ tests fixture compiler optimization =
                , checkedInterfaces ObjectCode "imported first-order measure selectors" "lh-selector-interface" "callback-projections" "SelectorProducer" [] [("SelectorClientGood", Safe), ("SelectorClientFalse", UnsafeAt [8])]
                , checkedInterfaces ObjectCode "imported higher-order callback selectors" "lh-callback-interface" "callback-projections" "CallbackProducer" [] [("CallbackClientGood", Safe), ("CallbackClientFalse", UnsafeAt [13])]
                , checkedInterfaces InterfaceOnly "interface-only higher-order callback publication" "lh-callback-interface-only" "callback-projections" "CallbackProducer" [] [("CallbackClientGood", Safe), ("CallbackClientFalse", UnsafeAt [13])]
+               , testCase "home assumption precedes an imported non-home assumption" $ withSystemTempDirectory "lh-home-assumption" $ \directory -> do
+                    tool <- compiler
+                    let fixtures = "plugin-boundary-tests/fixtures/assumed-predicates"
+                        alpha = directory </> "alpha"
+                        zeta = directory </> "zeta"
+                        objects = [alpha </> "objects", zeta </> "objects"]
+                    copyFixture fixture (fixtures </> "HomeAssumptionAlpha.hs") alpha "HomeAssumptionAlpha"
+                    _ <- compile tool Strict optimization ObjectCode alpha "HomeAssumptionAlpha" [] [] Safe
+                    copyFixture fixture (fixtures </> "HomeAssumptionZeta.hs") zeta "HomeAssumptionZeta"
+                    _ <- compile tool Strict optimization ObjectCode zeta "HomeAssumptionZeta" [alpha </> "objects"] [] Safe
+                    mapM_
+                        ( \(name, expected) -> do
+                            let target = directory </> name
+                            copyFixture fixture (fixtures </> name ++ ".hs") target name
+                            compile tool Strict optimization ObjectCode target name objects [] expected
+                        )
+                        [("HomeAssumptionClientGood", Safe), ("HomeAssumptionClientBad", UnsafeAt [8])]
                , constructorInterfaces
                , importedInstanceInterfaces
                , naturalSourceGraphs
