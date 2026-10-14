@@ -374,10 +374,14 @@ makeRewriteOne tce (_, t)
 
     xs = do
       (sym, arg) <- zip (ty_binds tRep) (ty_args tRep)
-      let e = maybe F.PTrue (F.reftPred . toReft) (stripRTypeBase arg)
+      -- The precondition is stated over the argument's value variable;
+      -- the rule binds the argument itself.
+      let e = maybe F.PTrue (argumentPred sym . toReft) (stripRTypeBase arg)
       return $ F.RR (RT.rTypeSort tce arg) (F.Reft (sym, e))
 
     tRep = toRTypeRep $ val t
+
+    argumentPred sym (F.Reft (v, p)) = F.subst1 p (v, F.EVar sym)
 
 _isClassOrDict :: Id -> Bool
 _isClassOrDict x = F.tracepp ("isClassOrDict: " ++ F.showpp x) (hasClassArg x || GM.isDictionary x || Mb.isJust (Ghc.isClassOpId_maybe x))
