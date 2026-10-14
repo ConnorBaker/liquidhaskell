@@ -137,7 +137,10 @@ localBinds :: [Ghc.CoreBind] -> [LocalVarDetails]
 localBinds                    = concatMap (bgoT [])
   where
     bgoT g (Ghc.NonRec x e) = pgo g True False (x, e)
-    bgoT g (Ghc.Rec xes) = concatMap (pgo (map fst xes ++ g) True True) xes
+    -- Top-level binders are global names, not lexical captures: in scope
+    -- they would shadow same-spelled logical declarations during name
+    -- resolution (e.g. liquid-prelude's `measure fromList`), as upstream.
+    bgoT g (Ghc.Rec xes) = concatMap (pgo g True True) xes
     pgo g isTopLevel isRec (x, e) = mkLocalVarDetails g isTopLevel isRec x : go g e
     bgo g (Ghc.NonRec x e)  = pgo g False False (x, e)
     bgo g (Ghc.Rec xes) = concatMap (pgo (map fst xes ++ g) False True) xes
