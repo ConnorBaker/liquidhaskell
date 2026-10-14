@@ -459,7 +459,8 @@ bsplitC γ t1 t2 = do
 addLhsInv :: CGEnv -> SpecType -> SpecType
 addLhsInv γ t = addRTyConInv (invs γ) t `strengthen` r
   where
-    r         = (mempty :: UReft) { ur_reft = F.Reft (F.dummySymbol, p) }
+    -- p is stated over v itself: bind it so a meet cannot rename the root apart.
+    r         = (mempty :: UReft) { ur_reft = F.Reft (v, p) }
     p         = constraintToLogic rE' (lcs γ)
     rE'       = insertREnv v t (renv γ)
     v         = rTypeValueVar t
