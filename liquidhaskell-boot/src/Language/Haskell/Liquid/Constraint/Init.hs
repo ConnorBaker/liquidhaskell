@@ -275,6 +275,7 @@ measEnv sp xts cbs _tcb lt1s lt2s asms itys hs info = CGE
   , cerr     = Nothing
   , cgInfo   = info
   , cgVar    = Nothing
+  , cgUses   = useSites cbs
   }
   where
       sourceSymbols = S.map F.symbol $

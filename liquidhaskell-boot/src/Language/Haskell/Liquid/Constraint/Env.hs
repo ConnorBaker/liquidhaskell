@@ -40,7 +40,7 @@ module Language.Haskell.Liquid.Constraint.Env (
  , rTypeSortedReft'
 
   -- * Extend CGEnv
- , setLocation, setBind, setRecs, setTRec
+ , setLocation, setBind, setRecs, setTRec, useSites
 
   -- * Lookup CGEnv
  , getLocation
@@ -52,6 +52,7 @@ module Language.Haskell.Liquid.Constraint.Env (
 import Prelude hiding (error)
 -- import Outputable
 -- import FastString (fsLit)
+import Control.Applicative ((<|>))
 import Control.Monad (foldM, msum)
 import Control.Monad.State
 
@@ -304,7 +305,37 @@ setBind γ x = located `setLocation` Sp.Var x `setBind'` x
         | isGoodSrcSpan (getSrcSpan x) || isGoodSrcSpan (getLocation γ) = γ
         | Just claim <- lookup x (gsTySigs (gsSig (giSpec (cgInfo γ)))) =
             γ `setLocation` Sp.Span (GM.fSrcSpan claim)
+        -- A GHC-generated binder (e.g. a dictionary) has no position of its
+        -- own. Attribute it to the source expression that first uses it.
+        | Just use <- useSpan (cgUses γ) x = γ `setLocation` Sp.Span use
         | otherwise = γ
+
+-- | Each binder's uses, with the user binder and the innermost source
+-- position enclosing the use, in program order.
+useSites :: [CoreBind] -> M.HashMap Var [(Var, Maybe SrcSpan)]
+useSites cbs = M.fromListWith (flip (++)) [(v, [(b, s)]) | (b, e) <- flattenBinds cbs, (v, s) <- uses (own b) e]
+  where
+    own b = good (getSrcSpan b)
+    good s = if isGoodSrcSpan s then Just s else Nothing
+    uses s (Var v) = [(v, s)]
+    uses s (App f a) = uses s f ++ uses s a
+    uses s (Lam _ e) = uses s e
+    uses s (Let b e) = concatMap (uses s) (rhssOfBind b) ++ uses s e
+    uses s (Case e _ _ alts) = uses s e ++ concat [uses s rhs | Alt _ _ rhs <- alts]
+    uses s (Cast e _) = uses s e
+    uses s (Tick t e) = uses (good (GM.tickSrcSpan t) <|> s) e
+    uses _ _ = []
+
+-- | The position of a binder's first use, reached through users that have
+-- no position of their own.
+useSpan :: M.HashMap Var [(Var, Maybe SrcSpan)] -> Var -> Maybe SrcSpan
+useSpan sites = go S.empty
+  where
+    go seen x = listToMaybe (concatMap (at (S.insert x seen)) (M.lookupDefault [] x sites))
+    at _ (_, Just s) = [s]
+    at seen (b, Nothing)
+        | b `S.member` seen = []
+        | otherwise = maybeToList (go seen b)
 
 setBind' :: CGEnv -> Tg.TagKey -> CGEnv
 setBind' γ k
