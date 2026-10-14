@@ -972,6 +972,28 @@ primitiveQuery flags native location embeddings measures projections instances s
                 Tick _ body -> go aliases body
                 _ -> []
 
+    -- A measure is a logical function: applied to a logical carrier, it
+    -- consumes that carrier at its declared domain's sort, not a source value.
+    measureApplication name lowered = do
+        logical <- logicalOperand lowered
+        selected <- selectMeasure name (Just lowered)
+        declared <- measureType name selected
+        -- No source value flows through this logical call, so its input is
+        -- the operand's own carrier; fixpoint sorts the readback.
+        ty <-
+            if logical
+                then polymorphicType liftedTypeKind (\carrier -> logicalDomain carrier declared)
+                else pure declared
+        operator <- freshParameter ty (F.EVar name)
+        pure (applyQuery operator lowered)
+    logicalDomain carrier (RAllT variable rest reft) = RAllT variable (logicalDomain carrier rest) reft
+    logicalDomain carrier (RFun binder info _ rest reft) = RFun binder info carrier rest reft
+    logicalDomain _ ty = ty
+    logicalOperand lowered = do
+        receiver <- operandType lowered
+        local <- State.gets (\(_, current, _) -> current)
+        pure (maybe False (`F.tceMember` local) (tyConAppTyCon_maybe receiver))
+
     measureType name declared
         | Just (T.MsReflect, _) <- M.lookup name measureTypes =
             if not (Measure.resolvedSourceInputType declared)
@@ -1051,14 +1073,20 @@ primitiveQuery flags native location embeddings measures projections instances s
             , not (isSource name)
             , Just alternatives <- M.lookup name projectionCases -> do
                 lowered <- lower argument
-                selected <- selectMeasure name (Just lowered)
-                receiver <- operandType lowered
-                input <- projectionInput selected
-                denotation <- functionMeaning [(x, receiver)] (F.EVar x)
-                bridge <- freshParameter input denotation
-                -- Eliminate this receiver in its actual scope; a generalized
-                -- helper would infer fresh, unrelated predicate parameters.
-                pure $ \locals -> nlHsCase (applyQuery bridge lowered locals) (map fieldAlternative alternatives)
+                logical <- logicalOperand lowered
+                -- A logical receiver (e.g. a partial measure's result) has no
+                -- source constructor to scrutinize; observe it logically.
+                if logical
+                    then measureApplication name lowered
+                    else do
+                        selected <- selectMeasure name (Just lowered)
+                        receiver <- operandType lowered
+                        input <- projectionInput selected
+                        denotation <- functionMeaning [(x, receiver)] (F.EVar x)
+                        bridge <- freshParameter input denotation
+                        -- Eliminate this receiver in its actual scope; a generalized
+                        -- helper would infer fresh, unrelated predicate parameters.
+                        pure $ \locals -> nlHsCase (applyQuery bridge lowered locals) (map fieldAlternative alternatives)
         F.EVar name | M.member name projectionCases -> do
             selected <- selectMeasure name Nothing
             helper <- projector name
@@ -1078,12 +1106,7 @@ primitiveQuery flags native location embeddings measures projections instances s
         _
             | (F.EVar name, [argument]) <- application expression
             , not (isSource name)
-            , isMeasure name -> do
-                lowered <- lower argument
-                selected <- selectMeasure name (Just lowered)
-                ty <- measureType name selected
-                operator <- freshParameter ty (F.EVar name)
-                pure (applyQuery operator lowered)
+            , isMeasure name -> lower argument >>= measureApplication name
         F.EApp function argument -> do
             function' <- lower function
             argument' <- lower argument
