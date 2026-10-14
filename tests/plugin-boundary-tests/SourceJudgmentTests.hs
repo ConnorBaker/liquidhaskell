@@ -361,6 +361,8 @@ tests fixture compiler optimization =
                 , ("TextConstructionGood", Safe)
                 , ("TextSingletonRawBad", UnsafeAt [8])
                 , ("TextSingletonFalse", UnsafeAt [8])
+                , ("TextPackGood", Safe)
+                , ("TextPackFalse", UnsafeAt [9])
                 , ("TextAppendRawLeftBad", UnsafeAt [8])
                 , ("TextAppendRawRightBad", UnsafeAt [8])
                 , ("TextAppendCapacityBad", UnsafeAt [8])
