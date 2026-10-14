@@ -76,4 +76,6 @@ tests fixture compiler optimization =
                , ("plugin-boundary-tests/fixtures/known-instance-methods", "KnownInstanceWord8False", UnsafeAt [13])
                , ("plugin-boundary-tests/fixtures/known-instance-methods", "KnownInstanceWord8DivGood", Safe)
                , ("plugin-boundary-tests/fixtures/known-instance-methods", "KnownInstanceWord8DivFalse", UnsafeAt [16])
+               , ("plugin-boundary-tests/fixtures/shared-failure", "SharedFailureGood", Safe)
+               , ("plugin-boundary-tests/fixtures/shared-failure", "SharedFailureFalse", UnsafeAt [22])
                ]

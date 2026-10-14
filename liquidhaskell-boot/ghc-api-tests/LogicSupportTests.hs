@@ -3,6 +3,7 @@
 module LogicSupportTests (tests) where
 
 import Control.Exception (throw)
+import qualified Data.List as L
 import Data.String (fromString)
 import qualified GHC.Types.Name as Name
 import qualified GHC.Unit.Types as Unit
@@ -101,6 +102,14 @@ tests compileToCore = withResource prepare (const (pure ())) $ \fixture ->
                         (meaning, _) = interpret mempty expression
                     meaning @?= F.EApp (F.EApp (F.EVar (F.symbol foreignOwner)) (F.EVar (F.symbol x))) (F.EVar (F.symbol y))
                 _ -> assertFailure "missing actual native boolean source application"
+        , testCase "a shared match-failure handler is not part of the logical meaning" $ do
+            -- GHC binds the two failing branches to one join point whose body
+            -- is an empty case on patError; readback must drop, not translate, it.
+            (_, _, program) <- fixture
+            (_, body) <- sourceBody program "secondOf"
+            let symbols = F.syms (fst (interpret mempty body))
+            assertBool ("failure branch reached the logic: " ++ show symbols) $
+                not (any (\symbol -> "patError" `L.isInfixOf` F.symbolString symbol) symbols)
         , testCase "same prelude module and operator spelling do not grant an unrelated source owner a logical alias" $ do
             program <- compileToCore "Language.Haskell.Liquid.Prelude" $ unlines
                 [ "module Language.Haskell.Liquid.Prelude where"
@@ -151,6 +160,8 @@ tests compileToCore = withResource prepare (const (pure ())) $ \fixture ->
             , "(||) :: Bool -> Bool -> Bool"
             , "(||) x _ = x"
             , "fakeDisjoin x y = (||) x y"
+            , "secondOf :: [Int] -> Int"
+            , "secondOf xs = case xs of (_ : y : _) -> y"
             ]
         case [(owner, body) | (owner, body) <- G.flattenBinds program, G.getOccString owner == "identity"] of
             [(owner, body)] -> pure (owner, body, program)
