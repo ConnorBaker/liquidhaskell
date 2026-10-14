@@ -1,15 +1,15 @@
 module MeasureSourceNameFalse where
 
-{-@ measure nonEmpty :: [k] -> Bool
-      nonEmpty ([])   = false
-      nonEmpty (x:xs) = true
+{-@ measure evenLen :: [k] -> Bool
+      evenLen ([])   = true
+      evenLen (x:xs) = not (evenLen xs)
 @-}
 
-{-@ nonEmpty :: (Ord k) => xs:[k] -> {v:Bool | v <=> nonEmpty xs} @-}
-nonEmpty :: (Ord k) => [k] -> Bool
-nonEmpty []    = False
-nonEmpty (_:_) = True
+{-@ evenLen :: (Ord k) => xs:[k] -> {v:Bool | v <=> evenLen xs} @-}
+evenLen :: (Ord k) => [k] -> Bool
+evenLen []     = True
+evenLen (_:xs) = not (evenLen xs)
 
-{-@ none :: {v:[Int] | nonEmpty v} @-}
-none :: [Int]
-none = []
+{-@ one :: {v:[Int] | evenLen v} @-}
+one :: [Int]
+one = [1]
