@@ -23,9 +23,9 @@ tests compiler optimization =
         , sourceCase "NativeProjectedCallbackDistinct" Fixtures.distinctProjectedCallbackPredicates (UnsafeAt [14])
         , sourceCase "NativeSameSpelledTermPredicate" Fixtures.sameSpelledTermPredicate Safe
         , sourceCase "NativeFalseMembership" Fixtures.falseMembershipGuard Safe
-        , sourceCase "NativeInadmissibleMembership" Fixtures.inadmissibleMembershipGuard (UnsafeAt [5])
+        , sourceCase "NativeInadmissibleMembership" Fixtures.inadmissibleMembershipGuard (UnsafeAt [6])
         , sourceCase "NativeClassFalseMembership" Fixtures.falseClassMembershipGuard Safe
-        , sourceCase "NativeClassFormationOnly" Fixtures.inadmissibleClassMembershipGuard (UnsafeAt [5])
+        , sourceCase "NativeClassFormationOnly" Fixtures.inadmissibleClassMembershipGuard (UnsafeAt [6])
         , sourceCase "NativePrivateFalse" Fixtures.privateFalseDomain Safe
         , sourceCase "NativePrivateTrue" Fixtures.privateTrueDomain (UnsafeAt [12])
         , sourceCase "NativePrivateIdentity" Fixtures.privateIdentityDomain (UnsafeAt [12])
