@@ -388,6 +388,14 @@ tests fixture compiler optimization =
                 ]
             )
         ,
+            ( "bounds"
+            , []
+            ,
+                [ ("BoundInstanceGood", Safe)
+                , ("BoundInstanceFalse", UnsafeAt [9])
+                ]
+            )
+        ,
             ( "byte-reads"
             , ["--adt"]
             ,
