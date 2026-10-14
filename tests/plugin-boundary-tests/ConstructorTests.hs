@@ -48,6 +48,8 @@ tests fixture compiler optimization =
         ]
             ++ [ ("measure/pos", "MeasureGadt", Safe)
                , ("plugin-boundary-tests/fixtures/constructor-correspondence", "MeasureGadtFalse", UnsafeAt [15])
+               , ("plugin-boundary-tests/fixtures/constructor-correspondence", "ExistentialConstraintFieldGood", Safe)
+               , ("plugin-boundary-tests/fixtures/constructor-correspondence", "ExistentialConstraintFieldFalse", UnsafeAt [9])
                , ("neg", "ConstructorAnonymousFields", UnsafeAt [16])
                , ("neg", "ConstructorBoxedSource", UnsafeAt [21])
                , ("neg", "ConstructorExistentialWorker", UnsafeAt [12])
