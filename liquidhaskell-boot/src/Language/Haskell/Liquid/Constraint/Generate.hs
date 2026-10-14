@@ -1078,7 +1078,7 @@ instantiatePreds :: CGEnv
                  -> SpecType
                  -> CG SpecType
 instantiatePreds γ (RAllP π t)
-  = do r <- freshPredRef γ π
+  = do r <- freshStructuredPredRef γ π
        instantiatePreds γ $ replacePreds "consE" t [(π, r)]
 
 instantiatePreds _ t0

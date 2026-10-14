@@ -14,6 +14,7 @@ module Language.Haskell.Liquid.Constraint.Fresh
     -- ,
     refreshArgsTop
   , freshTyType
+  , freshTyReftype
   , freshTyExpr
   , trueTy
   , addKuts

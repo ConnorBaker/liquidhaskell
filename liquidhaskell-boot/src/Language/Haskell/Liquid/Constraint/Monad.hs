@@ -20,7 +20,7 @@ import           Language.Haskell.Liquid.Types.RTypeOp (ofRSort, stripRTypeBase)
 import           Language.Haskell.Liquid.Types.PredType (pvarRType, substPVar, replacePredsWithRefs, pVartoRConc)
 import           Language.Haskell.Liquid.Constraint.Types
 import           Language.Haskell.Liquid.Constraint.Env
-import           Language.Haskell.Liquid.Constraint.Fresh (addKVars)
+import           Language.Haskell.Liquid.Constraint.Fresh (addKVars, freshTyReftype)
 import           Language.Haskell.Liquid.UX.Config (getConfig, typeclass)
 import qualified Language.Fixpoint.Types as F
 import           Language.Fixpoint.Misc hiding (errorstar)
@@ -94,6 +94,23 @@ freshPredRef γ (PV _ rsort as) =
         addKVars PredInstE t
         addW $ WfC γ' t
         return $ RProp targs (RHole root)
+
+-- | Instantiate a predicate whose carrier is a datatype application with a
+-- fresh template of that carrier, as upstream does: a dependent component
+-- (e.g. a tuple inside a dependent tuple) carries refinements below the
+-- carrier's root, which an atomic root refinement cannot convey. Any other
+-- carrier keeps the atomic instantiation of 'freshPredRef'.
+freshStructuredPredRef :: CGEnv -> PVar RSort -> CG SpecProp
+freshStructuredPredRef γ p@(PV _ rsort as)
+    | RApp _ (_ : _) _ _ <- (ofRSort rsort :: SpecType) =
+        do
+            t <- freshTyReftype (typeclass (getConfig γ)) PredInstE (ofRSort rsort)
+            args <- mapM (const fresh) as
+            let targs = [(x, s) | (x, (s, _, _)) <- zip args as]
+            γ' <- foldM (+=) γ [("freshPredRef", x, ofRSort τ) | (x, τ) <- targs]
+            addW $ WfC γ' t
+            return $ RProp targs t
+    | otherwise = freshPredRef γ p
 
 -- | Introduce a rigid predicate and its formal arguments in lexical scope.
 addPToEnv :: CGEnv -> PVar RSort -> CG CGEnv
