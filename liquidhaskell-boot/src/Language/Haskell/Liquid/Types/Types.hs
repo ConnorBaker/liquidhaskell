@@ -251,8 +251,11 @@ data CheckedRefinement = CheckedRefinement
     }
 
 -- Conjunction is interpreted before projection: the logical remainder and
--- every checked source conjunct share this refinement's value binder.
+-- every checked source conjunct share this refinement's value binder. A
+-- logical-only leaf is exactly its authored refinement: simplifying it would
+-- erase a tautological conjunct (e == e) before its formation is collected.
 checkedOrdinary :: CheckedRefinement -> UReft
+checkedOrdinary (CheckedRefinement logical []) = logical
 checkedOrdinary (CheckedRefinement logical sources) =
     logical{ur_reft = F.Reft (F.reftBind $ ur_reft logical, F.pAnd (F.reftPred (ur_reft logical) : map predicateReadback sources))}
 
