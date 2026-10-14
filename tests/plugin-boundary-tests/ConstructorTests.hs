@@ -61,4 +61,7 @@ tests fixture compiler optimization =
                , ("plugin-boundary-tests/fixtures/projection-admission", "ImportedProjectionFalse", UnsafeAt [19])
                , ("plugin-boundary-tests/fixtures/measure-source-name", "MeasureSourceNameGood", Safe)
                , ("plugin-boundary-tests/fixtures/measure-source-name", "MeasureSourceNameFalse", UnsafeAt [15])
+               , ("plugin-boundary-tests/fixtures/integer-arguments", "IntegerArgumentGood", Safe)
+               , ("plugin-boundary-tests/fixtures/integer-arguments", "IntegerArgumentFalse", UnsafeAt [14])
+               , ("plugin-boundary-tests/fixtures/integer-arguments", "IntegerArgumentRange", UnsafeAt [11, 13])
                ]

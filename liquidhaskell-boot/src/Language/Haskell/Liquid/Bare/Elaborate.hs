@@ -48,7 +48,10 @@ import qualified Data.Text as Text
 import qualified Control.Monad.State.Strict as State
 import Data.Generics (Data, everythingBut, extQ, mkQ)
 
-import GHC.Builtin.Types (charTy, integerTy, runtimeRepTy)
+import GHC.Builtin.Types (charTy, integerTy, runtimeRepTy, intTyConName, wordTyConName)
+import GHC.Builtin.Names (int8TyConName, int16TyConName, int32TyConName, int64TyConName, word8TyConName, word16TyConName, word32TyConName, word64TyConName)
+import GHC.Platform (Platform, platformMinInt, platformMaxInt, platformMaxWord)
+import GHC.Driver.DynFlags (targetPlatform, getDynFlags)
 import GHC.Hs (HsMatchContext (CaseAlt), HsExpr (HsLet), HsLocalBindsLR (HsValBinds), HsValBindsLR (ValBinds), mkSimpleGeneratedFunBind, mkSimpleMatch, nlConPat, nlHsCase, nlWildPat)
 import qualified GHC.Hs as Hs
 import qualified GHC.Tc.Gen.HsType as TcHs
@@ -426,6 +429,24 @@ elaborateSpecTypeWithPrimitives bindSelf flags native embeddings measures projec
     -- (selectors, checkers, reflections) denote their source owner.
     authored = S.fromList [name | (name, kind, _) <- measures, kind `elem` [T.MsMeasure, T.MsAbsMeasure, T.MsClass]]
     sources = filter (not . (`S.member` authored) . fst) allSources
+
+-- The target's machine ranges of GHC's fixed-width integral carriers.
+fixedWidthRange :: Platform -> TyCon -> Maybe (Integer, Integer)
+fixedWidthRange platform constructor
+    | name == intTyConName = Just (platformMinInt platform, platformMaxInt platform)
+    | name == wordTyConName = Just (0, platformMaxWord platform)
+    | otherwise = lookup name
+        [ (int8TyConName, (-2 ^ (7 :: Int), 2 ^ (7 :: Int) - 1))
+        , (int16TyConName, (-2 ^ (15 :: Int), 2 ^ (15 :: Int) - 1))
+        , (int32TyConName, (-2 ^ (31 :: Int), 2 ^ (31 :: Int) - 1))
+        , (int64TyConName, (-2 ^ (63 :: Int), 2 ^ (63 :: Int) - 1))
+        , (word8TyConName, (0, 2 ^ (8 :: Int) - 1))
+        , (word16TyConName, (0, 2 ^ (16 :: Int) - 1))
+        , (word32TyConName, (0, 2 ^ (32 :: Int) - 1))
+        , (word64TyConName, (0, 2 ^ (64 :: Int) - 1))
+        ]
+  where
+    name = tyConName constructor
 
 freshenLogicalType :: SpecType -> TcRn SpecType
 -- Logical declarations distinguish synthetic variables by occurrence as
@@ -836,6 +857,38 @@ primitiveQuery flags native location embeddings measures projections instances s
                         -- Keep the case: source calls inside a branch must
                         -- retain that branch's path condition during checking.
                         pure (ifQuery condition' yesValue noValue)
+    -- A logical integer (literal or arithmetic result) has the canonical
+    -- Integer carrier. Passing it to a source parameter of a fixed-width
+    -- integral type goes through an explicit bridge whose domain is that
+    -- type's target range: the conversion is an obligation, so an
+    -- out-of-range value is rejected rather than assumed into a value whose
+    -- type invariant contradicts it. The bridge's meaning is the identity.
+    logicalInteger (F.ECst expression _) = logicalInteger expression
+    logicalInteger (F.ECon F.I{}) = True
+    logicalInteger F.EBin{} = True
+    logicalInteger F.ENeg{} = True
+    logicalInteger _ = False
+    integerArgument function argument = do
+        argumentType <- operandType argument
+        if not (eqType argumentType integerTy)
+            then pure argument
+            else do
+                functionType <- operandType function
+                platform <- State.lift (targetPlatform <$> getDynFlags)
+                case splitFunTy_maybe functionType of
+                    Just (_, _, domain, _)
+                        | Just constructor <- tyConAppTyCon_maybe domain
+                        , Just (low, high) <- fixedWidthRange platform constructor -> do
+                            let bounds = F.PAnd [F.PAtom F.Le (integerLiteral low) (F.EVar value), F.PAtom F.Le (F.EVar value) (integerLiteral high)]
+                                ranged = strengthen integer (uTop (F.Reft (value, bounds)))
+                            denotation <- functionMeaning [(x, integerTy)] (F.EVar x)
+                            bridge <- freshParameter (rFun x ranged (equality (ofType domain) (F.EVar x))) denotation
+                            pure (applyQuery bridge argument)
+                    _ -> pure argument
+    integerLiteral n
+        | n < 0 = F.ENeg (F.ECon (F.I (negate n)))
+        | otherwise = F.ECon (F.I n)
+
     inject carrier sourceType expression
         | eqType sourceType (specTypeToQueryType carrier) = pure expression
         | otherwise = do
@@ -1031,7 +1084,11 @@ primitiveQuery flags native location embeddings measures projections instances s
                 ty <- measureType name selected
                 operator <- freshParameter ty (F.EVar name)
                 pure (applyQuery operator lowered)
-        F.EApp function argument -> applyQuery <$> lower function <*> lower argument
+        F.EApp function argument -> do
+            function' <- lower function
+            argument' <- lower argument
+            argument'' <- if logicalInteger argument then integerArgument function' argument' else pure argument'
+            pure (applyQuery function' argument'')
         F.ESym{} -> logicalOperation False expected [] (const expression) []
         F.ECon F.I{} -> logicalOperation False expected [] (const expression) []
         F.ECon F.R{} -> logicalOperation False expected [] (const expression) []
