@@ -29,10 +29,13 @@ import Data.Word (Word64) -- Necessary to bring in scope the evidence that Word6
 intCSize :: Int -> CSize
 intCSize = fromIntegral
 
+-- CSize has no instance contracts of its own. Convert through its Word64
+-- representation, whose contracts exist; the Int conversion is exact only
+-- below 2^63, so that range is a checked premise rather than an assumption.
 {-# NOINLINE cSizeInt #-}
-{-@ assume cSizeInt :: x:CSize -> {v: Int | v = x } @-}
+{-@ cSizeInt :: x:{CSize | x < 9223372036854775808} -> {v: Int | v = x } @-}
 cSizeInt :: CSize -> Int
-cSizeInt = fromIntegral
+cSizeInt (CSize w) = fromInteger (toInteger w)
 
 
 {-@ assume mkPtr :: x:Addr# -> {v: (Ptr b) | ((plen v) = (addrLen x) && ((plen v) >= 0)) } @-}
