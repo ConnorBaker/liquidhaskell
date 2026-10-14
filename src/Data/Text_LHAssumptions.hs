@@ -9,7 +9,7 @@ module Data.Text_LHAssumptions where
 
 import Data.Maybe_LHAssumptions ()
 import Data.Primitive.ByteArray (ByteArray, sizeofByteArray)
-import Data.Text (Text, append, drop, empty, length, null, singleton, span, split, uncons)
+import Data.Text (Text, append, drop, empty, length, null, pack, singleton, span, split, uncons)
 import qualified Data.Text.Internal
 import Data.Tuple_LHAssumptions ()
 
@@ -89,12 +89,18 @@ assume Data.Text.null
 -- Data/Text/Internal.hs:89-103 implements append by returning an operand when
 -- the other is empty, otherwise allocating the byte sum and copying both
 -- bounded slices. The dependent bound excludes its size-overflow branch.
--- Both actual imported owners are NOINLINE: these contracts do not depend on
--- the pack/IsString literal rules or grant validity to unchecked addresses.
+-- text-2.1.3 Data/Text/Internal.hs:245-272 implements pack by writing each
+-- sanitized character (safe) as UTF-8 into a growing buffer, then shrinking
+-- it to the bytes written; pack [] is empty. Its result is bounded and valid.
+-- The owners here are NOINLINE (pack until phase 0): these contracts state the
+-- functions' own definitions, not the literal rules in Data/Text/Show.hs:145-155 that
+-- replace pack on literals, and grant no validity to unchecked addresses.
 {-@
 assume Data.Text.singleton
   :: c:{Char | (lit "0" Char) <= c && c <= (lit "127" Char)}
   -> {t:Text | tvalid t && tlen t == 1 && tbytes t == 1 && thead t == c}
+
+assume Data.Text.pack :: String -> {t:Text | tvalid t}
 
 assume Data.Text.append
   :: x:{Text | tvalid x}
