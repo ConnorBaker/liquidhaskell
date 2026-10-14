@@ -210,14 +210,32 @@ knownInstanceOperations info
         -- On an unsigned carrier (operands in [0, 2^n)), quot/div and rem/mod
         -- coincide with the theory's Euclidean division and modulus for every
         -- nonzero divisor; a zero divisor raises, so its value is unobserved.
-        -- Signed truncation and flooring differ from Euclidean division and
-        -- stay uninterpreted.
         (method, [a, b])
             | unsigned tc
             , method `elem` ["quot", "div"] -> Just (F.EBin F.Div a b)
             | unsigned tc
             , method `elem` ["rem", "mod"] -> Just (F.EBin F.Mod a b)
+        -- On a signed carrier, truncation (quot/rem) and flooring (div/mod)
+        -- differ from Euclidean division whenever an operand is negative.
+        -- Read them by sign cases whose every theory divisor is positive,
+        -- the IntegralQuotient/Remainder/Div/Mod graphs of the Int and
+        -- Integer instance contracts. A zero divisor and the quotient
+        -- overflow raise, so their values are unobserved.
+        ("div", [a, b]) -> Just (positive b (F.EBin F.Div a b) (F.EBin F.Div (F.ENeg a) (F.ENeg b)))
+        ("mod", [a, b]) -> Just (positive b (F.EBin F.Mod a b) (F.ENeg (F.EBin F.Mod (F.ENeg a) (F.ENeg b))))
+        ("quot", [a, b]) -> Just (truncated F.Div a b)
+        ("rem", [a, b]) -> Just (truncated F.Mod a b)
         _ -> Nothing
+    positive b = F.EIte (F.PAtom F.Gt b (F.expr (0 :: Int)))
+    -- Truncation is the magnitude's Euclidean quotient (remainder) carrying
+    -- the sign of the dividend, and for quot also of the divisor.
+    truncated op a b =
+        F.EIte (F.PAtom F.Ge a (F.expr (0 :: Int))) (signed b (F.EBin op a magnitude)) (F.ENeg (signed b (F.EBin op (F.ENeg a) magnitude)))
+      where
+        magnitude = positive b b (F.ENeg b)
+        signed divisor e
+            | op == F.Div = positive divisor e (F.ENeg e)
+            | otherwise = e
 
 --------------------------------------------------------------------------------
 -- | Class methods at a known instance dictionary.
