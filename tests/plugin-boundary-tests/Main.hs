@@ -2,6 +2,7 @@ module Main (main) where
 
 import CompilerFixture (Optimization (..), configuredCompiler)
 import qualified ConstructorTests
+import qualified DictionaryMethodTests
 import qualified EmbeddingSortTests
 import qualified ImportedBodyTests
 import qualified NativeJudgmentTests
@@ -21,6 +22,7 @@ main = defaultMain $
             [ testGroup
                 (show optimization)
                 [ ConstructorTests.tests getDataFileName compiler optimization
+                , DictionaryMethodTests.tests getDataFileName compiler optimization
                 , EmbeddingSortTests.tests getDataFileName compiler optimization
                 , ImportedBodyTests.tests getDataFileName compiler optimization
                 , NativeJudgmentTests.tests compiler optimization
