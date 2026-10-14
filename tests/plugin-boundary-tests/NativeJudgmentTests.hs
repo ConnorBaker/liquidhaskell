@@ -21,6 +21,8 @@ tests compiler optimization =
         , sourceCase "NativeCallbackDistinct" Fixtures.distinctCallbackPredicates (UnsafeAt [10])
         , sourceCase "NativeProjectedCallbackAlpha" Fixtures.alphaProjectedCallbackPredicate Safe
         , sourceCase "NativeProjectedCallbackDistinct" Fixtures.distinctProjectedCallbackPredicates (UnsafeAt [14])
+        , sourceCase "NativePartialProjectedCallbackAlpha" Fixtures.partialProjectedCallbackPredicate Safe
+        , sourceCase "NativePartialProjectedCallbackDistinct" Fixtures.distinctPartialProjectedCallbackPredicates (UnsafeAt [14])
         , sourceCase "NativeSameSpelledTermPredicate" Fixtures.sameSpelledTermPredicate Safe
         , sourceCase "NativeFalseMembership" Fixtures.falseMembershipGuard Safe
         , sourceCase "NativeInadmissibleMembership" Fixtures.inadmissibleMembershipGuard (UnsafeAt [6])

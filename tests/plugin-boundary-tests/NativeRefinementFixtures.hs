@@ -9,6 +9,8 @@ module NativeRefinementFixtures (
     distinctCallbackPredicates,
     alphaProjectedCallbackPredicate,
     distinctProjectedCallbackPredicates,
+    partialProjectedCallbackPredicate,
+    distinctPartialProjectedCallbackPredicates,
     sameSpelledTermPredicate,
     falseMembershipGuard,
     inadmissibleMembershipGuard,
@@ -315,6 +317,34 @@ distinctProjectedCallbackPredicates =
         "Callback a"
         "forall <p :: a -> Bool, q :: a -> Bool>. callback:Callback<p> a -> value:{a<p> | project callback value} -> a<q>"
         "forall <r :: Int -> Bool, s :: Int -> Bool>. callback:Callback<r> Int -> value:{Int<r> | project callback value} -> Int<r>"
+
+-- A partial projection is an uninterpreted logical measure. Its quantified
+-- abstract refinement must not block its logical application.
+partialProjectedCallbackPredicate :: String
+partialProjectedCallbackPredicate =
+    callbackDomain
+        "NativePartialProjectedCallbackAlpha"
+        partialCallbackProjection
+        "Callback a"
+        "forall <p :: a -> Bool>. callback:Callback<p> a -> value:{a<p> | project callback value} -> a<p>"
+        "forall <q :: Int -> Bool>. callback:Callback<q> Int -> value:{Int<q> | project callback value} -> Int<q>"
+
+distinctPartialProjectedCallbackPredicates :: String
+distinctPartialProjectedCallbackPredicates =
+    callbackDomain
+        "NativePartialProjectedCallbackDistinct"
+        partialCallbackProjection
+        "Callback a"
+        "forall <p :: a -> Bool, q :: a -> Bool>. callback:Callback<p> a -> value:{a<p> | project callback value} -> a<q>"
+        "forall <r :: Int -> Bool, s :: Int -> Bool>. callback:Callback<r> Int -> value:{Int<r> | project callback value} -> Int<r>"
+
+partialCallbackProjection :: [String]
+partialCallbackProjection =
+    [ "data Callback a = Callback (a -> Bool) | NoCallback"
+    , "{-@ data Callback a <p :: a -> Bool> = Callback {stored :: a<p> -> {b:Bool | b}} | NoCallback @-}"
+    , "{-@ measure project :: forall <p :: a -> Bool>. Callback<p> a -> (a<p> -> {b:Bool | b})"
+    , "      project (Callback function) = function @-}"
+    ]
 
 callbackProjection :: [String]
 callbackProjection =
