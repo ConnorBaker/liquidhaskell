@@ -53,7 +53,8 @@ import           Language.Haskell.Liquid.UX.Annotate (mkOutput)
 import qualified Language.Haskell.Liquid.Termination.Structural as ST
 import qualified Language.Haskell.Liquid.GHC.Misc          as GM
 import           Liquid.GHC.API as GHC hiding (text, vcat, ($+$), (<+>))
-import Language.Haskell.Liquid.Types.RType (SpecType, LocSpecType, RReft, RTypeBV (..))
+import Language.Haskell.Liquid.Types.RType (SpecType, LocSpecType, RReft, RTypeBV (..), RTyCon (..), TyConInfo (..))
+import Language.Haskell.Liquid.Types.Variance (Variance (..))
 
 -- RefCore annotations and complete raw publication evidence are separate
 -- from the reported expected-failure result.
@@ -782,14 +783,20 @@ independentResult (RFun x i input result _) =
   RFun x i input (independentResult result) mempty
 -- Only value nodes receive an inference hole: a refinement on a higher-kinded
 -- argument would migrate onto the values of the constructor it is applied to.
+-- Only covariant type arguments are results: a contravariant or invariant
+-- argument is (also) an input domain, which stays the Haskell domain. Its
+-- independently least solution would be empty (e.g. a dictionary whose class
+-- parameter occurs only in method arguments).
 independentResult t = holes t
   where
     holes :: SpecType -> SpecType
     holes ty = case ty of
-      RApp c ts rs _ -> RApp c (map holes ts) (fmap (fmap (const inferred)) <$> rs) (valueHole ty)
+      RApp c ts rs _ -> RApp c (zipWith argument (varianceTyArgs (rtc_info c) ++ repeat Invariant) ts) (fmap (fmap (const inferred)) <$> rs) (valueHole ty)
       RAppTy f a _ -> RAppTy (holes f) (holes a) (valueHole ty)
       RVar a _ -> RVar a (valueHole ty)
       _ -> fmap (const inferred) ty
+    argument Covariant arg = holes arg
+    argument _ arg = arg
     inferred :: RReft
     inferred = uTop (F.Reft (F.vv_, hole))
     valueHole :: SpecType -> RReft
