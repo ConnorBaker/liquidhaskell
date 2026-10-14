@@ -380,6 +380,11 @@ tests fixture compiler optimization =
                 , ("TextUtf8NotBoundsBad", UnsafeAt [7])
                 , ("TextRawNotBoundsBad", UnsafeAt [7])
                 , ("TextBoundsLengthBad", UnsafeAt [8])
+                , -- GHC-generated dictionary binders have no position of their
+                  -- own; their obligations belong to the use that demands them.
+                  ("TextGeneratedOrdGood", Safe)
+                , ("TextGeneratedOrdBad", UnsafeAt [8])
+                , ("TextGeneratedNestedOrdBad", UnsafeAt [8])
                 ]
             )
         ,
