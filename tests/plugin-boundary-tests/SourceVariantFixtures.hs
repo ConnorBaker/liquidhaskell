@@ -35,6 +35,10 @@ variants =
         , replaceOnce "{-@ assume ord :: Char -> {v:Int | 0 <= positive 1} @-}\n" "{-@ assume ord :: Char -> {v:Int | 0 <= positive 0} @-}\n"
         )
     ,
+        ( "ProjectionIncompleteBad"
+        , replaceOnce "{-@ missing :: n:Int -> {v:Bool | selected Empty == n => v} @-}\n" "{-@ missing :: n:Int -> {v:Bool | selected Empty == n} @-}\n"
+        )
+    ,
         ( "ObligationContextBad"
         , replaceOnce "probe = requiresPositive 1\n" "probe = requiresPositive 0\n"
         )

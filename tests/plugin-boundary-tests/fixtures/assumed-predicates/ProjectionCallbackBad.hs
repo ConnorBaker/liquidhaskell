@@ -1,5 +1,7 @@
 module ProjectionCallbackBad where
 
+{-@ LIQUID "--higherorder" @-}
+
 data Callback = Callback (Int -> Int)
 
 {-@ data Callback = Callback { run :: {v:Int | v > 0} -> Int } @-}

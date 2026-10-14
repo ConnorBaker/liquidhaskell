@@ -1,5 +1,10 @@
 module ProjectionValueGood where
 
+{-@ LIQUID "--higherorder" @-}
+
+-- Only complete, selector-backed projections denote their source case.
+-- The functional Callback field has a generated selector under --higherorder.
+
 data Box a = Box a
 
 {-@ measure field :: Box a -> a
@@ -9,16 +14,15 @@ data Box a = Box a
 witness :: (Box a -> a) -> Bool
 witness _ = True
 
-data Choice a = Empty | Full a
+data Tagged a = Tagged Bool a
 
-{-@ measure full :: Choice a -> Bool
-      full Empty = false
-      full (Full x) = true @-}
-{-@ measure selected :: {v:Choice a | full v} -> a
-      selected (Full x) = x @-}
+{-@ measure tagged :: Tagged a -> Bool
+      tagged (Tagged b x) = b @-}
+{-@ measure payload :: {v:Tagged a | tagged v} -> a
+      payload (Tagged b x) = x @-}
 
-{-@ restricted :: f:({v:Choice a | full v} -> a) -> {v:Bool | f == selected => v} @-}
-restricted :: (Choice a -> a) -> Bool
+{-@ restricted :: f:({v:Tagged a | tagged v} -> a) -> {v:Bool | f == payload => v} @-}
+restricted :: (Tagged a -> a) -> Bool
 restricted _ = True
 
 data Callback = Callback (Int -> Int)
