@@ -119,9 +119,12 @@ subst msg as as' bt
   = trace msg $ mkForAllTys as bt
   where su = mkTvSubstPrs $ zip (map binderVar as) (mkTyVarTys (map binderVar as'))
 
--- | eta-expand CoreBinds with quantified types
+-- | eta-expand CoreBinds with quantified types. A source note around the
+-- type lambdas (e.g. a located refinement predicate) already binds them;
+-- re-applying the expression to its own type variables would turn the
+-- checked lambda telescope into a synthesized polymorphic application.
 normalizeForAllTys :: CoreExpr -> CoreExpr
-normalizeForAllTys e = case e of
+normalizeForAllTys e = case Core.stripTicksTopE (const True) e of
   Lam b _ | isTyVar b
     -> e
   _ -> mkLams tvs (mkTyApps e (map mkTyVarTy tvs))
