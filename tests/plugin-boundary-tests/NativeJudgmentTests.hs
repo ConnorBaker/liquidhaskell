@@ -33,8 +33,8 @@ tests compiler optimization =
         , sourceCase "NativePendingDictionary" Fixtures.pendingDictionaryDomain (FormationRefusal 5 "Instance compatibility depends on unadmitted instance authority:")
         , sourceCase "NativeSharedMethods" Fixtures.consistentSharedMethods Safe
         , sourceCase "NativeSharedMethodsReversed" Fixtures.reversedConsistentSharedMethods Safe
-        , sourceCase "NativeConflictingSharedMethods" Fixtures.conflictingSharedMethods (UnsafeAt [11])
-        , sourceCase "NativeConflictingSharedMethodsReversed" Fixtures.reversedConflictingSharedMethods (UnsafeAt [14])
+        , sourceCase "NativeConflictingSharedMethods" Fixtures.conflictingSharedMethods (UnsafeAt [12])
+        , sourceCase "NativeConflictingSharedMethodsReversed" Fixtures.reversedConflictingSharedMethods (UnsafeAt [15])
         ]
   where
     sourceCase name body expected =

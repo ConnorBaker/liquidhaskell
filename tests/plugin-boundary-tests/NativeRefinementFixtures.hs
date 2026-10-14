@@ -95,6 +95,9 @@ pendingDictionaryDomain =
 -- Both dictionaries retain the same actual source implementation Id. Every
 -- private claim must be checked, while each consumer keeps its own selector's
 -- instantiated contract. Catalog order cannot select which claim is required.
+-- `shared` stays private: an exported binder without a specification has the
+-- trivial contract, which could not establish either instance claim. A
+-- conflicting claim fails at the instance body that must establish it.
 consistentSharedMethods, reversedConsistentSharedMethods, conflictingSharedMethods, reversedConflictingSharedMethods :: String
 consistentSharedMethods = sharedMethods "NativeSharedMethods" False False
 reversedConsistentSharedMethods = sharedMethods "NativeSharedMethodsReversed" False True
@@ -105,7 +108,7 @@ sharedMethods :: String -> Bool -> Bool -> String
 sharedMethods name conflicting reversed =
     unlines $
         [ "{-# LANGUAGE NoImplicitPrelude, AllowAmbiguousTypes, TypeApplications #-}"
-        , "module " ++ name ++ " where"
+        , "module " ++ name ++ " (Marker (..), consumeInt, consumeBool) where"
         , "import GHC.Types (Bool, Int)"
         , "class Marker a where selected :: Int"
         , "shared :: Int"
