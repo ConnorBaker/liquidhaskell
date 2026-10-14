@@ -164,11 +164,23 @@ addSortBind γ (x, sort) = do
 
 
 addBind :: SrcSpan -> F.Symbol -> F.SortedReft -> CG ((F.Symbol, F.Sort), F.BindId)
-addBind l x r = do
+addBind l x r0 = do
   st          <- get
+  let r = declaredSort (cgLits st)
   let (i, bs') = F.insertBindEnv x r (Ci l Nothing Nothing) (binds st)
   put          $ st { binds = bs' } { bindSpans = M.insert i l (bindSpans st) }
   return ((x, F.sr_sort r), {- traceShow ("addBind: " ++ showpp x) -} i)
+  where
+    -- A global logical declaration (e.g. a same-spelled authored measure,
+    -- which name resolution selects) owns its symbol's sort. A trivially
+    -- refined program binder declares only a sort, so it must not redeclare
+    -- that symbol at a different (dictionary-carrying) source sort.
+    declaredSort lits
+      | F.isTautoReft (F.sr_reft r0)
+      , Just s <- F.lookupSEnv x lits
+      = r0 { F.sr_sort = s }
+      | otherwise
+      = r0
 
 -- | Add local rewrites associated to the next binding that will be inserted.
 addRewritesForNextBinding :: F.LocalRewrites -> CG ()

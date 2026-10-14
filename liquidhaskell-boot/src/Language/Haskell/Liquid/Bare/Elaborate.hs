@@ -382,7 +382,7 @@ elaborateSpecTypeWithPrimitives ::
     (F.TCEmb TyCon -> [(Id, F.Expr)] -> CoreExpr -> (F.Expr, T.LogicSupport)) ->
     SpecType ->
     TcRn T.CheckedSpecType
-elaborateSpecTypeWithPrimitives bindSelf flags native embeddings measures projections instances sources captures collect interpret ty =
+elaborateSpecTypeWithPrimitives bindSelf flags native embeddings measures projections instances allSources captures collect interpret ty =
     RnUtils.bindLocalNames (map getName (reverse captures)) $
         TcEnv.tcExtendTyVarEnv (filter isTyVar captures) $
             TcEnv.tcExtendIdEnv (filter isId captures) $ do
@@ -419,6 +419,13 @@ elaborateSpecTypeWithPrimitives bindSelf flags native embeddings measures projec
                 let reserved = map fst wiredSortedSyms ++ [name | (name, _, _) <- measures] ++ map fst projections ++ [name | (name, _, _) <- instances] ++ map fst sources ++ map F.symbol captures ++ maybe [] (map fst . F.toListSEnv . F.seSort) native
                     named = freshenQueryTelescope bindSelf reserved ty
                 elaborateSpecType' query collect id named
+  where
+    -- Name resolution prefers an authored logical declaration to a
+    -- same-spelled source value (as upstream's resolveLogicName does), so
+    -- that value is not what the refinement names. Generated measures
+    -- (selectors, checkers, reflections) denote their source owner.
+    authored = S.fromList [name | (name, kind, _) <- measures, kind `elem` [T.MsMeasure, T.MsAbsMeasure, T.MsClass]]
+    sources = filter (not . (`S.member` authored) . fst) allSources
 
 freshenLogicalType :: SpecType -> TcRn SpecType
 -- Logical declarations distinguish synthetic variables by occurrence as
