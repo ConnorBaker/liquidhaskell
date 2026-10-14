@@ -151,6 +151,13 @@ refreshRefType _ (RApp rc ts _ _)
     | isEmbeddedDict rc =
         return $ rRCls rc ts
 
+-- The dictionary value itself is not an inference target. As in upstream's
+-- template, its refinement stays as given: a fresh KVar here has no lower
+-- bound in a binder without callers, and its least solution `false` would
+-- make that binder's whole scope vacuous (tests/neg/Monad5.hs).
+refreshRefType allowTC (RApp rc ts rs r)
+    | isClass rc =
+        RApp rc <$> mapM (refresh allowTC) ts <*> mapM (refreshRef allowTC) rs <*> pure r
 refreshRefType allowTC t@(RApp rc ts rs r) =
     RApp rc <$> mapM (refresh allowTC) ts <*> mapM (refreshRef allowTC) rs <*> refreshValueReft allowTC t r
 refreshRefType allowTC t@(RVar a r) =
