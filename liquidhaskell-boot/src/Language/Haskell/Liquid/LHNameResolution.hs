@@ -201,7 +201,8 @@ resolveLHNames cfg thisModule localVars impMods globalRdrEnv bareSpec0 dependenc
       -- same names. We resolve them before constructing the logic
       -- environments.
       dataDecls <- lift $ mapM (mapDataDeclFieldNamesM resolveFieldLogicName) (dataDecls sp1)
-      let sp2 = sp1 {dataDecls}
+      newtyDecls <- lift $ mapM (mapDataDeclFieldNamesM resolveFieldLogicName) (newtyDecls sp1)
+      let sp2 = sp1 {dataDecls, newtyDecls}
 
       checkErrors
 
