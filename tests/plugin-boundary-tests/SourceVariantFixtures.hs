@@ -104,6 +104,10 @@ variants =
         , replaceOnce "queryOnly x = x\n" "queryOnly _ = 0\n"
         )
     ,
+        ( "OwnedInstanceBad"
+        , replaceOnce "      pick :: x:Int -> {v:Int | v == x} @-}\n" "      pick :: x:{v:Int | v > 0} -> {v:Int | v == x} @-}\n"
+        )
+    ,
         ( "InstanceFormationBad"
         , replaceOnce "      check :: Token -> flag:Bool -> {value:Integer | flag => onlyTrue flag == onlyTrue flag}\n" "      check :: Token -> flag:Bool -> {value:Integer | onlyTrue flag == onlyTrue flag}\n"
         )

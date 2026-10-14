@@ -1,4 +1,4 @@
-module QueryAssertions (assertAuthoredFailure, assertDefaultInterfaces, assertExternalFormationTag, assertSingleSourceCheck, assertJointInferenceCheck) where
+module QueryAssertions (assertAuthoredFailure, assertDefaultInterfaces, assertExternalFormationTag, assertSingleSourceCheck, assertJointInferenceCheck, compatibilityObligations) where
 
 import CompilerFixture (Compiled (..))
 import qualified Data.ByteString as ByteString
@@ -115,6 +115,12 @@ assertAuthoredFailure compiled = do
                 Just (F.Unsafe _ failures) -> map fst failures @?= [identifier]
                 other -> assertFailure ("expected the authored saved-query failure, got " ++ show other)
         other -> assertFailure ("expected exactly one authored result=1 goal, got " ++ show (map snd other))
+
+-- The constraints of a module's instance-against-class compatibility query.
+-- Only a module's own instance declarations are its obligations there.
+compatibilityObligations :: Compiled -> IO Int
+compatibilityObligations compiled =
+    length . F.cm <$> readQuery (compiledDirectory compiled </> ".liquid" </> compiledModule compiled ++ ".hs.compatibility.bfq")
 
 checkingQueries :: Compiled -> IO [(FilePath, F.FInfo ())]
 checkingQueries compiled = do

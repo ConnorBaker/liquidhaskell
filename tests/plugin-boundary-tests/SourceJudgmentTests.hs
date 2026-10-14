@@ -3,12 +3,12 @@ module SourceJudgmentTests (tests) where
 import CompilerFixture
 import Control.Monad (when)
 import DeclaredAliasFixtures (declaredAlias)
-import QueryAssertions (assertDefaultInterfaces, assertExternalFormationTag, assertJointInferenceCheck, assertSingleSourceCheck)
+import QueryAssertions (assertDefaultInterfaces, assertExternalFormationTag, assertJointInferenceCheck, assertSingleSourceCheck, compatibilityObligations)
 import SourceVariantFixtures (copySourceFixture)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
 import Test.Tasty (TestTree, testGroup)
-import Test.Tasty.HUnit (testCase)
+import Test.Tasty.HUnit (assertBool, testCase, (@?=))
 
 tests :: (FilePath -> IO FilePath) -> IO Compiler -> Optimization -> TestTree
 tests fixture compiler optimization =
@@ -180,6 +180,25 @@ tests fixture compiler optimization =
             [ testGroup
                 mode
                 [ checkedInterfaces ObjectCode "checked dictionary publication" "lh-checked-instance" "instance-formation" "CheckedCarrier" flags [("CheckedCarrierGood", Safe), ("CheckedCarrierBad", UnsafeAt [10])]
+                , sourceCase "instance-formation" flags "OwnedInstanceBad" (UnsafeAt [11])
+                , -- The declaring module checks its instance against the class.
+                  -- An importer, with or without the implicit Prelude's trusted
+                  -- assumption instances, uses that result and never re-proves it.
+                  testCase "instance compatibility belongs to its declaring module" $ withSystemTempDirectory "lh-instance-owner" $ \directory -> do
+                    tool <- compiler
+                    let producerDirectory = directory </> "producer"
+                        fixtures = "plugin-boundary-tests/fixtures/instance-formation"
+                    copyFixture fixture (fixtures </> "OwnedInstanceGood.hs") producerDirectory "OwnedInstanceGood"
+                    producer <- compile tool Strict optimization ObjectCode producerDirectory "OwnedInstanceGood" [] flags Safe
+                    owned <- compatibilityObligations producer
+                    assertBool "the declaring module did not check its instance against the class" (owned > 0)
+                    mapM_
+                        ( \name -> do
+                            compiled <- client tool directory fixtures producerDirectory flags (name, Safe)
+                            imported <- compatibilityObligations compiled
+                            imported @?= 0
+                        )
+                        ["OwnedInstanceClient", "OwnedInstancePreludeClient"]
                 , testCase "assumed dictionary admission" $ withSystemTempDirectory "lh-imported-instance" $ \directory -> do
                     tool <- compiler
                     let producerDirectory = directory </> "producer"
@@ -274,8 +293,7 @@ tests fixture compiler optimization =
     client tool directory fixtures producerDirectory flags (name, expected) = do
         let target = directory </> name
         copySourceFixture fixture (fixtures </> name ++ ".hs") target name
-        _ <- compile tool Strict optimization ObjectCode target name [producerDirectory </> "objects"] flags expected
-        pure ()
+        compile tool Strict optimization ObjectCode target name [producerDirectory </> "objects"] flags expected
     groups =
         [
             ( "native-relations"
