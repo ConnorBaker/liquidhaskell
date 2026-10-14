@@ -1581,10 +1581,9 @@ myAsmSig v sigs = Mb.fromMaybe errImp (mbHome `mplus` mbImp)
     mbImp       = takeBiggest   fst (Misc.firstGroup sigsImp) -- see [NOTE:Prioritize-Home-Spec]
     sigsHome    = [(m, t)      | (True,  m, t) <- sigs ]
     sigsImp     = F.notracepp ("SIGS-IMP: " ++ F.showpp v)
-                  [(d, (m, t)) | (False, m, t) <- sigs, let d = nameDistance vName m]
+                  [(d, (m, t)) | (False, m, t) <- sigs, let d = nameDistance v m]
     mkErr ts    = ErrDupSpecs (Ghc.getSrcSpan v) (F.pprint v) (GM.sourcePosSrcSpan . F.loc . snd <$> ts) :: UserError
     errImp      = impossible Nothing "myAsmSig: cannot happen as sigs is non-null"
-    vName       = GM.takeModuleNames (F.symbol v)
 
 makeTExpr :: Bare.Env -> [(Ghc.Var, LocBareType)] -> BareRTEnv -> Ms.BareSpec
           -> Bare.Lookup [(Ghc.Var, LocBareType, Maybe [Located F.Expr])]
@@ -1625,10 +1624,14 @@ makeVarTExprs env spec =
 -- modules and such (see `Resolve.matchMod`). However, we should pick the closer name
 -- if its available.
 ----------------------------------------------------------------------------------------
-nameDistance :: F.Symbol -> ModName -> Int
-nameDistance vName tName
-  | vName == F.symbol tName = 0
-  | otherwise               = 1
+-- | A specification from the variable's defining module is nearest. The
+--   variable's symbol also names its unit, which a module name does not carry.
+nameDistance :: Ghc.Var -> ModName -> Int
+nameDistance v tName
+  | home == Just (getModName tName) = 0
+  | otherwise                       = 1
+  where
+    home = Ghc.moduleName <$> Ghc.nameModule_maybe (Ghc.getName v)
 
 takeUnique :: Ex.Exception e => ([a] -> e) -> [a] -> Maybe a
 takeUnique _ []  = Nothing
