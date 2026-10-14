@@ -936,7 +936,15 @@ primitiveQuery flags native location embeddings measures projections instances s
         go variables arguments result = do
             environment <- queryEmbeddings
             let resultSort = typeSort environment (specTypeToQueryType result)
-            carrier <- logicalType variables resultSort
+            -- A declared datatype result is the carrier that the same
+            -- declared domain of another measure consumes (Bag's
+            -- `bagSize (fromList xs)`). Primitive sorts keep their canonical
+            -- logical carriers (e.g. Int-sorted results are Integer).
+            carrier <- case result of
+                RApp{}
+                    | resultSort `notElem` [F.boolSort, F.FInt, F.charSort, F.FReal] ->
+                        pure (ofType (specTypeToQueryType result))
+                _ -> logicalType variables resultSort
             pure (equality (strengthen carrier (Mb.fromMaybe mempty (stripRTypeBase result))) (apply name arguments))
 
     -- Preserve the declaration's input refinement before taking the actual
