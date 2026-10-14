@@ -801,8 +801,9 @@ primitiveQuery flags native location embeddings measures projections instances s
     -- The fixpoint judgment owns both the primitive and its result sort.
     -- Source operands retain their independently elaborated GHC types; no
     -- source Num/Eq dictionary supplies logical arithmetic or relation meaning.
-    logicalOperation generalize expected declarations operation arguments = do
-        lowered <- traverse lower arguments
+    logicalOperation generalize expected declarations operation arguments =
+        traverse lower arguments >>= logicalOperationOn generalize expected declarations operation
+    logicalOperationOn generalize expected declarations operation lowered = do
         types <-
             if generalize
                 then do
@@ -813,7 +814,7 @@ primitiveQuery flags native location embeddings measures projections instances s
                     (common, _) <- State.lift $ tryTc $ State.evalStateT (operandTypes lowered) query
                     maybe (traverse operandType lowered) pure common
                 else traverse operandType lowered
-        names <- traverse (const freshName) arguments
+        names <- traverse (const freshName) lowered
         environment <- queryEmbeddings
         let expression = operation (map F.EVar names)
             sorts = F.fromListSEnv (declarations ++ zip names (map (typeSort environment) types))
@@ -972,23 +973,20 @@ primitiveQuery flags native location embeddings measures projections instances s
                 Tick _ body -> go aliases body
                 _ -> []
 
-    -- A measure is a logical function: applied to a logical carrier, it
-    -- consumes that carrier at its declared domain's sort, not a source value.
+    -- A measure is a logical function. Applied to a logical carrier (no
+    -- source value), it is a logical primitive application: fixpoint sorts
+    -- the operand's carrier against the measure's declared sort and owns the
+    -- result sort, exactly as for the wired theory symbols.
     measureApplication name lowered = do
         logical <- logicalOperand lowered
-        selected <- selectMeasure name (Just lowered)
-        declared <- measureType name selected
-        -- No source value flows through this logical call, so its input is
-        -- the operand's own carrier; fixpoint sorts the readback.
-        ty <-
-            if logical
-                then polymorphicType liftedTypeKind (\carrier -> logicalDomain carrier declared)
-                else pure declared
-        operator <- freshParameter ty (F.EVar name)
-        pure (applyQuery operator lowered)
-    logicalDomain carrier (RAllT variable rest reft) = RAllT variable (logicalDomain carrier rest) reft
-    logicalDomain carrier (RFun binder info _ rest reft) = RFun binder info carrier rest reft
-    logicalDomain _ ty = ty
+        if logical
+            then case F.lookupSEnv name declarations of
+                Just schema -> logicalOperationOn False Nothing [(name, schema)] (apply name) [lowered]
+                Nothing -> die ("no resolved measure sort for " ++ F.showpp name)
+            else do
+                ty <- selectMeasure name (Just lowered) >>= measureType name
+                operator <- freshParameter ty (F.EVar name)
+                pure (applyQuery operator lowered)
     logicalOperand lowered = do
         receiver <- operandType lowered
         local <- State.gets (\(_, current, _) -> current)
