@@ -166,6 +166,21 @@ tests fixture compiler optimization =
                 ]
             | (mode, flags) <- [("default", []), ("typeclass", ["--typeclass"])]
             ]
+    -- A class method named in a refinement. With --typeclass, the method at
+    -- a known instance means that instance's contract, and at an abstract
+    -- dictionary it is uninterpreted.
+    methodQueries mode = case mode of
+        "default" ->
+            [ ("ImportedInstanceQueryOnlyGood", Safe)
+            , ("ImportedInstanceQueryOnlyBad", UnsafeAt [13])
+            ]
+        _ ->
+            [ ("ImportedInstanceQueryOnlyGood", Safe)
+            , ("ImportedInstanceQueryOnlyBad", UnsafeAt [13])
+            , ("ImportedInstanceQueryClaimBad", UnsafeAt [13])
+            , ("ImportedAbstractMethodGood", Safe)
+            , ("ImportedAbstractMethodBad", UnsafeAt [11])
+            ]
     checkedInterfaces backend label prefix category name flags cases =
         testCase label $ withSystemTempDirectory prefix $ \directory -> do
             tool <- compiler
@@ -208,7 +223,7 @@ tests fixture compiler optimization =
                     _ <- compileHaskell tool optimization producerDirectory "ImportedCarrier" []
                     mapM_
                         (client tool directory fixtures producerDirectory flags)
-                        [("ImportedInstanceCarrierGood", Safe), ("ImportedInstanceCarrierGenericBad", UnsafeAt [13]), ("ImportedInstanceCarrierMethodBad", UnsafeAt [6]), ("ImportedInstanceResultGood", Safe), ("ImportedInstancePredicateGood", Safe), ("ImportedInstancePredicateNarrowBad", UnsafeAt [10]), ("ImportedInstancePredicateResultBad", UnsafeAt [14]), ("ImportedInstanceQueryOnlyGood", Safe), ("ImportedInstanceQueryOnlyBad", UnsafeAt [13])]
+                        ([("ImportedInstanceCarrierGood", Safe), ("ImportedInstanceCarrierGenericBad", UnsafeAt [13]), ("ImportedInstanceCarrierMethodBad", UnsafeAt [6]), ("ImportedInstanceResultGood", Safe), ("ImportedInstancePredicateGood", Safe), ("ImportedInstancePredicateNarrowBad", UnsafeAt [10]), ("ImportedInstancePredicateResultBad", UnsafeAt [14])] ++ methodQueries mode)
                 , testCase "nested predicate callback admission" $ withSystemTempDirectory "lh-imported-callback-instance" $ \directory -> do
                     tool <- compiler
                     let producerDirectory = directory </> "producer"

@@ -36,6 +36,7 @@ import qualified Data.HashSet                      as S
 -- import           Language.Fixpoint.Misc
 
 import           Language.Haskell.Liquid.Types.Errors
+import           Language.Haskell.Liquid.Types.Dictionaries (fromRISig)
 import           Language.Haskell.Liquid.Types.RType
 import           Language.Haskell.Liquid.Types.RTypeOp
 import           Language.Haskell.Liquid.Types.Specs
@@ -88,7 +89,7 @@ cgInfoFInfo :: [(Var, LocSpecType)] -> TargetInfo -> CGInfo -> IO (F.FInfo Cinfo
 cgInfoFInfo rewrites info cgi = return (targetFInfo rewrites info cgi)
 
 targetFInfo :: [(Var, LocSpecType)] -> TargetInfo -> CGInfo -> F.FInfo Cinfo
-targetFInfo rewrites info cgi = knownInstanceOperations info (mappend (mempty { F.ae = ax, F.lrws = localRewrites cgi }) fi)
+targetFInfo rewrites info cgi = instanceMethodContracts info (knownInstanceOperations info (mappend (mempty { F.ae = ax, F.lrws = localRewrites cgi }) fi))
   where
     fi               = F.fi cs ws bs ls consts ks qs bi aHO aHOqs es mempty adts
     cs               = fixCs    cgi
@@ -217,6 +218,70 @@ knownInstanceOperations info
             | unsigned tc
             , method `elem` ["rem", "mod"] -> Just (F.EBin F.Mod a b)
         _ -> Nothing
+
+--------------------------------------------------------------------------------
+-- | Class methods at a known instance dictionary.
+--
+-- Readback keeps a method's dictionary, so a source refinement `pick x` at
+-- `Pick Int` is the application `pick $fPickInt x`. That dictionary's declared
+-- instance contract (checked by its owner, or an `assume` the user stated)
+-- describes every result of this application. Instantiate exactly that
+-- contract at each such term of a constraint: its argument refinements imply
+-- its result refinement. This adds no fact beyond the declared contract; at
+-- an abstract dictionary the application stays uninterpreted.
+--------------------------------------------------------------------------------
+instanceMethodContracts :: TargetInfo -> F.FInfo Cinfo -> F.FInfo Cinfo
+instanceMethodContracts info fi
+    | M.null contracts = fi
+    | otherwise = fi { F.cm = M.map instantiate (F.cm fi) }
+  where
+    DEnv dictionaries = gsDicts (gsSig (giSpec info))
+    contracts = M.fromList
+        [ ((F.symbol dictionary, method), contract)
+        | (dictionary, methods) <- M.toList dictionaries
+        , (method, signature) <- M.toList methods
+        , Just contract <- [firstOrder (F.val (fromRISig signature))]
+        ]
+    -- Only a closed first-order contract has a direct reading at a term.
+    -- Abstract refinements and type parameters keep their call-site rules.
+    firstOrder ty
+        | null (ty_vars rep), null (ty_preds rep), all isBase (ty_args rep), isBase (ty_res rep) =
+            Just (ty_binds rep, map rTypeReft (ty_args rep), rTypeReft (ty_res rep))
+        | otherwise = Nothing
+      where
+        rep = toRTypeRep ty
+    isBase RApp{} = True
+    isBase RVar{} = True
+    isBase _ = False
+    fact term = case F.splitEApp term of
+        (F.EVar method, F.EVar dictionary : arguments)
+            | Just (binders, domains, F.Reft (result, goal)) <-
+                M.lookup (dictionary, GM.dropModuleNamesCorrect method) contracts
+            , length binders == length arguments ->
+                let actual = F.mkSubst (zip binders arguments)
+                    premise (F.Reft (value, predicate)) argument =
+                        F.subst actual (F.subst1 predicate (value, argument))
+                 in Just $ F.PImp
+                        (F.pAnd (zipWith premise domains arguments))
+                        (F.subst actual (F.subst1 goal (result, term)))
+        _ -> Nothing
+    instantiate c =
+        case Mb.mapMaybe fact (S.toList (S.fromList terms)) of
+            [] -> c
+            facts -> c { F.slhs = strengthen (F.slhs c) facts }
+      where
+        F.RR _ (F.Reft (value, _)) = F.slhs c
+        -- Each hypothesis is read at its own binder; the goal at the
+        -- constraint's value variable.
+        hypotheses =
+            [ F.subst1 predicate (binder, F.EVar name)
+            | (name, F.RR _ (F.Reft (binder, predicate))) <- F.clhs (F.bs fi) c
+            ]
+        goal = case F.srhs c of
+            F.RR _ (F.Reft (binder, predicate)) -> F.subst1 predicate (binder, F.EVar value)
+        terms = concatMap Vis.eapps (goal : hypotheses)
+    strengthen (F.RR sort (F.Reft (value, predicate))) facts =
+        F.RR sort (F.Reft (value, F.pAnd (predicate : facts)))
 
 makeAxiomEnvironment :: [(Var, LocSpecType)] -> TargetInfo -> [(Var, SpecType)] -> M.HashMap F.SubcId (F.SubC Cinfo) -> F.AxiomEnv
 makeAxiomEnvironment rewrites info xts fcs =

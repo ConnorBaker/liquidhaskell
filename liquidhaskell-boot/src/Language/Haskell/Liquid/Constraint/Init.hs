@@ -20,12 +20,13 @@ module Language.Haskell.Liquid.Constraint.Init (
 import           Prelude                                       hiding (error, undefined)
 import           Control.Monad (foldM, forM)
 import           Control.Monad.State
-import           Data.Maybe                                    (isNothing, fromMaybe, catMaybes, mapMaybe)
+import           Data.Maybe                                    (isJust, isNothing, fromMaybe, catMaybes, mapMaybe)
 import qualified Data.HashMap.Strict                           as M
 import qualified Data.HashSet                                  as S
 import qualified Data.List                                     as L
 import           Data.Bifunctor
 import qualified Language.Fixpoint.Types                       as F
+import           GHC.Core.FVs                                  (exprsSomeFreeVarsList)
 
 import qualified Language.Haskell.Liquid.UX.CTags              as Tg
 import           Language.Haskell.Liquid.Constraint.Fresh
@@ -403,7 +404,13 @@ coreBindLits :: F.TCEmb TyCon -> TargetInfo -> [(F.Symbol, F.Sort)]
 coreBindLits tce info
   = sortNub      $ [ (F.symbol x, F.strSort) | (_, Just (F.ESym x)) <- lconsts ]    -- strings
                 ++ [ (dconToSym dc, dconToSort dc) | dc <- dcons ]                  -- data constructors
+                ++ [ (F.symbol x, methodSort x) | typeclass (getConfig info), x <- methodSupport ]
   where
+    -- A class-method call's result is the method applied to its actual
+    -- dictionary (see Generate.methodApplication). Declare those symbols with
+    -- the dictionary-retaining sort that logical readback gives them.
+    methodSupport = exprsSomeFreeVarsList (\v -> isId v && (isJust (isClassOpId_maybe v) || isDFunId v)) (concatMap rhssOfBind (giCbs src))
+    methodSort x = rTypeSort tce (classRFInfoType True (ofType (varType x) :: SpecType))
     src         = giSrc info
     lconsts      = literalConst tce <$> literals (giCbs src)
     dcons        = filter isDCon $ map dataConWorkId $ M.keys $ gsConstructorBoxes $ gsName $ giSpec info

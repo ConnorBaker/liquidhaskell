@@ -1343,8 +1343,29 @@ consEAppUsing synthesize γ e'@(App e a) | Just aDict <- getExprDict γ a =
 consEAppUsing synthesize γ e'@(App e a) =
     do
         (γ', t) <- consEAppWith synthesize γ e' e (argExpr γ $ simplify a) (\γ' -> sourceArgument γ' e' a)
-        return $ scopedConstructorIntroduction γ' e' (makeSingleton γ' (simplify e') t)
+        return $ scopedConstructorIntroduction γ' e' (methodApplication γ' e' (makeSingleton γ' (simplify e') t))
 consEAppUsing _ _ _ = panic Nothing "Constraint.Generate.consEApp called on invalid inputs"
+
+-- | A saturated class-method call denotes the method applied to its actual
+-- dictionary and arguments. This is the term that logical readback gives a
+-- source refinement `m x` (dictionaries retained), so a refinement can name
+-- the call's result. At an abstract dictionary the application is
+-- uninterpreted; a known instance's contract is instantiated at the term by
+-- ToFixpoint.instanceMethodContracts.
+methodApplication :: CGEnv -> CoreExpr -> SpecType -> SpecType
+methodApplication γ e t
+  | typeclass (getConfig γ)
+  , (Var selector, arguments) <- collectArgs (simplify e)
+  , Just _ <- isClassOpId_maybe selector
+  , terms@(_ : _ : _) <- filter isTermArg arguments
+  , Nothing <- splitFunTy_maybe (exprType e)
+  , Just logical <- traverse (argExpr γ) terms
+  , let application = F.eApps (F.EVar (F.symbol selector)) logical
+  = strengthenMeet t (uTop (if isBool (exprType e) then F.propReft application else F.exprReft application))
+  | otherwise
+  = t
+  where
+    isBool ty = maybe False ((== boolTyCon) . fst) (splitTyConApp_maybe ty)
 
 -- Subsumption changes this source value's view, not the surrounding callable
 -- environment. Every actual argument and every residual expected refinement
