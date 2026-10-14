@@ -97,10 +97,11 @@ unsafeError = error
 liquidError :: String -> a
 liquidError = error
 
-{-@ assume crash  :: forall a . x:{v:Bool | v} -> a @-}
+-- crash diverges on every argument, so it is total only where unreachable.
+{-@ crash  :: forall a . x:{v:Bool | false} -> a @-}
 {-# NOINLINE crash #-}
 crash :: Bool -> a
-crash = undefined
+crash _ = undefined
 
 {-# NOINLINE force #-}
 force :: Bool
