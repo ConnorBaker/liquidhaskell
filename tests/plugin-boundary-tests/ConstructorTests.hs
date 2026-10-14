@@ -64,4 +64,8 @@ tests fixture compiler optimization =
                , ("plugin-boundary-tests/fixtures/integer-arguments", "IntegerArgumentGood", Safe)
                , ("plugin-boundary-tests/fixtures/integer-arguments", "IntegerArgumentFalse", UnsafeAt [14])
                , ("plugin-boundary-tests/fixtures/integer-arguments", "IntegerArgumentRange", UnsafeAt [11, 13])
+               , ("plugin-boundary-tests/fixtures/known-instance-methods", "KnownInstanceModGood", Safe)
+               , ("plugin-boundary-tests/fixtures/known-instance-methods", "KnownInstanceModZero", UnsafeAt [4])
+               , ("plugin-boundary-tests/fixtures/known-instance-methods", "KnownInstanceWord8Good", Safe)
+               , ("plugin-boundary-tests/fixtures/known-instance-methods", "KnownInstanceWord8False", UnsafeAt [13])
                ]

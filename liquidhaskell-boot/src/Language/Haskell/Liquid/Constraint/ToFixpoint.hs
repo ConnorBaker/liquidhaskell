@@ -20,6 +20,11 @@ import           Language.Haskell.Liquid.Constraint.Types
 import qualified Language.Haskell.Liquid.Types.RefType as RT
 import           Control.Monad (guard)
 import qualified Data.Maybe as Mb
+import qualified Language.Fixpoint.Types.Visitor as Vis
+import qualified GHC.Core.FVs as G (exprsSomeFreeVarsList)
+import qualified GHC.Builtin.Names as G (eqClassName, ordClassName, numClassName, int8TyConName, int16TyConName, int32TyConName, int64TyConName, word8TyConName, word16TyConName, word32TyConName, word64TyConName)
+import qualified GHC.Builtin.Types as G (integerTyConName, intTyConName, wordTyConName)
+import qualified GHC.Types.Name.Set as G (emptyNameSet, extendNameSet, elemNameSet)
 
 -- AT: Move to own module?
 -- imports for AxiomEnv
@@ -83,7 +88,7 @@ cgInfoFInfo :: [(Var, LocSpecType)] -> TargetInfo -> CGInfo -> IO (F.FInfo Cinfo
 cgInfoFInfo rewrites info cgi = return (targetFInfo rewrites info cgi)
 
 targetFInfo :: [(Var, LocSpecType)] -> TargetInfo -> CGInfo -> F.FInfo Cinfo
-targetFInfo rewrites info cgi = mappend (mempty { F.ae = ax, F.lrws = localRewrites cgi }) fi
+targetFInfo rewrites info cgi = knownInstanceOperations info (mappend (mempty { F.ae = ax, F.lrws = localRewrites cgi }) fi)
   where
     fi               = F.fi cs ws bs ls consts ks qs bi aHO aHOqs es mempty adts
     cs               = fixCs    cgi
@@ -105,6 +110,100 @@ targetFInfo rewrites info cgi = mappend (mempty { F.ae = ax, F.lrws = localRewri
     es               = [] -- makeAxioms info
     ax               = makeAxiomEnvironment rewrites info (dataConTys cgi) (F.cm fi)
     -- msg              = show . map F.symbol . M.keys . tyConInfo
+
+--------------------------------------------------------------------------------
+-- | Class methods at a known base instance of a native integral carrier.
+--
+-- Logical readback retains class dictionaries, so `(<) $fOrdWord8 x y` or a
+-- class contract's `fromInteger ($p1Real ($p1Integral $fIntegralInt)) 1` is an
+-- uninterpreted application. GHC instance coherence makes the dictionary for
+-- such a carrier the base library's instance, whose methods are the native
+-- comparisons and (wrapping) arithmetic that the instance contracts state.
+-- Interpret them as those theory operations, as upstream LH does (upstream
+-- also does so for every instance; here only these known instances).
+--------------------------------------------------------------------------------
+knownInstanceOperations :: TargetInfo -> F.FInfo Cinfo -> F.FInfo Cinfo
+knownInstanceOperations info
+    | M.null carriers = id
+    | otherwise = Vis.mapExpr interpret
+  where
+    cbs = giCbs (giSrc info)
+    intBits = Mb.fromMaybe 64 (targetIntBits (getConfig info))
+    dfuns =
+        [ (dfun, cls, tc)
+        | dfun <- G.exprsSomeFreeVarsList (\v -> Ghc.isId v && Ghc.isDFunId v) (concatMap Ghc.rhssOfBind cbs)
+        , let (tvs, theta, cls, tys) = Ghc.tcSplitDFunTy (Ghc.idType dfun)
+        , null tvs, null theta
+        , [ty] <- [tys]
+        , Just (tc, []) <- [Ghc.splitTyConApp_maybe ty]
+        , Mb.isJust (carrierWidth tc)
+        ]
+    -- A dictionary symbol and the carrier whose (unique) instance it is.
+    carriers = M.fromList [(F.symbol dfun, tc) | (dfun, _, tc) <- dfuns]
+    superclasses = S.fromList
+        [ F.symbol sel
+        | cls <- closure [cls | (_, cls, _) <- dfuns]
+        , sel <- Ghc.classSCSelIds cls
+        ]
+    closure = go G.emptyNameSet
+      where
+        go _ [] = []
+        go seen (c : cs)
+            | Ghc.getName c `G.elemNameSet` seen = go seen cs
+            | otherwise =
+                c : go (G.extendNameSet seen (Ghc.getName c))
+                       (cs ++ [sc | Just (sc, _) <- map Ghc.getClassPredTys_maybe (Ghc.classSCTheta c)])
+    methods = M.fromList
+        [ (F.symbol op, (Ghc.getName cls, Ghc.occNameString (Ghc.getOccName op)))
+        | cls <- closure [cls | (_, cls, _) <- dfuns]
+        , Ghc.getName cls `elem` [G.eqClassName, G.ordClassName, G.numClassName]
+        , op <- Ghc.classMethods cls
+        ]
+    carrierWidth tc
+        | n == G.integerTyConName = Just Nothing
+        | n == G.intTyConName = Just (Just (True, intBits))
+        | n == G.wordTyConName = Just (Just (False, intBits))
+        | otherwise = lookup n
+            [ (G.int8TyConName, Just (True, 8)), (G.int16TyConName, Just (True, 16))
+            , (G.int32TyConName, Just (True, 32)), (G.int64TyConName, Just (True, 64))
+            , (G.word8TyConName, Just (False, 8)), (G.word16TyConName, Just (False, 16))
+            , (G.word32TyConName, Just (False, 32)), (G.word64TyConName, Just (False, 64))
+            ]
+      where n = Ghc.tyConName tc
+    carrierOf (F.EVar d) = M.lookup d carriers
+    carrierOf (F.EApp (F.EVar sel) d) | sel `S.member` superclasses = carrierOf d
+    carrierOf _ = Nothing
+    wrap tc e = case carrierWidth tc of
+        Just (Just (signed, bits)) ->
+            let m = (2 :: Integer) ^ bits
+                h = (2 :: Integer) ^ (bits - 1)
+             in if signed
+                    then F.EBin F.Minus (F.EBin F.Mod (F.EBin F.Plus e (F.expr h)) (F.expr m)) (F.expr h)
+                    else F.EBin F.Mod e (F.expr m)
+        _ -> e
+    inRange tc k = case carrierWidth tc of
+        Just (Just (True, bits)) -> negate (2 ^ (bits - 1)) <= k && k < 2 ^ (bits - 1)
+        Just (Just (False, bits)) -> 0 <= k && k < (2 :: Integer) ^ bits
+        _ -> True
+    interpret e = case F.splitEApp e of
+        (F.EVar m, d : args)
+            | Just (_, op) <- M.lookup m methods
+            , Just tc <- carrierOf d -> Mb.fromMaybe e (operation tc op args)
+        _ -> e
+    operation tc op args = case (op, args) of
+        ("==", [a, b]) -> Just (F.PAtom F.Eq a b)
+        ("/=", [a, b]) -> Just (F.PAtom F.Ne a b)
+        ("<", [a, b]) -> Just (F.PAtom F.Lt a b)
+        ("<=", [a, b]) -> Just (F.PAtom F.Le a b)
+        (">", [a, b]) -> Just (F.PAtom F.Gt a b)
+        (">=", [a, b]) -> Just (F.PAtom F.Ge a b)
+        ("+", [a, b]) -> Just (wrap tc (F.EBin F.Plus a b))
+        ("-", [a, b]) -> Just (wrap tc (F.EBin F.Minus a b))
+        ("*", [a, b]) -> Just (wrap tc (F.EBin F.Times a b))
+        ("negate", [a]) -> Just (wrap tc (F.ENeg a))
+        ("fromInteger", [F.ECon (F.I k)]) | inRange tc k -> Just (F.ECon (F.I k))
+        ("fromInteger", [a]) -> Just (wrap tc a)
+        _ -> Nothing
 
 makeAxiomEnvironment :: [(Var, LocSpecType)] -> TargetInfo -> [(Var, SpecType)] -> M.HashMap F.SubcId (F.SubC Cinfo) -> F.AxiomEnv
 makeAxiomEnvironment rewrites info xts fcs =

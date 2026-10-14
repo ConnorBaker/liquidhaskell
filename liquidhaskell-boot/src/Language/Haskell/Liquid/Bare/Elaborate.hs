@@ -48,10 +48,10 @@ import qualified Data.Text as Text
 import qualified Control.Monad.State.Strict as State
 import Data.Generics (Data, everythingBut, extQ, mkQ)
 
-import GHC.Builtin.Types (charTy, integerTy, runtimeRepTy, intTyConName, wordTyConName)
+import GHC.Builtin.Types (charTy, integerTy, runtimeRepTy, wordTyConName)
 import GHC.Builtin.Names (int8TyConName, int16TyConName, int32TyConName, int64TyConName, word8TyConName, word16TyConName, word32TyConName, word64TyConName)
 import GHC.Platform (Platform, platformMinInt, platformMaxInt, platformMaxWord)
-import GHC.Driver.DynFlags (targetPlatform, getDynFlags)
+import GHC.Driver.DynFlags (targetPlatform)
 import GHC.Hs (HsMatchContext (CaseAlt), HsExpr (HsLet), HsLocalBindsLR (HsValBinds), HsValBindsLR (ValBinds), mkSimpleGeneratedFunBind, mkSimpleMatch, nlConPat, nlHsCase, nlWildPat)
 import qualified GHC.Hs as Hs
 import qualified GHC.Tc.Gen.HsType as TcHs
