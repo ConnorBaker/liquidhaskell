@@ -601,6 +601,10 @@ tests fixture compiler optimization =
                 [ ("OpaqueNullaryGood", Safe)
                 , ("OpaqueNullaryFalse", UnsafeAt [6])
                 , ("OpaqueUnaryFalse", UnsafeAt [6])
+                , -- Opaque reflection consults every specification's logic
+                  -- names, including the field of a newtype specification.
+                  ("OpaqueNewtypeFieldGood", Safe)
+                , ("OpaqueNewtypeFieldFalse", UnsafeAt [17])
                 ]
             )
         ,
