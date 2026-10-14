@@ -166,13 +166,20 @@ tests fixture compiler optimization =
                 ]
             | (mode, flags) <- [("default", []), ("typeclass", ["--typeclass"])]
             ]
-    -- A class method named in a refinement. With --typeclass, the method at
-    -- a known instance means that instance's contract, and at an abstract
-    -- dictionary it is uninterpreted.
+    -- A class method named in a refinement. Without --typeclass, name
+    -- resolution rejects it as upstream does, at the refinement's line.
+    -- With --typeclass, the method at a known instance means that instance's
+    -- contract, and at an abstract dictionary it is uninterpreted.
     methodQueries mode = case mode of
         "default" ->
-            [ ("ImportedInstanceQueryOnlyGood", Safe)
-            , ("ImportedInstanceQueryOnlyBad", UnsafeAt [13])
+            [ (name, FormationRefusal owner "This is a class method, but typeclass support is disabled.")
+            | (name, owner) <-
+                [ ("ImportedInstanceQueryOnlyGood", 11)
+                , ("ImportedInstanceQueryOnlyBad", 11)
+                , ("ImportedInstanceQueryClaimBad", 11)
+                , ("ImportedAbstractMethodGood", 9)
+                , ("ImportedAbstractMethodBad", 9)
+                ]
             ]
         _ ->
             [ ("ImportedInstanceQueryOnlyGood", Safe)
