@@ -1216,6 +1216,7 @@ executable unit-neg
                     , Contra0
                     , Coretologic
                     , CosNegTest
+                    , CrashReachable
                     , Csv
                     , Datacon_eq
                     , DependentTypes
@@ -1967,6 +1968,7 @@ executable unit-pos-4
                     , Coercion
                     , Comma
                     , CommentedOut
+                    , CrashUnreachable
                     , Compare1
                     , Compare2
                     , CompareConstraints
