@@ -838,8 +838,10 @@ tests fixture compiler optimization =
                   -- contracts, so their callers cannot borrow the false claim.
                   ("TransitiveRewriteFalse", UnsafeAt [18])
                 , ("MutualRewriteFalse", UnsafeAt [10, 16])
-                , ("ExplicitRewriteCycleFalse", UnsafeAt [15])
-                , ("MediatedRewriteCycleFalse", UnsafeAt [23])
+                , -- Each pair of false claims is independent: neither rule may
+                  -- justify the other, so neither group assumes the other's claim.
+                  ("ExplicitRewriteCycleFalse", UnsafeAt [10, 15])
+                , ("MediatedRewriteCycleFalse", UnsafeAt [14, 23])
                 , -- A rule's precondition names its value, not the argument binder.
                   ("RewritePreconditionBinderGood", Safe)
                 , ("RewritePreconditionBinderFalse", UnsafeAt [25])
