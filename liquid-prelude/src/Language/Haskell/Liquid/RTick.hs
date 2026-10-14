@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP #-}
 {-# OPTIONS_GHC -fplugin=LiquidHaskell #-}
 
 --
@@ -61,6 +62,19 @@ import qualified Control.Applicative as A
 import qualified Control.Monad       as M
 import qualified Data.Functor        as F
 
+#include "MachDeps.h"
+
+-- Costs are machine Ints, whose arithmetic wraps on the GHC target. Each
+-- cost-combining operator therefore requires that the sums it computes stay
+-- in the target's Int range; within that range its cost law is exact.
+#if WORD_SIZE_IN_BITS == 32
+{-@ predicate IntRange X = -2147483648 <= X && X < 2147483648 @-}
+#elif WORD_SIZE_IN_BITS == 64
+{-@ predicate IntRange X = -9223372036854775808 <= X && X < 9223372036854775808 @-}
+#else
+#error Unsupported GHC target Int width
+#endif
+
 --
 -- The 'Tick' datatype and its corresponding resource modifiers.
 --
@@ -89,9 +103,11 @@ instance F.Functor Tick where
 fmap :: (a -> b) -> Tick a -> Tick b
 fmap f (Tick m x) = Tick m (f x)
 
+-- The class methods have no cost-range premise, so the instance states the
+-- same (wrapping) computation directly instead of reusing the bounded '(<*>)'.
 instance A.Applicative Tick where
   pure  = pure
-  (<*>) = (<*>)
+  Tick m f <*> Tick n x = Tick (m + n) (f x)
 
 {-@ reflect pure @-}
 {-@ pure :: x:a -> { t:Tick a | x == tval t && 0 == tcost t } @-}
@@ -99,7 +115,7 @@ pure :: a -> Tick a
 pure x = Tick 0 x
 
 {-@ reflect <*> @-}
-{-@ (<*>) :: t1:Tick (a -> b) -> t2:Tick a
+{-@ (<*>) :: t1:Tick (a -> b) -> t2:{Tick a | IntRange (tcost t1 + tcost t2)}
       -> { t:Tick b | (tval t1) (tval t2) == tval  t &&
                     tcost t1 + tcost t2 == tcost t }
 @-}
@@ -108,7 +124,7 @@ infixl 4 <*>
 Tick m f <*> Tick n x = Tick (m + n) (f x)
 
 {-@ reflect liftA2 @-}
-{-@ liftA2 :: f:(a -> b -> c) -> t1:Tick a -> t2:Tick b
+{-@ liftA2 :: f:(a -> b -> c) -> t1:Tick a -> t2:{Tick b | IntRange (tcost t1 + tcost t2)}
       -> { t:Tick c | f (tval t1) (tval t2) == tval  t &&
                       tcost t1 + tcost t2 == tcost t }
 @-}
@@ -117,7 +133,7 @@ liftA2 f (Tick m x) (Tick n y) = Tick (m + n) (f x y)
 
 instance M.Monad Tick where
   return = return
-  (>>=)  = (>>=)
+  Tick m x >>= f = let Tick n y = f x in Tick (m + n) y
 
 {-@ reflect return @-}
 {-@ return :: x:a -> { t:Tick a | x == tval t && 0 == tcost t } @-}
@@ -125,7 +141,7 @@ return :: a -> Tick a
 return x = Tick 0 x
 
 {-@ reflect >>= @-}
-{-@ (>>=) :: t1:Tick a -> f:(a -> Tick b)
+{-@ (>>=) :: t1:Tick a -> f:(a -> {tf:Tick b | IntRange (tcost t1 + tcost tf)})
       -> { t:Tick b | tval (f (tval t1))  == tval  t &&
          tcost t1 + tcost (f (tval t1)) == tcost t }
 @-}
@@ -134,7 +150,7 @@ infixl 4 >>=
 Tick m x >>= f = let Tick n y = f x in Tick (m + n) y
 
 {-@ reflect =<< @-}
-{-@ (=<<) :: f:(a -> Tick b) -> t1:Tick a
+{-@ (=<<) :: f:(a -> Tick b) -> t1:{Tick a | IntRange (tcost t1 + tcost (f (tval t1)))}
       -> { t:Tick b | tval (f (tval t1))  == tval  t &&
          tcost t1 + tcost (f (tval t1)) == tcost t }
 @-}
@@ -143,7 +159,7 @@ infixl 4 =<<
 f =<< Tick m x = let Tick n y = f x in Tick (m + n) y
 
 {-@ reflect ap @-}
-{-@ ap :: t1:(Tick (a -> b)) -> t2:Tick a
+{-@ ap :: t1:(Tick (a -> b)) -> t2:{Tick a | IntRange (tcost t1 + tcost t2)}
       -> { t:Tick b | (tval t1) (tval t2) == tval  t &&
                     tcost t1 + tcost t2 == tcost t }
 @-}
@@ -156,7 +172,7 @@ liftM :: (a -> b) -> Tick a -> Tick b
 liftM f (Tick m x) = Tick m (f x)
 
 {-@ reflect liftM2 @-}
-{-@ liftM2 :: f:(a -> b -> c) -> t1:Tick a -> t2:Tick b
+{-@ liftM2 :: f:(a -> b -> c) -> t1:Tick a -> t2:{Tick b | IntRange (tcost t1 + tcost t2)}
       -> { t:Tick c | f (tval t1) (tval t2) == tval  t &&
                       tcost t1 + tcost t2 == tcost t }
 @-}
@@ -166,7 +182,7 @@ liftM2 f (Tick m x) (Tick n y) = Tick (m + n) (f x y)
 -------------------------------------------------------------------------------
 
 {-@ reflect eqBind @-}
-{-@ eqBind :: n:Int -> t1:Tick a
+{-@ eqBind :: n:Int -> t1:{Tick a | IntRange (tcost t1 + n)}
       -> f:(a -> { tf:Tick b | n == tcost tf })
       -> { t:Tick b | tval (f (tval t1))  == tval  t &&
                            tcost t1 + n == tcost t }
@@ -176,7 +192,7 @@ eqBind _ (Tick m x) f = let Tick n y = f x in Tick (m + n) y
 
 {-@ reflect leqBind @-}
 {-@ leqBind :: n:Int -> t1:Tick a
-      -> f:(a -> { tf:Tick b | n >= tcost tf })
+      -> f:(a -> { tf:Tick b | n >= tcost tf && IntRange (tcost t1 + tcost tf) })
       -> { t:Tick b | tcost t1 + n >= tcost t }
 @-}
 leqBind :: Int -> Tick a -> (a -> Tick b) -> Tick b
@@ -184,7 +200,7 @@ leqBind _ (Tick m x) f = let Tick n y = f x in Tick (m + n) y
 
 {-@ reflect geqBind @-}
 {-@ geqBind :: n:Int -> t1:Tick a
-      -> f:(a -> { tf:Tick b | n <= tcost tf })
+      -> f:(a -> { tf:Tick b | n <= tcost tf && IntRange (tcost t1 + tcost tf) })
       -> { t2:Tick b | tcost t1 + n <= tcost t2 }
 @-}
 geqBind :: Int -> Tick a -> (a -> Tick b) -> Tick b
@@ -195,7 +211,7 @@ geqBind _ (Tick m x) f = let Tick n y = f x in Tick (m + n) y
 -------------------------------------------------------------------------------
 
 {-@ reflect step @-}
-{-@ step :: m:Int -> t1:Tick a
+{-@ step :: m:Int -> t1:{Tick a | IntRange (m + tcost t1)}
       -> { t:Tick a | tval t1 == tval t && m + tcost t1 == tcost t }
 @-}
 step :: Int -> Tick a -> Tick a
@@ -241,7 +257,7 @@ goN n x = Tick (-n) x
 -- @wmap f := step 1 . fmap f@.
 --
 {-@ reflect wmap @-}
-{-@ wmap :: f:(a -> b) -> t1:Tick a
+{-@ wmap :: f:(a -> b) -> t1:{Tick a | IntRange (1 + tcost t1)}
       -> { t:Tick b | Tick (1 + tcost t1) (f (tval t1)) == t }
 @-}
 wmap :: (a -> b) -> Tick a -> Tick b
@@ -251,7 +267,7 @@ wmap f (Tick m x) = Tick (1 + m) (f x)
 -- @wmapN (n > 0) f := step n . fmap f@.
 --
 {-@ reflect wmapN @-}
-{-@ wmapN :: { m:Nat | m > 0 } -> f:(a -> b) -> t1:Tick a
+{-@ wmapN :: { m:Nat | m > 0 } -> f:(a -> b) -> t1:{Tick a | IntRange (m + tcost t1)}
       -> { t:Tick b | Tick (m + tcost t1) (f (tval t1)) == t }
 @-}
 wmapN :: Int -> (a -> b) -> Tick a -> Tick b
@@ -261,7 +277,7 @@ wmapN m f (Tick n x) = Tick (m + n) (f x)
 -- @gmap f := step (-1) . fmap f@.
 --
 {-@ reflect gmap @-}
-{-@ gmap :: f:(a -> b) -> t1:Tick a
+{-@ gmap :: f:(a -> b) -> t1:{Tick a | IntRange (tcost t1 - 1)}
       -> { t:Tick b | Tick (tcost t1 - 1) (f (tval t1)) == t }
 @-}
 gmap :: (a -> b) -> Tick a -> Tick b
@@ -271,7 +287,7 @@ gmap f (Tick m x) = Tick (m - 1) (f x)
 -- @gmapN (n > 0) f := step (-n) . fmap f@.
 --
 {-@ reflect gmapN @-}
-{-@ gmapN :: { m:Nat | m > 0 } -> f:(a -> b) -> t1:Tick a
+{-@ gmapN :: { m:Nat | m > 0 } -> f:(a -> b) -> t1:{Tick a | IntRange (tcost t1 - m)}
       -> { t:Tick b | Tick (tcost t1 - m) (f (tval t1)) == t }
 @-}
 gmapN :: Int -> (a -> b) -> Tick a -> Tick b
@@ -281,7 +297,7 @@ gmapN m f (Tick n x) = Tick (n - m) (f x)
 -- \"wapp\": @(f </>) := step 1 . (f <*>)@.
 --
 {-@ reflect </> @-}
-{-@ (</>) :: t1:(Tick (a -> b)) -> t2:Tick a
+{-@ (</>) :: t1:(Tick (a -> b)) -> t2:{Tick a | IntRange (1 + tcost t1) && IntRange (1 + tcost t1 + tcost t2)}
       -> { t:Tick b | (tval t1) (tval t2) == tval  t &&
                 1 + tcost t1 + tcost t2 == tcost t }
 @-}
@@ -293,7 +309,7 @@ Tick m f </> Tick n x = Tick (1 + m + n) (f x)
 -- \"wwapp\": @(f <//>) := step 2 . (f <*>)@.
 --
 {-@ reflect <//> @-}
-{-@ (<//>) :: t1:(Tick (a -> b)) -> t2:Tick a
+{-@ (<//>) :: t1:(Tick (a -> b)) -> t2:{Tick a | IntRange (2 + tcost t1) && IntRange (2 + tcost t1 + tcost t2)}
       -> { t:Tick b | (tval t1) (tval t2) == tval  t &&
                 2 + tcost t1 + tcost t2 == tcost t }
 @-}
@@ -305,7 +321,7 @@ Tick m f <//> Tick n x = Tick (2 + m + n) (f x)
 -- \"gapp\": @(f <\>) := step (-1) . (f <*>)@.
 --
 {-@ reflect <\> @-}
-{-@ (<\>) :: t1:(Tick (a -> b)) -> t2:Tick a
+{-@ (<\>) :: t1:(Tick (a -> b)) -> t2:{Tick a | IntRange (tcost t1 + tcost t2) && IntRange (tcost t1 + tcost t2 - 1)}
       -> { t:Tick b | (tval t1) (tval t2) == tval  t &&
                 tcost t1 + tcost t2 - 1 == tcost t }
 @-}
@@ -317,7 +333,7 @@ Tick m f <\> Tick n x = Tick (m + n - 1) (f x)
 -- \"ggapp\": @(f <\\>) := step (-2) . (f <*>)@.
 --
 {-@ reflect <\\> @-}
-{-@ (<\\>) :: t1:(Tick (a -> b)) -> t2:Tick a
+{-@ (<\\>) :: t1:(Tick (a -> b)) -> t2:{Tick a | IntRange (tcost t1 + tcost t2) && IntRange (tcost t1 + tcost t2 - 2)}
       -> { t:Tick b | (tval t1) (tval t2) == tval  t &&
                 tcost t1 + tcost t2 - 2 == tcost t }
 @-}
@@ -329,7 +345,7 @@ Tick m f <\\> Tick n x = Tick (m + n - 2) (f x)
 -- \"wbind\": @(>/= f) := step 1 . (>>= f)@.
 --
 {-@ reflect >/= @-}
-{-@ (>/=) :: t1:Tick a -> f:(a -> Tick b)
+{-@ (>/=) :: t1:Tick a -> f:(a -> {tf:Tick b | IntRange (1 + tcost t1) && IntRange (1 + tcost t1 + tcost tf)})
       -> { t:Tick b | (tval (f (tval t1))      == tval  t) &&
          (1 + tcost t1 + tcost (f (tval t1))) == tcost t }
 @-}
@@ -341,7 +357,7 @@ Tick m x >/= f = let Tick n y = f x in Tick (1 + m + n) y
 -- \"wbind\": @(f =/<) := step 1 . (f =<<)@.
 --
 {-@ reflect =/< @-}
-{-@ (=/<) :: f:(a -> Tick b) -> t1:Tick a
+{-@ (=/<) :: f:(a -> Tick b) -> t1:{Tick a | IntRange (1 + tcost t1) && IntRange (1 + tcost t1 + tcost (f (tval t1)))}
       -> { t:Tick b | tval (f (tval t1))      == tval  t &&
          1 + tcost t1 + tcost (f (tval t1)) == tcost t }
 @-}
@@ -353,7 +369,7 @@ f =/< Tick m x = let Tick n y = f x in Tick (1 + m + n) y
 -- \"wwbind\": @(>//= f) := step 2 . (>>= f)@.
 --
 {-@ reflect >//= @-}
-{-@ (>//=) :: t1:Tick a -> f:(a -> Tick b)
+{-@ (>//=) :: t1:Tick a -> f:(a -> {tf:Tick b | IntRange (2 + tcost t1) && IntRange (2 + tcost t1 + tcost tf)})
       -> { t:Tick b | tval (f (tval t1))      == tval  t &&
          2 + tcost t1 + tcost (f (tval t1)) == tcost t }
 @-}
@@ -365,7 +381,7 @@ Tick m x >//= f = let Tick n y = f x in Tick (2 + m + n) y
 -- \"wwbind\": @(f =//<) := step 2 . (f =<<)@.
 --
 {-@ reflect =//< @-}
-{-@ (=//<) :: f:(a -> Tick b) -> t1:Tick a
+{-@ (=//<) :: f:(a -> Tick b) -> t1:{Tick a | IntRange (2 + tcost t1) && IntRange (2 + tcost t1 + tcost (f (tval t1)))}
       -> { t:Tick b | tval (f (tval t1))      == tval  t &&
          2 + tcost t1 + tcost (f (tval t1)) == tcost t }
 @-}
@@ -377,7 +393,7 @@ f =//< Tick m x = let Tick n y = f x in Tick (2 + m + n) y
 -- \"gbind\": @(>\= f) := step (-1) . (>>= f)@.
 --
 {-@ reflect >\= @-}
-{-@ (>\=) :: t1:Tick a -> f:(a -> Tick b)
+{-@ (>\=) :: t1:Tick a -> f:(a -> {tf:Tick b | IntRange (tcost t1 + tcost tf) && IntRange (tcost t1 + tcost tf - 1)})
       -> { t:Tick b | tval (f (tval t1))      == tval  t &&
          tcost t1 + tcost (f (tval t1)) - 1 == tcost t }
 @-}
@@ -389,7 +405,7 @@ Tick m x >\= f = let Tick n y = f x in Tick (m + n - 1) y
 -- \"gbind\": @(f =\<) := step (-1) . (f =<<)@.
 --
 {-@ reflect =\< @-}
-{-@ (=\<) :: f:(a -> Tick b) -> t1:Tick a
+{-@ (=\<) :: f:(a -> Tick b) -> t1:{Tick a | IntRange (tcost t1 + tcost (f (tval t1))) && IntRange (tcost t1 + tcost (f (tval t1)) - 1)}
       -> { t:Tick b | tval (f (tval t1))      == tval  t &&
          tcost t1 + tcost (f (tval t1)) - 1 == tcost t }
 @-}
@@ -401,7 +417,7 @@ f =\< Tick m x = let Tick n y = f x in Tick (m + n - 1) y
 -- \"ggbind\": @(>\= f) := step (-2) . (>>= f)@.
 --
 {-@ reflect >\\= @-}
-{-@ (>\\=) :: t1:Tick a -> f:(a -> Tick b)
+{-@ (>\\=) :: t1:Tick a -> f:(a -> {tf:Tick b | IntRange (tcost t1 + tcost tf) && IntRange (tcost t1 + tcost tf - 2)})
       -> { t:Tick b | tval (f (tval t1))      == tval  t &&
          tcost t1 + tcost (f (tval t1)) - 2 == tcost t }
 @-}
@@ -413,7 +429,7 @@ Tick m x >\\= f = let Tick n y = f x in Tick (m + n - 2) y
 -- \"ggbind\": @(f =\\<) := step (-2) . (f =<<)@.
 --
 {-@ reflect =\\< @-}
-{-@ (=\\<) :: f:(a -> Tick b) -> t1:Tick a
+{-@ (=\\<) :: f:(a -> Tick b) -> t1:{Tick a | IntRange (tcost t1 + tcost (f (tval t1))) && IntRange (tcost t1 + tcost (f (tval t1)) - 2)}
       -> { t:Tick b | tval (f (tval t1))      == tval  t &&
          tcost t1 + tcost (f (tval t1)) - 2 == tcost t }
 @-}
@@ -427,7 +443,7 @@ f =\\< Tick m x = let Tick n y = f x in Tick (m + n - 2) y
 
 {-@ reflect pay @-}
 {-@ pay :: m:Int
-      -> { t1:Tick a | m <= tcost t1 }
+      -> { t1:Tick a | m <= tcost t1 && IntRange (tcost t1 - m) }
       -> { t:Tick ({ t2 : Tick a | tcost t1 - m == tcost t2 }) | m == tcost t }
 @-}
 pay :: Int -> Tick a -> Tick (Tick a)
@@ -435,7 +451,8 @@ pay m (Tick n x) = Tick m (Tick (n - m) x)
 
 
 {-@ reflect zipWithM @-}
-{-@ zipWithM :: f:(a -> b -> Tick c) -> x:Tick a -> y:Tick b
+{-@ zipWithM :: f:(a -> b -> Tick c) -> x:Tick a
+      -> y:{Tick b | IntRange (tcost (f (tval x) (tval y)) + tcost x) && IntRange (tcost (f (tval x) (tval y)) + tcost x + tcost y)}
       -> {t:Tick c | tcost t == tcost x + tcost y + tcost (f (tval x) (tval y))} @-}
 zipWithM :: (a -> b -> Tick c) -> Tick a -> Tick b -> Tick c
 zipWithM f (Tick c1 x1) (Tick c2 x2) = let Tick c x = f x1 x2 in Tick (c + c1 + c2) x
