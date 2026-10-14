@@ -942,6 +942,12 @@ simplifyCoreExpr _allowTC = go
     go (C.Let (C.NonRec x eb) e)
       | isDictOrErasable x
       = go e
+      -- GHC's desugarer shares a match's failure branch as a let-bound
+      -- @\_ -> failure@ (shareFailureHandler). Restore it at its uses so the
+      -- pattern-error alternatives below are recognised.
+      | C.Lam _ failure <- eb
+      , isPatErrorExpr failure
+      = go (sub x eb e)
       | otherwise
       = C.Let (C.NonRec x (go eb)) (go e)
     go (C.Let (C.Rec xes) e)

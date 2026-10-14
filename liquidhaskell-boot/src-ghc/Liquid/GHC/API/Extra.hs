@@ -13,6 +13,7 @@ module Liquid.GHC.API.Extra (
   , directImports
   , fsToUnitId
   , isPatErrorAlt
+  , isPatErrorExpr
   , minus_RDR
   , qualifiedNameFS
   , displayNameFS
@@ -195,13 +196,18 @@ addNoInlinePragmasToBinds tcg = tcg{ tcg_binds = go (tcg_binds tcg) }
 
 -- | Tells if a case alternative calls to patError
 isPatErrorAlt :: CoreAlt -> Bool
-isPatErrorAlt (Alt _ _ exprCoreBndr) = hasPatErrorCall exprCoreBndr
+isPatErrorAlt (Alt _ _ exprCoreBndr) = isPatErrorExpr exprCoreBndr
+
+-- | Tells if an expression is a pattern-match failure
+isPatErrorExpr :: CoreExpr -> Bool
+isPatErrorExpr = hasPatErrorCall
   where
    hasPatErrorCall :: CoreExpr -> Bool
    -- auto generated undefined case: (\_ -> (patError @levity @type "error message")) void
    -- Type arguments are erased before calling isUndefined
    hasPatErrorCall (App e _)
      | Var x <- unTick e = x == pAT_ERROR_ID
+     | Lam _ body <- unTick e = hasPatErrorCall body
      | otherwise = hasPatErrorCall e
    -- another auto generated undefined case:
    -- let lqanf_... = patError "error message") in case lqanf_... of {}
