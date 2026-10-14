@@ -420,6 +420,19 @@ tests fixture compiler optimization =
                 ]
             )
         ,
+            -- A failing proof group does not hide later groups' diagnostics.
+            -- Each expectation is upstream's report for the same source.
+            ( "group-failures"
+            , []
+            ,
+                [ ("GroupFailuresIndependent", UnsafeAt [9, 12])
+                , ("GroupFailuresSwapped", UnsafeAt [9, 12])
+                , ("GroupFailuresExpectedSafe", UnsafeAt [10, 13, 15])
+                , ("GroupFailuresAuthoredResult", UnsafeAt [11, 17])
+                , ("GroupFailuresAuthoredBody", UnsafeAt [11, 17])
+                ]
+            )
+        ,
             ( "assumed-predicates"
             , ["--adt"]
             ,
