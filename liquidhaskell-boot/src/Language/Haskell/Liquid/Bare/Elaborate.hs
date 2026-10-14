@@ -45,6 +45,7 @@ import qualified Data.List                     as L
 import qualified Data.HashMap.Strict           as M
 import qualified Data.HashSet                  as S
 import qualified Data.Text as Text
+import Control.Monad (foldM)
 import qualified Control.Monad.State.Strict as State
 import Data.Generics (Data, everythingBut, extQ, mkQ)
 
@@ -1083,7 +1084,7 @@ primitiveQuery flags native location embeddings measures projections instances s
                         argument' <- if logicalInteger argument then integerArgument (variable name) lowered else pure lowered
                         pure (applyQuery (variable name) argument')
         _
-            | (F.EVar name, [argument]) <- application expression
+            | (F.EVar name, argument : extras) <- application expression
             , not (isSource name)
             , Just alternatives <- M.lookup name projectionCases -> do
                 lowered <- lower argument
@@ -1091,7 +1092,9 @@ primitiveQuery flags native location embeddings measures projections instances s
                 -- A logical receiver (e.g. a partial measure's result) has no
                 -- source constructor to scrutinize; observe it logically.
                 if logical
-                    then measureApplication name lowered
+                    then do
+                        receiver <- measureApplication name lowered
+                        fst <$> foldM applyLowered (receiver, []) extras
                     else do
                         selected <- selectMeasure name (Just lowered)
                         receiver <- operandType lowered
@@ -1100,7 +1103,14 @@ primitiveQuery flags native location embeddings measures projections instances s
                         bridge <- freshParameter input denotation
                         -- Eliminate this receiver in its actual scope; a generalized
                         -- helper would infer fresh, unrelated predicate parameters.
-                        pure $ \locals -> nlHsCase (applyQuery bridge lowered locals) (map fieldAlternative alternatives)
+                        let scrutinee = applyQuery bridge lowered
+                            selection = \locals -> nlHsCase (scrutinee locals) (map (fieldAlternative []) alternatives)
+                        -- A function-valued field is applied to the measure's
+                        -- further arguments in its alternative, where the field is
+                        -- the selected value: the application then denotes the
+                        -- selector applied to them, not an unrelated result.
+                        (_, arguments) <- foldM applyLowered (selection, []) extras
+                        pure $ \locals -> nlHsCase (scrutinee locals) (map (fieldAlternative (map ($ locals) arguments)) alternatives)
         F.EVar name | M.member name projectionCases -> do
             selected <- selectMeasure name Nothing
             helper <- projector name
@@ -1123,9 +1133,7 @@ primitiveQuery flags native location embeddings measures projections instances s
             , isMeasure name -> lower argument >>= measureApplication name
         F.EApp function argument -> do
             function' <- lower function
-            argument' <- lower argument
-            argument'' <- if logicalInteger argument then integerArgument function' argument' else pure argument'
-            pure (applyQuery function' argument'')
+            fst <$> applyLowered (function', []) argument
         F.ESym{} -> logicalOperation False expected [] (const expression) []
         F.ECon F.I{} -> logicalOperation False expected [] (const expression) []
         F.ECon F.R{} -> logicalOperation False expected [] (const expression) []
@@ -1162,18 +1170,24 @@ primitiveQuery flags native location embeddings measures projections instances s
         | Just identifier <- M.lookup name sourceIds = nlHsVar (nameRdrName (getName identifier))
         | otherwise = nlHsVar (varSymbolToRdrName name)
     applyQuery function argument = mkHsApp <$> function <*> argument
+    -- Lower one argument of an application, converting a logical integer at
+    -- the applied function's parameter type.
+    applyLowered (function, arguments) argument = do
+        argument' <- lower argument
+        argument'' <- if logicalInteger argument then integerArgument function argument' else pure argument'
+        pure (applyQuery function argument'', arguments ++ [argument''])
     ifQuery condition yes no = nlHsIf <$> condition <*> yes <*> no
     true = const (nlHsVar true_RDR)
     false = const (nlHsVar (getRdrName falseDataCon))
     bindProjector (owner, argumentName, alternatives, _) expression =
         let helper = nameRdrName owner
             parameter = nameRdrName argumentName
-            body = nlHsCase (nlHsVar parameter) (map fieldAlternative alternatives)
+            body = nlHsCase (nlHsVar parameter) (map (fieldAlternative []) alternatives)
             binding = mkSimpleGeneratedFunBind noSrcSpan helper (noLocA [nlVarPat parameter]) body
             bindings = HsValBinds noAnn (ValBinds mempty [binding] [])
          in noLocA (HsLet (noAnn, noAnn) bindings expression)
-    fieldAlternative (constructor, index) =
-        mkSimpleMatch CaseAlt (noLocA [pattern]) (nlHsVar selected)
+    fieldAlternative arguments (constructor, index) =
+        mkSimpleMatch CaseAlt (noLocA [pattern]) (foldl mkHsApp (nlHsVar selected) arguments)
       where
         selected = mkRdrUnqual (mkVarOcc "lh_selected_field")
         pattern =
