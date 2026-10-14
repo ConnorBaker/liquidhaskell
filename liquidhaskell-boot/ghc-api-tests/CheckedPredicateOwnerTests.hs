@@ -38,6 +38,15 @@ tests compileToCore = withResource prepare (const (pure ())) $ \fixture ->
             map fst (predicateDefinitions resident) @?= map snd (queryValueOwners (predicateTelescope checked))
             assertBool "owner presentation changed the nominal checked Core" $
                 G.eqType (G.exprType (predicateCore resident)) (G.exprType (predicateCore checked))
+        , testCase "a logical-only refinement is its own ordinary projection" $
+            -- Formation is collected from this projection. Simplifying here
+            -- would erase an authored conjunct such as e == e or p || True
+            -- before its source operations are checked.
+            mapM_
+                (\predicate -> let logical = MkUReft (F.Reft ("v", predicate)) mempty in checkedOrdinary (CheckedRefinement logical []) @?= logical)
+                [ F.PAtom F.Eq (F.EApp (F.EVar "partial") (F.EVar "x")) (F.EApp (F.EVar "partial") (F.EVar "x"))
+                , F.POr [F.EApp (F.EVar "partial") (F.EVar "x"), F.PTrue]
+                ]
         , testCase "equal logical sorts do not license a different nominal owner" $ do
             checked <- fixture
             let embeddings =
