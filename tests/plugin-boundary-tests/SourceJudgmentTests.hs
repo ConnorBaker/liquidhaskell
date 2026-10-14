@@ -354,6 +354,8 @@ tests fixture compiler optimization =
             , ["--adt", "--higherorder", "--higherorderqs", "--ple", "--etabeta"]
             ,
                 [ ("TextObservationsGood", Safe)
+                , ("DependentNestedGood", Safe)
+                , ("DependentNestedBad", UnsafeAt [6])
                 , ("ByteStringWord8ModelGood", Safe)
                 , ("ByteStringWord8ModelBad", UnsafeAt [18])
                 , ("TextConstructionGood", Safe)
