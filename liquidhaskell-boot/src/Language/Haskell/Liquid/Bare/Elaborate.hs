@@ -755,7 +755,7 @@ primitiveQuery flags native location embeddings measures projections instances s
         | otherwise = case sortApplication sort of
             (headSort@F.FTC{}, arguments) -> aggregate headSort arguments
             (headSort@F.FObj{}, []) -> aggregate headSort []
-            _ -> die ("logical result has no closed carrier interpretation: " ++ F.showpp sort)
+            _ -> reject (PJ.text ("logical result has no closed carrier interpretation: " ++ F.showpp sort))
       where
         abstract variable = do
             local <- State.gets (\(_, current, _) -> current)
@@ -1007,6 +1007,9 @@ primitiveQuery flags native location embeddings measures projections instances s
             (\result -> RAllT variable result reft) <$> go (tv : variables) arguments rest
         go variables arguments (RFun binder info domain rest reft) =
             (\result -> RFun binder info domain result reft) <$> go variables (arguments ++ [F.EVar binder]) rest
+        -- An abstract refinement quantifies the measure's arrows, not its result.
+        go variables arguments (RAllP predicate rest) =
+            RAllP predicate <$> go variables arguments rest
         go variables arguments result = do
             environment <- queryEmbeddings
             let resultSort = typeSort environment (specTypeToQueryType result)
