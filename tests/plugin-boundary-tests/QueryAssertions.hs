@@ -73,9 +73,10 @@ resultGoal expected constraint =
 
 -- The imported `ord` declaration has no local call-graph tag. Its predicate's
 -- positive-argument obligation must not inherit the last local function's tag.
+-- A declaration without a local body is checked in the `.declarations` stage.
 assertExternalFormationTag :: Compiled -> Assertion
 assertExternalFormationTag compiled = do
-    let path = compiledDirectory compiled </> ".liquid" </> compiledModule compiled ++ ".hs.admission.bfq"
+    let path = compiledDirectory compiled </> ".liquid" </> compiledModule compiled ++ ".hs.declarations.bfq"
     query <- readQuery path
     let tags =
             [ F.stag constraint
