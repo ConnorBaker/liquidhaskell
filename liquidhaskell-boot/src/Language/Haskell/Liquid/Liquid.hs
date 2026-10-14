@@ -150,23 +150,10 @@ checkSourceTarget info = do
         else do
             let initial = (mempty{o_result = F.Safe mempty}, mempty, F.Safe mempty)
             (before, callables, available, interfaces) <- go ".prerequisite" initial [] S.empty mempty (numberedGroups prerequisiteBodies)
-            (declarations, _, _) <-
-                if isSafe before
-                    then query ".declarations" [] callables available interfaces declarationOwners [] IndependentBodyAndFormation False
-                    else pure (mempty, [], [])
-            (compatibility, _, _) <-
-                if isSafe (before <> declarations)
-                    then query ".compatibility" closedMethods callables available interfaces [] [] IndependentBodyAndFormation False
-                    else pure (mempty, [], [])
-            let checked = before <> declarations <> compatibility
-            (bodies, established, visible, completedInterfaces) <-
-                if isSafe checked
-                    then go "" checked callables available interfaces (numberedGroups remainingBodies)
-                    else pure (checked, callables, available, interfaces)
-            (admission, _, _) <-
-                if isSafe bodies
-                    then query ".admission" [] established visible completedInterfaces [] [] IndependentBodyAndFormation True
-                    else pure (mempty, [], [])
+            (declarations, _, _) <- query ".declarations" [] callables available interfaces declarationOwners [] IndependentBodyAndFormation False
+            (compatibility, _, _) <- query ".compatibility" closedMethods callables available interfaces [] [] IndependentBodyAndFormation False
+            (bodies, established, visible, completedInterfaces) <- go "" (before <> declarations <> compatibility) callables available interfaces (numberedGroups remainingBodies)
+            (admission, _, _) <- query ".admission" [] established visible completedInterfaces [] [] IndependentBodyAndFormation True
             let (out, types, publication) = bodies <> admission
                 checkedOwners = S.fromList (letVars (giCbs (giSrc sourceInfo)))
                 unowned = filter (not . (`S.member` checkedOwners) . F.val) (S.toList (gsFail (gsTerm (giSpec info))))
@@ -219,46 +206,27 @@ checkSourceTarget info = do
         S.fromList (giDefVars (giSrc info) ++ letVars (giCbs (giSrc info)))
             `S.difference` gsIgnoreVars (gsVars (giSpec info))
 
-    -- Each checked group establishes its callable only after its own body
-    -- succeeds. The same ordered cut governs successful and failed claims.
+    -- Every group is checked, in proof-dependency order. A rejected claim stays
+    -- an error, and later groups assume its checking target, as upstream's
+    -- single query does. The verdict is safe only when every query is.
     go _ result callables available interfaces [] = pure (result, callables, available, interfaces)
     go phase result callables available interfaces ((number, component) : groups)
         | Just ordered <- directGroup component = do
             (body, established, _) <- query checking [] callables available interfaces [] ordered AuthoredBodyAndFormation False
-            let checked = result <> body
-            if isSafe body
-                then continue checked established
-                else do
-                    -- A rejected interface cannot be used by downstream diagnostics.
-                    -- Infer an independent callable only when recovery needs one.
-                    (admission, inferred, _) <- query admissionName [] callables available interfaces [] group IndependentBodyAndFormation False
-                    if isSafe admission
-                        then go phase (checked <> admission) (callables ++ inferred) available' interfaces groups
-                        else pure (checked <> admission, callables, available, interfaces)
+            continue (result <> body) established
         | otherwise = do
             (admission, inferred, _) <- query admissionName [] callables available interfaces [] group IndependentBodyAndFormation False
-            let admitted = result <> admission
-            if not (isSafe admission)
-                then pure (admitted, callables, available, interfaces)
-                else do
-                    let assumed = callables ++ filter ((`S.member` expected) . fst) inferred
-                    (body, established, _) <- query checking [] assumed available' interfaces [] group AuthoredBody False
-                    -- A rejected claim stays an error. Continue diagnostics using the
-                    -- independently checked callable, never the rejected postcondition.
-                    -- Without an authored checking target, success establishes
-                    -- no stronger claim than admission. Keep that inferred
-                    -- callable rather than its weaker reflected/default view.
-                    let inferredTypes = HashMap.fromList inferred
-                        reusable =
-                            if isSafe body
-                                then
-                                    [ (owner, if owner `HashMap.member` asserted && not (owner `S.member` expected) then ty else HashMap.lookupDefault ty owner inferredTypes)
-                                    | (owner, ty) <- established
-                                    ]
-                                else inferred
-                    if isSafe body
-                        then continue (admitted <> body) reusable
-                        else go phase (admitted <> body) (callables ++ reusable) available' interfaces groups
+            let assumed = callables ++ filter ((`S.member` expected) . fst) inferred
+            (body, established, _) <- query checking [] assumed available' interfaces [] group AuthoredBody False
+            -- Without an authored checking target, the body establishes no
+            -- stronger claim than admission. Keep that inferred callable
+            -- rather than its weaker reflected/default view.
+            let inferredTypes = HashMap.fromList inferred
+                reusable =
+                    [ (owner, if owner `HashMap.member` asserted && not (owner `S.member` expected) then ty else HashMap.lookupDefault ty owner inferredTypes)
+                    | (owner, ty) <- established
+                    ]
+            continue (result <> admission <> body) reusable
       where
         group = Graph.flattenSCC (fst component)
         available' = available `S.union` S.fromList (concatMap bindersOf group)
@@ -301,10 +269,7 @@ checkSourceTarget info = do
                     , Just _ <- [methodOrigin method]
                     , all (\ty -> not (any hasHole (F.val ty)) && null (specTypeKVars (F.val ty))) (Mb.catMaybes [tyInstance method, tyClass method])
                     ]
-                interfaces' = if isSafe proof then replaceInterfaces interfaces granted else interfaces
-            if isSafe proof
-                then go phase (checked <> proof) (callables ++ established) available' interfaces' groups
-                else pure (checked <> proof, callables ++ established, available', interfaces)
+            go phase (checked <> proof) (callables ++ established) available' (replaceInterfaces interfaces granted) groups
 
     -- Init and checkingSignatures select the last method checking target for an
     -- owner. Body success establishes that target, not every row sharing the
@@ -359,10 +324,6 @@ checkSourceTarget info = do
         dat = gsData (giSpec info)
         refl = gsRefl (giSpec info)
 
-    isSafe (out, _, _) = case o_result out of
-        F.Safe _ -> True
-        _ -> False
-
     -- Authored checking (a direct group, or a body after its admission) keeps
     -- the ordinary qualifier policy: explicit qualifiers and those scraped from
     -- signatures and aliases. Only independent queries, which infer a callable
@@ -415,13 +376,11 @@ checkSourceTarget info = do
                 (out0, infTypes) <- case obligation of
                     IndependentBodyAndFormation -> Right (mempty{o_result = resModel}, mempty)
                     _ -> mkOutput cfg resModel scopes sol (annotMap cgi)
-                -- Admission has no expected failures. Authored checking may reject an
-                -- expected goal, but that owner's callable is already the independently
-                -- checked type, never its failed claim. Every other constraint and CG
-                -- error must pass, as must the complete result-scope correspondence.
-                (solvedCallables, completedMethods) <- case resModel of
-                    F.Safe _ -> (,) <$> traverse (applySolution scopes sol) prepared <*> traverse (\(owner, method) -> (\completedMethod -> (owner, completedMethod)) <$> traverse (applySolution scopes sol) method) (interfaceEndpoints cgi)
-                    _ -> Right ([], [])
+                -- An expected goal's callable is already the independently checked
+                -- type, never its failed claim. A rejected query remains an error;
+                -- its callables are still the targets that later queries assume.
+                solvedCallables <- traverse (applySolution scopes sol) prepared
+                completedMethods <- traverse (\(owner, method) -> (\completedMethod -> (owner, completedMethod)) <$> traverse (applySolution scopes sol) method) (interfaceEndpoints cgi)
                 let admitted = case obligation of
                         IndependentBodyAndFormation -> [(owner, sourceCallableIdentity cfg signatures owner ty) | (owner, ty) <- solvedCallables]
                         _ -> solvedCallables
@@ -522,7 +481,6 @@ checkSourceTarget info = do
 
 -- Checking goals remain authored. Reusable contract projections instead use
 -- the established callable, including measure invariants and rewrite theorems.
--- This also preserves honest diagnostic recovery after a rejected claim.
 admittedInvariants :: [(Var, SpecType)] -> TargetSpec -> GhcSpecData
 admittedInvariants admitted spec =
     dat
