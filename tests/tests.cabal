@@ -1005,6 +1005,7 @@ executable measure-pos
                     , List02
                     , List02Lib
                     , LogicalCarrierObservation
+                    , LogicalCarrierSourceMeasure
                     , MeasureGadt
                     , Ple00
                     , Ple01
@@ -1045,6 +1046,7 @@ executable measure-neg
                     , List02
                     , LogicalCarrierObservation00
                     , LogicalCarrierObservation01
+                    , LogicalCarrierObservation02
                     , Ple0
                     , Ple1
                     , Ple1Lib
