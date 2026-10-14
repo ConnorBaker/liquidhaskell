@@ -736,6 +736,9 @@ tests fixture compiler optimization =
                 , ("MutualRewriteFalse", UnsafeAt [10, 16])
                 , ("ExplicitRewriteCycleFalse", UnsafeAt [10, 15])
                 , ("MediatedRewriteCycleFalse", UnsafeAt [10, 14, 19, 23])
+                , -- A rule's precondition names its value, not the argument binder.
+                  ("RewritePreconditionBinderGood", Safe)
+                , ("RewritePreconditionBinderFalse", UnsafeAt [25])
                 ]
             )
         ,
