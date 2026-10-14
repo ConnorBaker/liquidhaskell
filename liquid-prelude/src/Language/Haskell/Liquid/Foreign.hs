@@ -24,10 +24,12 @@ import Data.Word (Word64) -- Necessary to bring in scope the evidence that Word6
 
 -----------------------------------------------------------------------------------------------
 
+-- Word64's conversion from Integer wraps, so the Int-to-CSize conversion is
+-- exact only for nonnegative arguments; callers prove that premise.
 {-# NOINLINE intCSize #-}
-{-@ assume intCSize :: x:Int -> {v: CSize | v = x } @-}
+{-@ intCSize :: x:{Int | 0 <= x} -> {v: CSize | v = x } @-}
 intCSize :: Int -> CSize
-intCSize = fromIntegral
+intCSize x = CSize (fromInteger (toInteger x))
 
 -- CSize has no instance contracts of its own. Convert through its Word64
 -- representation, whose contracts exist; the Int conversion is exact only
