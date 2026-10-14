@@ -607,6 +607,14 @@ proofGroups info = map ordered (Graph.stronglyConnComp vertices)
                    | (owner, ty) <- HashMap.toList (checkingSignatures (gsSig spec))
                    , all (not . hasHole) (F.val ty)
                    ]
+                ++ evidence
+    -- Class evidence is not coupled with its consumers. Coupling lets uses
+    -- constrain an unannotated binder's inferred input domain; a dictionary
+    -- value has none. Like any earlier group it is checked on its own, and
+    -- consumers assume only the type that group establishes, so separation
+    -- admits no unchecked fact. It can only withhold a fact the shared system
+    -- would expose, such as a constructor singleton selectedDictionaryField reads.
+    evidence = [F.symbol owner | (_, cb, _) <- indexed, owner <- letVars cb, isId owner, isDictId owner]
     consumers =
         HashMap.fromListWith
             (++)
