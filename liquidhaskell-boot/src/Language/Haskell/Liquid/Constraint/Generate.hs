@@ -204,10 +204,13 @@ generateConstraints initialize defaultTypes callables info obligations =
         -- unsigned bindings. Reuse requires the source driver's corresponding
         -- proof obligations, not merely source-position annotations. A rejected
         -- expected goal resolves to its independently checked callable instead.
+        -- Generated type-representation evidence establishes only its
+        -- template: its body's solved structure is no source-facing claim.
         pure
             [ (owner, ty)
             | owner <- concatMap bindersOf groups
-            , Just ty <- [lookupREnv (F.symbol owner) (renv checked)]
+            , let environment = if GM.isTypeRepresentationVar owner then γ else checked
+            , Just ty <- [lookupREnv (F.symbol owner) (renv environment)]
             ]
     cfg = getConfig info
     groups = obligationBodies obligations

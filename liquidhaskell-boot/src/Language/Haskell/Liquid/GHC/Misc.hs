@@ -35,6 +35,7 @@ import           GHC.Tc.Gen.Expr                            (tcCheckPolyExpr)
 import           GHC.Tc.Solver                              (simplifyTop)
 import qualified GHC.Driver.Session                        as Session
 import           GHC.Types.Literal                          (LitNumType(LitNumBigNat))
+import qualified GHC.Types.Name.Occurrence                  as Occurrence
 
 
 import           Data.Char                                  (isDigit, isLower, isSpace, isUpper)
@@ -149,6 +150,15 @@ isBaseType (LitTy _)       = True
 isBaseType (TyConApp _ ts) = all isBaseType ts
 isBaseType (AppTy t1 t2)   = isBaseType t1 && isBaseType t2
 isBaseType _               = False
+
+-- | GHC's generated Typeable evidence: the @$tc@ and @$trModule@ bindings
+--   and the @$krep@ kind representations they reference. Source refinements
+--   cannot name them.
+isTypeRepresentationVar :: Var -> Bool
+isTypeRepresentationVar v =
+  Occurrence.isTypeableBindOcc occ || Occurrence.occNameString occ == "$krep"
+  where
+    occ = getOccName v
 
 isTmpVar :: Var -> Bool
 isTmpVar = isTmpSymbol . dropModuleNamesAndUnique . symbol
