@@ -26,6 +26,7 @@ tests fixture compiler optimization =
                , checkedInterfaces ObjectCode "logical-measure interfaces" "lh-logical-interface" "assumed-predicates" "LogicalCarrierGood" ["--adt"] [("LogicalCarrierClient", Safe), ("LogicalCarrierClientFalse", UnsafeAt [7, 11])]
                , checkedInterfaces ObjectCode "local map laws and imported counterclaim" "lh-map-composition" "map-composition" "MapCompositionLaws" ["--adt"] [("MapCompositionFalse", UnsafeAt [9])]
                , checkedInterfaces ObjectCode "imported opaque identity, explicit trust, and counterclaim" "lh-opaque-interface" "opaque-reflection" "OpaqueProducer" [] [("OpaqueClient", Safe), ("OpaqueClientAssumed", Safe), ("OpaqueClientFalse", UnsafeAt [8])]
+               , checkedInterfaces ObjectCode "imported first-order measure selectors" "lh-selector-interface" "callback-projections" "SelectorProducer" [] [("SelectorClientGood", Safe), ("SelectorClientFalse", UnsafeAt [8])]
                , checkedInterfaces ObjectCode "imported higher-order callback selectors" "lh-callback-interface" "callback-projections" "CallbackProducer" [] [("CallbackClientGood", Safe), ("CallbackClientFalse", UnsafeAt [13])]
                , checkedInterfaces InterfaceOnly "interface-only higher-order callback publication" "lh-callback-interface-only" "callback-projections" "CallbackProducer" [] [("CallbackClientGood", Safe), ("CallbackClientFalse", UnsafeAt [13])]
                , constructorInterfaces
