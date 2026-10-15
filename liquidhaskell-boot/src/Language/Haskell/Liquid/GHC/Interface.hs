@@ -87,6 +87,9 @@ derivedVars instSpans mg =
     isGeneratedBinding v =
       let occ = Ghc.getOccName v
        in
+          -- Hydrated imported bodies keep their defining module. Only this
+          -- module's generated binders are eligible for unchecked trust.
+          maybe True (== mgi_module mg) (Ghc.nameModule_maybe (Ghc.getName v)) &&
           Ghc.isDerivedOccName occ &&
           -- default methods are always written by the user
           not ("$dm" `isPrefixOf` Ghc.occNameString occ) &&

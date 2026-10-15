@@ -52,7 +52,7 @@ hydrateAuthoredImportedBodies cfg current reader request dependencies existing =
                         )
             selected <- mapM (tcLookupId . fst) declarations
             pure $ case selected of
-                root : _ | not strictMode -> refusal root root "requires complete strict source checking (totality, termination, derived binders, and refinement domains)"
+                root : _ | not strictMode -> refusal root root "requires complete strict source checking (totality, termination, and refinement domains)"
                 _ -> case List.find ((`Set.member` assumed) . getName) selected of
                     Just owner -> refusal owner owner "also has an authored assumption"
                     Nothing -> case hydrateImportedBodies selected justified existing of
@@ -72,7 +72,6 @@ hydrateAuthoredImportedBodies cfg current reader request dependencies existing =
     strictMode =
         Config.totalityCheck cfg
             && Config.terminationCheck cfg
-            && Config.checkDerived cfg
             && Config.checkRefinements cfg
             && null (Config.checks cfg)
             && not (Config.compileSpec cfg)
