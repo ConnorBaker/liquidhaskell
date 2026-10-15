@@ -49,7 +49,7 @@ tests fixture compiler optimization =
         , ("SetIdIntFalse", UnsafeAt [7])
         , ("OrdPolyIntFalse", UnsafeAt [9])
         , ("SetUnionKeyFalse", UnsafeAt [13])
-        , ("SetUnionTextDomainFalse", UnsafeAt [11])
+        , ("SetUnionTextMeasureGood", Safe)
         , ("PickContractFalse", UnsafeAt [18])
         , ("SuperclassFabFalse", UnsafeAt [34])
         , -- Incomplete but sound: derived methods have no contracts.

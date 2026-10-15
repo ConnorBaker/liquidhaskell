@@ -1,5 +1,5 @@
--- Text's Ord methods require tbounds arguments, which okT does not imply.
-module SetUnionTextDomainFalse (combine) where
+-- Every Text is bounded, so Set.union needs no further Text domain.
+module SetUnionTextMeasureGood (combine) where
 
 import qualified Data.Set as Set
 import Data.Text (Text)
