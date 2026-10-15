@@ -247,7 +247,7 @@ tests fixture compiler optimization =
                     _ <- compileHaskell tool optimization producerDirectory "ImportedCarrier" []
                     mapM_
                         (client tool directory fixtures producerDirectory flags)
-                        ([("ImportedInstanceCarrierGood", Safe), ("ImportedInstanceCarrierGenericBad", UnsafeAt [13]), ("ImportedInstanceCarrierMethodBad", UnsafeAt [6, 9]), ("ImportedInstanceResultGood", Safe), ("ImportedInstancePredicateGood", Safe), ("ImportedInstancePredicateNarrowBad", UnsafeAt [10]), ("ImportedInstancePredicateResultBad", UnsafeAt [14])] ++ methodQueries mode)
+                        ([("ImportedInstanceCarrierGood", Safe), ("ImportedInstanceCarrierGenericBad", UnsafeAt [13]), ("ImportedInstanceCarrierMethodBad", UnsafeAt [6, 9]), ("ImportedInstanceResultGood", Safe), ("ImportedInstancePredicateGood", Safe), ("ImportedInstancePredicateNarrowBad", UnsafeAt [10, 14]), ("ImportedInstancePredicateResultBad", UnsafeAt [14, 17])] ++ methodQueries mode)
                 , testCase "nested predicate callback admission" $ withSystemTempDirectory "lh-imported-callback-instance" $ \directory -> do
                     tool <- compiler
                     let producerDirectory = directory </> "producer"
