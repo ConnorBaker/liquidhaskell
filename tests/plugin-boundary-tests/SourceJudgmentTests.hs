@@ -3,7 +3,7 @@ module SourceJudgmentTests (tests) where
 import CompilerFixture
 import Control.Monad (when)
 import DeclaredAliasFixtures (declaredAlias)
-import QueryAssertions (assertDefaultInterfaces, assertExternalFormationTag, assertJointInferenceCheck, assertSingleSourceCheck, compatibilityObligations)
+import QueryAssertions (assertUnmentionedEvidenceHidden, assertDefaultInterfaces, assertExternalFormationTag, assertJointInferenceCheck, assertSingleSourceCheck, compatibilityObligations)
 import SourceVariantFixtures (copySourceFixture)
 import System.FilePath ((</>))
 import System.IO.Temp (withSystemTempDirectory)
@@ -132,6 +132,11 @@ tests fixture compiler optimization =
                     ]
                , sourceCase "inferred-interface" ["--no-true-types"] "DefaultDomain" Safe
                , testGroup
+                    "shared evidence scope"
+                    [ sourceCase "shared-evidence" [] "SharedEvidenceScopeGood" Safe
+                    , sourceCase "shared-evidence" [] "SharedEvidenceScopeFalse" (UnsafeAt [16, 21])
+                    ]
+               , testGroup
                     "represented value contracts"
                     [ sourceCase "represented-contracts" ["--higherorder"] "CallbackRootGood" Safe
                     , sourceCase "represented-contracts" ["--higherorder"] "CallbackRootBad" (UnsafeAt [3])
@@ -161,6 +166,7 @@ tests fixture compiler optimization =
             when (name == "IgnoredNestedGood") (assertSingleSourceCheck compiled)
             when (name `elem` ["InferredFunctionGood", "InferredHoleGood"]) (assertJointInferenceCheck compiled)
             when (name == "DerivedDefaultGood") (assertDefaultInterfaces compiled)
+            when (name == "SharedEvidenceScopeGood") (assertUnmentionedEvidenceHidden compiled)
     instanceFormation =
         testGroup
             "instance formation"

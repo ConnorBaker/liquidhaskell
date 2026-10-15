@@ -1,4 +1,4 @@
-module QueryAssertions (assertAuthoredFailure, assertDefaultInterfaces, assertExternalFormationTag, assertSingleSourceCheck, assertJointInferenceCheck, compatibilityObligations) where
+module QueryAssertions (assertAuthoredFailure, assertUnmentionedEvidenceHidden, assertDefaultInterfaces, assertExternalFormationTag, assertSingleSourceCheck, assertJointInferenceCheck, compatibilityObligations) where
 
 import CompilerFixture (Compiled (..))
 import qualified Data.ByteString as ByteString
@@ -122,6 +122,24 @@ assertAuthoredFailure compiled = do
 compatibilityObligations :: Compiled -> IO Int
 compatibilityObligations compiled =
     length . F.cm <$> readQuery (compiledDirectory compiled </> ".liquid" </> compiledModule compiled ++ ".hs.compatibility.bfq")
+
+-- Shared evidence (Transforms.ShareEvidence) is hoisted to top level, but it
+-- keeps the scope it had as a let inside the generated binding that built it.
+-- A checking query whose constraints never name such evidence must not carry
+-- it in any constraint environment. At least one query must exercise this:
+-- evidence bound in the query, yet named by none of its constraints.
+assertUnmentionedEvidenceHidden :: Compiled -> Assertion
+assertUnmentionedEvidenceHidden compiled = do
+    queries <- checkingQueries compiled
+    let evidence query = [name | (_, (name, _, _)) <- F.bindEnvToList (F.bs query), hoisted name]
+        hoisted name = any (`isPrefixOf` F.symbolString name) ["$d", "$$d"]
+        named query = concat [toList (F.syms (F.slhs c)) ++ toList (F.syms (F.srhs c)) | c <- toList (F.cm query)]
+        unmentioned query = null (filter (`elem` evidence query) (named query))
+        scoped query = [name | c <- toList (F.cm query), (name, _) <- F.envCs (F.bs query) (F.senv c), name `elem` evidence query]
+        exercised = [file | (file, query) <- queries, unmentioned query, not (null (evidence query))]
+        leaked = [(file, scoped query) | (file, query) <- queries, unmentioned query, not (null (scoped query))]
+    assertBool "no checking query binds shared evidence that its constraints do not name" (not (null exercised))
+    leaked @?= []
 
 checkingQueries :: Compiled -> IO [(FilePath, F.FInfo ())]
 checkingQueries compiled = do
