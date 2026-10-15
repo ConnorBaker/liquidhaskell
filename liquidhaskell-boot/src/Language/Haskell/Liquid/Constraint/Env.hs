@@ -303,12 +303,12 @@ setBind γ x = located `setLocation` Sp.Var x `setBind'` x
     -- to its authored claim, without replacing an actual source location.
     located
         | isGoodSrcSpan (getSrcSpan x) || isGoodSrcSpan (getLocation γ) = γ
-        | Just claim <- lookup x (gsTySigs (gsSig (giSpec (cgInfo γ)))) =
-            γ `setLocation` Sp.Span (GM.fSrcSpan claim)
+        | Just claim <- claimSpan x = γ `setLocation` Sp.Span claim
         -- A GHC-generated binder (e.g. a dictionary) has no position of its
         -- own. Attribute it to the source expression that first uses it.
-        | Just use <- useSpan (cgUses γ) x = γ `setLocation` Sp.Span use
+        | Just use <- useSpan claimSpan (cgUses γ) x = γ `setLocation` Sp.Span use
         | otherwise = γ
+    claimSpan v = GM.fSrcSpan <$> lookup v (gsTySigs (gsSig (giSpec (cgInfo γ))))
 
 -- | Each binder's uses, with the user binder and the innermost source
 -- position enclosing the use, in program order.
@@ -327,15 +327,16 @@ useSites cbs = M.fromListWith (flip (++)) [(v, [(b, s)]) | (b, e) <- flattenBind
     uses _ _ = []
 
 -- | The position of a binder's first use, reached through users that have
--- no position of their own.
-useSpan :: M.HashMap Var [(Var, Maybe SrcSpan)] -> Var -> Maybe SrcSpan
-useSpan sites = go S.empty
+-- no position of their own. A user without a body position, such as a
+-- hydrated imported owner, is located at its authored claim when it has one.
+useSpan :: (Var -> Maybe SrcSpan) -> M.HashMap Var [(Var, Maybe SrcSpan)] -> Var -> Maybe SrcSpan
+useSpan claim sites = go S.empty
   where
     go seen x = listToMaybe (concatMap (at (S.insert x seen)) (M.lookupDefault [] x sites))
     at _ (_, Just s) = [s]
     at seen (b, Nothing)
         | b `S.member` seen = []
-        | otherwise = maybeToList (go seen b)
+        | otherwise = maybeToList (claim b <|> go seen b)
 
 setBind' :: CGEnv -> Tg.TagKey -> CGEnv
 setBind' γ k
