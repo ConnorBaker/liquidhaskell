@@ -44,7 +44,7 @@ import           Language.Haskell.Liquid.Types.RTypeOp
 import           Language.Haskell.Liquid.Types.Types
 import           Language.Haskell.Liquid.Types.RefType
 import           GHC.Core.Type (typeKind)
-import           Liquid.GHC.API (isTYPEorCONSTRAINT)
+import           Liquid.GHC.API (isTYPEorCONSTRAINT, tyConAppTyCon_maybe, tyConDataCons_maybe)
 
 
 class (Applicative m, Monad m) => Freshable m a where
@@ -178,9 +178,21 @@ refreshValueReft allowTC t r
     | otherwise = return r
 
 -- | Whether a type node classifies term values (rather than, e.g., an
--- unsaturated type constructor argument of a higher kind).
+-- unsaturated type constructor argument of a higher kind). A kind used as a
+-- type, such as an instantiated kind variable, and a declared data type
+-- without constructors, such as a generic representation tag, have no term
+-- values whose refinements could be inferred. An abstract type's
+-- constructors are merely hidden: it still classifies values.
 isValueNode :: RRType r -> Bool
-isValueNode t = isTYPEorCONSTRAINT (typeKind (toType False (toRSort t)))
+isValueNode t =
+    isTYPEorCONSTRAINT (typeKind ty)
+        && not (isTYPEorCONSTRAINT ty)
+        && not declaredEmpty
+  where
+    ty = toType False (toRSort t)
+    declaredEmpty = case tyConAppTyCon_maybe ty >>= tyConDataCons_maybe of
+        Just [] -> True
+        _ -> False
 
 refreshRef :: (Freshable f Integer, Freshable f r, IsReft r, F.Subable r, F.Variable r ~ F.Symbol, ReftBind r ~ F.Symbol, ReftVar r ~ F.Symbol)
            => Bool -> Ref τ (RType RTyCon RTyVar r) -> f (Ref τ (RRType r))
