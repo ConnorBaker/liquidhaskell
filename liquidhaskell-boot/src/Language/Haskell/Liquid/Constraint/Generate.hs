@@ -295,12 +295,14 @@ consAct γ cfg info obligations = do
                 | S.member x seen = reach seen xs
                 | otherwise = reach (S.insert x seen) (xs ++ evidenceIn (Mb.maybeToList (M.lookup x hoisted)))
             hiddenNames = S.fromList [x | x <- M.keys hoisted, not (S.member x mentioned)]
-        pure $ S.fromList
-            [ i
-            | i <- F.elemsIBindEnv (feBinds (fenv environment))
-            , let (name, _, _) = F.lookupBindEnv i bindEnv
-            , S.member name hiddenNames
-            ]
+            entries = [(i, name, F.syms (F.sr_reft reft)) | i <- F.elemsIBindEnv (feBinds (fenv environment)), let (name, reft, _) = F.lookupBindEnv i bindEnv]
+            -- A visible binder's refinement may name evidence (a singleton
+            -- or a KVar actual); that evidence stays in scope with it.
+            close hidden =
+                let named = S.fromList [y | (_, name, free) <- entries, not (S.member name hidden), y <- S.toList free, S.member y hidden]
+                 in if S.null named then hidden else close (hidden `S.difference` named)
+            hiddenClosed = close hiddenNames
+        pure $ S.fromList [i | (i, name, _) <- entries, S.member name hiddenClosed]
 
 ---------------------------------
 
