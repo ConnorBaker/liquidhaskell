@@ -58,6 +58,19 @@ tests fixture compiler optimization =
             _ <- compile tool WithoutRefinementChecking optimization InterfaceOnly target "OwnedRefinementDomain" [compiledDirectory identity </> "objects"] [] (FormationRefusal 5 "requires complete strict source checking")
             _ <- checked tool directory "OwnedWithText" [] (FormationRefusal 7 "unpackAppendCString# has neither an actual unfolding nor a retained dependency contract")
             pure ()
+        , scenario "imported generated binders are checked with or without derived checking" $ \tool directory -> do
+            complete <- raw tool directory "GeneratedHelperProvider"
+            partial <- raw tool directory "GeneratedHelperPartialProvider"
+            -- The selected owner reaches a generated instance-method binder.
+            assertSourceNamePresent tool complete "StableUser <2,FalseTrue> $fPickBool_$cpick"
+            assertSourceNamePresent tool partial "StableUser <2,FalseTrue> $fPickBool_$cpick"
+            _ <- checked tool directory "GeneratedHelperGood" [complete] Safe
+            _ <- checked tool directory "GeneratedHelperBad" [partial] (UnsafeAt [5])
+            -- --check-derived governs only this module's generated binders.
+            -- An imported body is source to check, never derived trust.
+            _ <- withoutDerived tool directory "GeneratedHelperGood" [complete] Safe
+            _ <- withoutDerived tool directory "GeneratedHelperBad" [partial] (UnsafeAt [5])
+            pure ()
         ]
   where
     scenario label action = testCase label $ withSystemTempDirectory "lh-imported-owned" $ \directory -> compiler >>= \tool -> action tool directory
@@ -66,6 +79,10 @@ tests fixture compiler optimization =
         let target = directory </> name
         copy target name
         compileHaskell tool optimization target name ["-fno-omit-interface-pragmas", "-fexpose-all-unfoldings"]
+    withoutDerived tool directory name providers expected = do
+        let target = directory </> "without-derived-checking" </> name
+        copy target name
+        compile tool WithoutDerivedChecking optimization InterfaceOnly target name [compiledDirectory provider </> "objects" | provider <- providers] [] expected
     checked tool directory name providers expected = do
         let target = directory </> name
         copy target name

@@ -32,7 +32,7 @@ data Compiler = Compiler FilePath String [(String, String)] [String]
 
 data Optimization = O0 | O2 deriving (Show)
 
-data CheckingMode = Strict | WithoutRefinementChecking
+data CheckingMode = Strict | WithoutRefinementChecking | WithoutDerivedChecking
 
 data Backend = ObjectCode | InterfaceOnly deriving (Show)
 
@@ -205,10 +205,11 @@ strictOptions = checkingOptions Strict
 
 checkingOptions :: CheckingMode -> [String]
 checkingOptions checking =
-    ["--total-Haskell", "--check-derived"]
+    ["--total-Haskell"]
         ++ ( case checking of
-                Strict -> ["--check-refinements"]
-                WithoutRefinementChecking -> []
+                Strict -> ["--check-derived", "--check-refinements"]
+                WithoutRefinementChecking -> ["--check-derived"]
+                WithoutDerivedChecking -> ["--check-refinements"]
            )
         ++ ["--no-annotations", "--save-query"]
 
