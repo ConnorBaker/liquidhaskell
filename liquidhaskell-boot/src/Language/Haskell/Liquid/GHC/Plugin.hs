@@ -43,6 +43,7 @@ import           Language.Haskell.Liquid.GHC.Plugin.SpecFinder
                                                          as SpecFinder
 
 import           Language.Haskell.Liquid.GHC.Types       (MGIModGuts(..), miModGuts)
+import           Language.Haskell.Liquid.Transforms.ShareEvidence (shareGeneratedEvidence)
 import           Language.Haskell.Liquid.Transforms.InlineAux (inlineAux)
 import           Language.Haskell.Liquid.Transforms.Rewrite (rewriteBinds)
 
@@ -569,8 +570,11 @@ processModule LiquidHaskellContext{..} = do
 
     hscEnv <- getTopEnv
     tcg <- getGblEnv
-    let originalCore = preNormalizeCore moduleCfg modGuts0
-        file = LH.modSummaryHsFile lhModuleSummary
+    originalCore <- liftIO $
+      shareGeneratedEvidence
+        (LH.isGeneratedBinding (LH.manualMethodSpans tcg) thisModule)
+        (preNormalizeCore moduleCfg modGuts0)
+    let file = LH.modSummaryHsFile lhModuleSummary
     -- Only imported signature owners are selected before ANF. Refinements
     -- and local names retain their existing final resolution path.
     hydrated <- hydrateAuthoredImportedBodies
