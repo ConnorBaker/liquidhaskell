@@ -266,7 +266,10 @@ consAct γ cfg info obligations = do
     checkGroup :: CGEnv -> CoreBind -> CG CGEnv
     checkGroup environment cb = do
         checked <- consCBTop cfg info environment cb
-        consRefinementChecks checked (bindersOf cb)
+        -- A claim's formation must not assume the claim: check it in the
+        -- environment before the group. A predicate that names a group member
+        -- still receives that member's shared checking template.
+        consRefinementChecks environment (bindersOf cb)
         pure checked
 
 ---------------------------------
