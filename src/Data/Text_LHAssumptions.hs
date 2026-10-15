@@ -11,6 +11,7 @@ import Data.Maybe_LHAssumptions ()
 import Data.Primitive.ByteArray (ByteArray, sizeofByteArray)
 import Data.Text (Text, append, drop, empty, length, null, pack, singleton, span, split, uncons)
 import qualified Data.Text.Internal
+import qualified Data.Text.Unsafe
 import Data.Tuple_LHAssumptions ()
 
 {-@ LIQUID "--higherorder" @-}
@@ -29,8 +30,10 @@ import Data.Tuple_LHAssumptions ()
 -- complete, well-formed UTF-8 sequence. No bounds follow from tutf8 alone;
 -- its interpretation outside a bounded slice supplies no content facts.
 -- tvalid names their conjunction, the domain of Unicode observations.
--- None is an invariant on arbitrary Text: Data.Text.Internal exposes a
--- constructor that can violate them. Producers establish the predicates.
+-- tbounds is text's own representation invariant: its constructor requires a
+-- bounded slice, as do the unsafe slicing operations below, so every Text is
+-- bounded. Validity is not an invariant: raw constructors and unsafe
+-- operations may form malformed UTF-8. Producers establish tutf8 and tvalid.
 --
 -- On bounded slices, tbytes is the stored byte length. On valid slices, tlen
 -- counts Unicode scalar values; thead denotes the first only when tlen is
@@ -54,15 +57,16 @@ assume Data.Primitive.ByteArray.sizeofByteArray
   :: array:ByteArray
   -> {n:Nat | n == Data.Primitive.ByteArray.sizeofByteArray array}
 
-// The exposed constructor accepts malformed slices. These equations describe
-// its stored metadata; they neither establish bounds nor validate UTF-8.
+// The constructor requires a bounded slice (text's documented invariant);
+// it does not validate UTF-8.
 data Text where
   Data.Text.Internal.Text
-    :: array:ByteArray -> offset:Int -> bytes:Int
-    -> {t:Text | tbytes t == bytes &&
-          (tbounds t <=> (0 <= offset && 0 <= bytes &&
-             offset <= Data.Primitive.ByteArray.sizeofByteArray array &&
-             bytes <= Data.Primitive.ByteArray.sizeofByteArray array - offset))}
+    :: array:ByteArray
+    -> offset:{Int | 0 <= offset && offset <= Data.Primitive.ByteArray.sizeofByteArray array}
+    -> bytes:{Int | 0 <= bytes && bytes <= Data.Primitive.ByteArray.sizeofByteArray array - offset}
+    -> {t:Text | tbytes t == bytes && tbounds t}
+
+invariant {t:Text | tbounds t}
 
 invariant {t:Text | tvalid t <=> (tbounds t && tutf8 t)}
 
@@ -114,14 +118,46 @@ assume Data.Text.append
 -- compareText compares bounded byte slices without decoding UTF-8. Its
 -- unchecked array comparison still requires bounds, but not tutf8. Returning
 -- an input preserves that input's properties; it does not validate its bytes.
--- The refined instance head is the dictionary's carrier, so every Ord method
--- and polymorphic dictionary use has the same bounded-slice domain.
+-- Every Text is bounded, so Ord needs no further domain.
 {-@
-instance Ord ({t:Text | tbounds t}) where
-  assume min :: x:{Text | tbounds x} -> y:{Text | tbounds y}
-             -> {v:Text | v == x || v == y}
-  assume max :: x:{Text | tbounds x} -> y:{Text | tbounds y}
-             -> {v:Text | v == x || v == y}
+instance Ord Text where
+  assume min :: x:Text -> y:Text -> {v:Text | v == x || v == y}
+  assume max :: x:Text -> y:Text -> {v:Text | v == x || v == y}
+@-}
+
+-- text-2.1.3 Data/Text/Unsafe.hs:150-165: lengthWord8 reads the stored byte
+-- length; takeWord8 and dropWord8 slice without checking, keeping their
+-- argument's array and adjusting offset and length by k. unsafeTail (59-66)
+-- drops the first scalar's leader-declared width, which is within the slice
+-- only for a valid nonempty Text. These preconditions keep the constructor's
+-- bounded-slice invariant.
+{-@
+assume Data.Text.Unsafe.takeWord8
+  :: k:Int -> t:{Text | 0 <= k && k <= tbytes t} -> {v:Text | tbytes v == k}
+assume Data.Text.Unsafe.dropWord8
+  :: k:Int -> t:{Text | 0 <= k && k <= tbytes t} -> {v:Text | tbytes v == tbytes t - k}
+assume Data.Text.Unsafe.unsafeTail
+  :: t:{Text | tvalid t && 0 < tbytes t} -> {v:Text | tbytes v < tbytes t}
+
+assume Data.Text.Unsafe.lengthWord8 :: t:Text -> {v:Int | v == tbytes t}
+@-}
+
+-- text-2.1.3 Data/Text/Internal.hs:116-130: the exported smart constructor
+-- text (and its deprecated alias textP) returns empty for a zero length and
+-- otherwise builds the slice without checking it, so it needs the
+-- constructor's bounded-slice precondition.
+{-@
+assume Data.Text.Internal.text
+  :: array:ByteArray
+  -> offset:{Int | 0 <= offset && offset <= Data.Primitive.ByteArray.sizeofByteArray array}
+  -> bytes:{Int | 0 <= bytes && bytes <= Data.Primitive.ByteArray.sizeofByteArray array - offset}
+  -> {t:Text | tbytes t == bytes}
+
+assume Data.Text.Internal.textP
+  :: array:ByteArray
+  -> offset:{Int | 0 <= offset && offset <= Data.Primitive.ByteArray.sizeofByteArray array}
+  -> bytes:{Int | 0 <= bytes && bytes <= Data.Primitive.ByteArray.sizeofByteArray array - offset}
+  -> {t:Text | tbytes t == bytes}
 @-}
 
 -- text-2.1.3 Data/Text.hs:627 defines length as negate . measureOff maxBound.
