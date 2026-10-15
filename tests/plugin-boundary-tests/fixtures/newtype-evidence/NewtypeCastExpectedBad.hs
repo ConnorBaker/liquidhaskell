@@ -11,6 +11,6 @@ newtype Members = Members (Set.Set Int)
 forged :: Int -> Positive
 forged value = Positive value
 
-{-@ emptyMembers :: {m:Members | false} @-}
-emptyMembers :: Members
-emptyMembers = Members Set.empty
+{-@ emptyMembers :: () -> {m:Members | false} @-}
+emptyMembers :: () -> Members
+emptyMembers _ = Members Set.empty

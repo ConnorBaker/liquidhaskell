@@ -25,7 +25,7 @@ tests compiler optimization =
         , sourceCase "NativePartialProjectedCallbackDistinct" Fixtures.distinctPartialProjectedCallbackPredicates (UnsafeAt [14])
         , sourceCase "NativeSameSpelledTermPredicate" Fixtures.sameSpelledTermPredicate Safe
         , sourceCase "NativeFalseMembership" Fixtures.falseMembershipGuard Safe
-        , sourceCase "NativeInadmissibleMembership" Fixtures.inadmissibleMembershipGuard (UnsafeAt [6])
+        , sourceCase "NativeInadmissibleMembership" Fixtures.inadmissibleMembershipGuard (UnsafeAt [5, 6, 10])
         , sourceCase "NativeClassFalseMembership" Fixtures.falseClassMembershipGuard Safe
         , sourceCase "NativeClassFormationOnly" Fixtures.inadmissibleClassMembershipGuard (UnsafeAt [6])
         , sourceCase "NativePrivateFalse" Fixtures.privateFalseDomain Safe
@@ -35,8 +35,8 @@ tests compiler optimization =
         , sourceCase "NativePendingDictionary" Fixtures.pendingDictionaryDomain (FormationRefusal 5 "Instance compatibility depends on unadmitted instance authority:")
         , sourceCase "NativeSharedMethods" Fixtures.consistentSharedMethods Safe
         , sourceCase "NativeSharedMethodsReversed" Fixtures.reversedConsistentSharedMethods Safe
-        , sourceCase "NativeConflictingSharedMethods" Fixtures.conflictingSharedMethods (UnsafeAt [12])
-        , sourceCase "NativeConflictingSharedMethodsReversed" Fixtures.reversedConflictingSharedMethods (UnsafeAt [15])
+        , sourceCase "NativeConflictingSharedMethods" Fixtures.conflictingSharedMethods (UnsafeAt [12, 17])
+        , sourceCase "NativeConflictingSharedMethodsReversed" Fixtures.reversedConflictingSharedMethods (UnsafeAt [15, 17])
         ]
   where
     sourceCase name body expected =

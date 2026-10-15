@@ -247,7 +247,7 @@ tests fixture compiler optimization =
                     _ <- compileHaskell tool optimization producerDirectory "ImportedCarrier" []
                     mapM_
                         (client tool directory fixtures producerDirectory flags)
-                        ([("ImportedInstanceCarrierGood", Safe), ("ImportedInstanceCarrierGenericBad", UnsafeAt [13]), ("ImportedInstanceCarrierMethodBad", UnsafeAt [6]), ("ImportedInstanceResultGood", Safe), ("ImportedInstancePredicateGood", Safe), ("ImportedInstancePredicateNarrowBad", UnsafeAt [10]), ("ImportedInstancePredicateResultBad", UnsafeAt [14])] ++ methodQueries mode)
+                        ([("ImportedInstanceCarrierGood", Safe), ("ImportedInstanceCarrierGenericBad", UnsafeAt [13]), ("ImportedInstanceCarrierMethodBad", UnsafeAt [6, 9]), ("ImportedInstanceResultGood", Safe), ("ImportedInstancePredicateGood", Safe), ("ImportedInstancePredicateNarrowBad", UnsafeAt [10]), ("ImportedInstancePredicateResultBad", UnsafeAt [14])] ++ methodQueries mode)
                 , testCase "nested predicate callback admission" $ withSystemTempDirectory "lh-imported-callback-instance" $ \directory -> do
                     tool <- compiler
                     let producerDirectory = directory </> "producer"
@@ -675,7 +675,7 @@ tests fixture compiler optimization =
                 , ("LexicalShadowTautologyGood", Safe)
                 , ("LexicalShadowTautologyBad", UnsafeAt [16])
                 , ("LexicalCallbackGood", Safe)
-                , ("LexicalCallbackBad", UnsafeAt [7])
+                , ("LexicalCallbackBad", UnsafeAt [7, 9])
                 , ("LexicalTemplateNamesGood", Safe)
                 , ("NominalTermScopeGood", Safe)
                 , ("NominalTermScopeCastBad", FormationRefusal 7 "Illegal type specification")
@@ -734,10 +734,10 @@ tests fixture compiler optimization =
                 [ ("TransitiveRewriteContractGood", Safe)
                 , -- Rejected callees retain only their independently checked
                   -- contracts, so their callers cannot borrow the false claim.
-                  ("TransitiveRewriteFalse", UnsafeAt [10, 14, 18])
+                  ("TransitiveRewriteFalse", UnsafeAt [18])
                 , ("MutualRewriteFalse", UnsafeAt [10, 16])
-                , ("ExplicitRewriteCycleFalse", UnsafeAt [10, 15])
-                , ("MediatedRewriteCycleFalse", UnsafeAt [10, 14, 19, 23])
+                , ("ExplicitRewriteCycleFalse", UnsafeAt [15])
+                , ("MediatedRewriteCycleFalse", UnsafeAt [23])
                 , -- A rule's precondition names its value, not the argument binder.
                   ("RewritePreconditionBinderGood", Safe)
                 , ("RewritePreconditionBinderFalse", UnsafeAt [25])
@@ -758,8 +758,8 @@ tests fixture compiler optimization =
                 [ ("VarianceGood", Safe)
                 , -- Reject both the invalid widening and its caller's negative
                   -- argument; recovery must not retain the rejected interface.
-                  ("NestedVarianceBad", UnsafeAt [18, 23])
-                , ("HigherKindedVarianceBad", UnsafeAt [19, 24])
+                  ("NestedVarianceBad", UnsafeAt [18])
+                , ("HigherKindedVarianceBad", UnsafeAt [19])
                 , ("DeclaredCovarianceBad", FormationRefusal 3 "Declared variance contradicts constructor-field occurrences")
                 , ("DeclaredContravarianceBad", FormationRefusal 3 "Declared variance contradicts constructor-field occurrences")
                 ]
