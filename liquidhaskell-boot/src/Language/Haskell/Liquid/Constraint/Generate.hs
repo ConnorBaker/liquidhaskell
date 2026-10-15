@@ -34,6 +34,7 @@ import           Control.Monad ( foldM, forM, forM_, when, void, unless, msum, g
 import           Control.Monad.State
 import           Data.Bifunctor                                (first)
 import           Data.Maybe                                    (fromMaybe, isJust)
+import qualified Data.Maybe                                    as Mb
 import           Data.Either.Extra                             (eitherToMaybe)
 import qualified Data.HashMap.Strict                           as M
 import qualified Data.HashSet                                  as S
@@ -265,12 +266,41 @@ consAct γ cfg info obligations = do
     groups = obligationBodies obligations
     checkGroup :: CGEnv -> CoreBind -> CG CGEnv
     checkGroup environment cb = do
-        checked <- consCBTop cfg info environment cb
+        hidden <- hiddenEvidence environment cb
+        let restrict ids = F.filterIBindEnv (not . (`S.member` hidden)) ids
+            scoped = environment{fenv = (fenv environment){feBinds = restrict (feBinds (fenv environment))}}
+        checked <- consCBTop cfg info scoped cb
         -- A claim's formation must not assume the claim: check it in the
         -- environment before the group. A predicate that names a group member
         -- still receives that member's shared checking template.
         consRefinementChecks environment (bindersOf cb)
-        pure checked
+        pure checked{fenv = (fenv checked){feBinds = F.unionIBindEnv (feBinds (fenv checked)) (F.fromListIBindEnv (S.toList hidden))}}
+    -- Hoisting shared evidence (Transforms.ShareEvidence) must not widen its
+    -- lexical scope. Before sharing, each such dictionary was let-bound inside
+    -- the generated binding that constructs it, so no other binding's KVars or
+    -- constraints could depend on it. Hide a hoisted dictionary from every
+    -- group that mentions neither it nor evidence built from it.
+    hoisted = M.fromList
+        [ (F.symbol x, rhs)
+        | NonRec x rhs <- giCbs (giSrc info)
+        , isDictId x
+        , not (isExternalName (getName x))
+        ]
+    evidenceIn expressions = [y | e <- expressions, v <- nonDetEltsUniqSet (exprFreeVars e), let y = F.symbol v, M.member y hoisted]
+    hiddenEvidence environment cb = do
+        bindEnv <- gets binds
+        let mentioned = reach S.empty (evidenceIn (rhssOfBind cb) ++ filter (`M.member` hoisted) (map F.symbol (bindersOf cb)))
+            reach seen [] = seen
+            reach seen (x : xs)
+                | S.member x seen = reach seen xs
+                | otherwise = reach (S.insert x seen) (xs ++ evidenceIn (Mb.maybeToList (M.lookup x hoisted)))
+            hiddenNames = S.fromList [x | x <- M.keys hoisted, not (S.member x mentioned)]
+        pure $ S.fromList
+            [ i
+            | i <- F.elemsIBindEnv (feBinds (fenv environment))
+            , let (name, _, _) = F.lookupBindEnv i bindEnv
+            , S.member name hiddenNames
+            ]
 
 ---------------------------------
 
