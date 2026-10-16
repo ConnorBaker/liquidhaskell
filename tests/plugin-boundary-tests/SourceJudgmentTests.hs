@@ -137,6 +137,13 @@ tests fixture compiler optimization =
                     , sourceCase "shared-evidence" [] "SharedEvidenceScopeFalse" (UnsafeAt [16, 21])
                     ]
                , testGroup
+                    "instance-owned evidence"
+                    [ sourceCase "shared-evidence" [] "SharedEvidenceNewtypeGood" Safe
+                    , sourceCase "shared-evidence" [] "SharedEvidenceNewtypeNFDataGood" Safe
+                    , sourceCase "shared-evidence" [] "SharedEvidenceViaGood" Safe
+                    , sourceCase "shared-evidence" [] "SharedEvidenceNewtypeFalse" (UnsafeAt [10])
+                    ]
+               , testGroup
                     "represented value contracts"
                     [ sourceCase "represented-contracts" ["--higherorder"] "CallbackRootGood" Safe
                     , sourceCase "represented-contracts" ["--higherorder"] "CallbackRootBad" (UnsafeAt [3])
