@@ -247,6 +247,9 @@ consAct γ cfg info obligations = do
     fcs <- concat <$> mapM (splitC (typeclass (getConfig info))) hcs
     hws <- gets hsWfs
     fws <- concat <$> mapM splitW hws
+    sharedHws <- gets sharedHoleWfs
+    sharedFws <- concat <$> mapM splitW (reverse sharedHws)
+    bindEnv <- gets binds
     checkStratCtors γ sSpc
     when (warnOnTermHoles cfg) emitConsolidatedHoleWarnings
     -- Self is a constructor-field placeholder whose lexical owner is supplied
@@ -259,7 +262,7 @@ consAct γ cfg info obligations = do
             , cgLits = litEnv γ
             , cgConsts = cgConsts st `mappend` constEnv γ
             , fixCs = classConstraints ++ fcs
-            , fixWfs = fws
+            , fixWfs = fws ++ mergeSharedHoleWfs bindEnv sharedFws
             }
     pure γ'
   where
@@ -650,6 +653,31 @@ nativeIf condition yes no = do
     binder <- freshNativeBool
     return $ Case condition binder boolTy [Alt (DataAlt falseDataCon) [] no, Alt (DataAlt trueDataCon) [] yes]
 
+-- | One well-formedness constraint per KVar of a shared hole template.
+--
+-- Every checked occurrence of a binder with a hole template contributes that
+-- template's well-formedness in the occurrence's own environment. Case
+-- expansion can check several copies of one binding, each in a different
+-- branch, so a KVar may receive several such constraints. Its scope is the
+-- symbols bound at EVERY occurrence: a symbol bound in only one branch cannot
+-- appear in a solution that every copy uses. Narrowing a KVar's scope only
+-- restricts its solutions. Copies of one template agree on the value
+-- variables; a disagreement is not a copy, and is reported.
+mergeSharedHoleWfs :: F.BindEnv Cinfo -> [FixWfC] -> [FixWfC]
+mergeSharedHoleWfs bindEnv constraints =
+    [ merge occurrences
+    | occurrences <- M.elems (M.fromListWith (flip (++)) [(F.wkvar w, [w]) | w <- constraints])
+    ]
+  where
+    merge [] = panic Nothing "mergeSharedHoleWfs: empty occurrence group"
+    merge (first : rest)
+        | all ((== F.wvvs first) . F.wvvs) rest =
+            first{F.wenv = F.filterIBindEnv (\i -> all (S.member (symbolOf i) . scope) rest) (F.wenv first)}
+        | otherwise =
+            panic Nothing ("Shared hole template copies disagree on the value variables of " ++ showpp (F.wkvar first))
+    symbolOf i = let (x, _, _) = F.lookupBindEnv i bindEnv in x
+    scope w = S.fromList (symbolOf <$> F.elemsIBindEnv (F.wenv w))
+
 --------------------------------------------------------------------------------
 consCBLet :: CGEnv -> CoreBind -> CG CGEnv
 --------------------------------------------------------------------------------
@@ -860,7 +888,7 @@ consBind isRec' γ (x, e, Asserted spect) =
             -- formals, not new owners of the KVar's well-formedness scope.
             -- Keep this actual lexical environment for captured variables.
             case lookupREnv (F.symbol x) (grtys cgenv) of
-                Just declared -> addW $ WfC cgenv $ fmap killSubst declared
+                Just declared -> addSharedHoleW $ WfC cgenv $ fmap killSubst declared
                 Nothing ->
                     panic
                         (Just (getSrcSpan x))

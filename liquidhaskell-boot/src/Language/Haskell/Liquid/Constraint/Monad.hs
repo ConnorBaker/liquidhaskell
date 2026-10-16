@@ -78,6 +78,13 @@ addW   :: WfC -> CG ()
 --------------------------------------------------------------------------------
 addW !w = modify $ \s -> s { hsWfs = w : hsWfs s }
 
+-- | Well-formedness of a binder's shared hole checking template, from one
+-- checked occurrence of that binder. Case expansion can check several copies
+-- of one binding; their KVars are the template's, so the occurrences are merged
+-- into one well-formedness constraint per KVar after splitting.
+addSharedHoleW :: WfC -> CG ()
+addSharedHoleW !w = modify $ \s -> s { sharedHoleWfs = w : sharedHoleWfs s }
+
 -- | Instantiate a universally quantified predicate with a fresh, well-formed
 -- refinement in its current lexical environment.
 freshPredRef :: CGEnv -> PVar RSort -> CG SpecProp

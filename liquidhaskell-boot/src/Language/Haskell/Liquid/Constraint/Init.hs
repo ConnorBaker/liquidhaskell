@@ -346,6 +346,7 @@ initCGI cfg base = \info ->
         { fEnv = F.emptySEnv
         , hsCs = []
         , hsWfs = []
+        , sharedHoleWfs = []
         , fixCs = []
         , fixWfs = []
         , freshIndex = 0

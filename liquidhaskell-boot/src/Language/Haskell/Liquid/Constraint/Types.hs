@@ -220,6 +220,7 @@ data CGInfo = CGInfo
   { fEnv          :: !(F.SEnv F.Sort)                    -- ^ top-level fixpoint env
   , hsCs          :: ![SubC]                             -- ^ subtyping constraints over RType
   , hsWfs         :: ![WfC]                              -- ^ wellformedness constraints over RType
+  , sharedHoleWfs :: ![WfC]                              -- ^ one per checked occurrence of a shared hole template
   , fixCs         :: ![FixSubC]                          -- ^ subtyping over Sort (post-splitting)
   , fixWfs        :: ![FixWfC]                           -- ^ wellformedness constraints over Sort (post-splitting)
   , freshIndex    :: !Integer                            -- ^ counter for generating fresh KVars
@@ -485,6 +486,7 @@ instance NFData WfC where
 instance NFData CGInfo where
   rnf x = ({-# SCC "CGIrnf1" #-}  rnf (hsCs x))       `seq`
           ({-# SCC "CGIrnf2" #-}  rnf (hsWfs x))      `seq`
+          rnf (sharedHoleWfs x)                         `seq`
           ({-# SCC "CGIrnf3" #-}  rnf (fixCs x))      `seq`
           ({-# SCC "CGIrnf4" #-}  rnf (fixWfs x))     `seq`
           ({-# SCC "CGIrnf6" #-}  rnf (freshIndex x)) `seq`
