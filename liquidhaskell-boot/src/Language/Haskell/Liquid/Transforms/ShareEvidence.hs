@@ -34,13 +34,16 @@ import           Data.Word                      (Word64)
 -- defining construction, and its class methods are found from the fields of
 -- that construction ('instanceDictionaryOwners'). Hoisting it, or evidence
 -- nested in it, would leave the instance an alias of a shared binding.
+-- Likewise a top-level evidence binding is already shared evidence, and its
+-- uses find their instance through its definition (e.g. @$dIsString =
+-- $fIsStringList \@Char $d~@); it is not replaced by an alias either.
 shareGeneratedEvidence :: (Var -> Bool) -> CoreProgram -> IO CoreProgram
 shareGeneratedEvidence generated program = do
     supply <- mkSplitUniqSupply 'S'
     pure $ evalState (concat <$> mapM bind program) (Sharing Map.empty [] (uniqsFromSupply supply))
   where
     bind (NonRec x rhs)
-      | generated x, not (isDFunId x) = do
+      | generated x, not (isDFunId x), not (isDictId x) = do
           rhs' <- expr emptyVarSet emptyVarEnv rhs
           hoisted <- state (\s -> (reverse (shHoisted s), s{shHoisted = []}))
           pure (hoisted ++ [NonRec x rhs'])
