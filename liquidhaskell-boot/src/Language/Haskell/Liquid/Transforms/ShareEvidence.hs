@@ -28,13 +28,18 @@ import           Data.Word                      (Word64)
 -- same evidence as an earlier one is replaced by it. The program's meaning
 -- is unchanged; each distinct construction is checked once rather than once
 -- per use. The new binders are themselves generated.
+--
+-- An instance's dictionary function is not rewritten: it owns its whole
+-- defining construction, and its class methods are found from the fields of
+-- that construction ('instanceDictionaryOwners'). Hoisting it, or evidence
+-- nested in it, would leave the instance an alias of a shared binding.
 shareGeneratedEvidence :: (Var -> Bool) -> CoreProgram -> IO CoreProgram
 shareGeneratedEvidence generated program = do
     supply <- mkSplitUniqSupply 'S'
     pure $ evalState (concat <$> mapM bind program) (Sharing Map.empty [] (uniqsFromSupply supply))
   where
     bind (NonRec x rhs)
-      | generated x = do
+      | generated x, not (isDFunId x) = do
           rhs' <- expr emptyVarSet emptyVarEnv rhs
           hoisted <- state (\s -> (reverse (shHoisted s), s{shHoisted = []}))
           pure (hoisted ++ [NonRec x rhs'])
