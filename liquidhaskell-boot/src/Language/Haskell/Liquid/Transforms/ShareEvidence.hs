@@ -14,6 +14,7 @@ import           GHC.Types.Var.Env              (VarEnv, emptyVarEnv, extendVarE
 import           GHC.Types.Var.Set              (disjointVarSet)
 import           Control.Monad.State.Strict     (State, evalState, gets, modify', state)
 import           Data.List                      (find)
+import           Data.Maybe                     (isJust)
 import qualified Data.Map.Strict               as Map
 import           Data.Word                      (Word64)
 
@@ -63,12 +64,12 @@ expr locals env = go
         App{} -> do
             let (f, args) = collectArgs e
             e' <- mkApps <$> go f <*> mapM go args
-            if isDictTy (exprType e') && closed e' then Var <$> share Nothing e' else pure e'
+            if isDictTy (exprType e') && shareable e' then Var <$> share Nothing e' else pure e'
         Lam b body -> Lam b <$> expr (extendVarSet locals b) env body
         Let (NonRec d rhs) body
             | isDictId d -> do
                 rhs' <- go rhs
-                if closed rhs'
+                if shareable rhs'
                     then do
                         shared <- share (Just d) rhs'
                         expr locals (extendVarEnv env d (Var shared)) body
@@ -83,7 +84,14 @@ expr locals env = go
         Tick t inner -> Tick t <$> go inner
         _ -> pure e
     alt b (Alt c bs rhs) = Alt c bs <$> expr (extendVarSetList locals (b : bs)) env rhs
-    closed e = disjointVarSet locals (exprFreeVars e)
+    -- A dictionary built by its class constructor stays where it is built:
+    -- checking reads such evidence through its constructor (the DataToTag
+    -- evidence of a derived comparison interprets its dataToTag#), which a
+    -- shared top-level binding no longer exposes.
+    shareable e = disjointVarSet locals (exprFreeVars e) && not (constructed e)
+    constructed e = case collectArgs e of
+        (Var f, _) -> isJust (isDataConId_maybe f)
+        _ -> False
 
 -- | The top-level binder of a closed dictionary construction: an earlier one
 -- that constructs the same evidence, else the given or a fresh binder.
