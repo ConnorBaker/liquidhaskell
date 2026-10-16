@@ -137,6 +137,11 @@ tests fixture compiler optimization =
                     , sourceCase "shared-evidence" [] "SharedEvidenceScopeFalse" (UnsafeAt [16, 21])
                     ]
                , testGroup
+                    "shared hole template copies"
+                    [ sourceCase "shared-hole-template" [] "SharedHoleTemplateGood" Safe
+                    , sourceCase "shared-hole-template" [] "SharedHoleTemplateFalse" (UnsafeAt [22])
+                    ]
+               , testGroup
                     "instance-owned evidence"
                     [ sourceCase "shared-evidence" [] "SharedEvidenceNewtypeGood" Safe
                     , sourceCase "shared-evidence" [] "SharedEvidenceNewtypeNFDataGood" Safe
