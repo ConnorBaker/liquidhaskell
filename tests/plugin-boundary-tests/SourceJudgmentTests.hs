@@ -410,6 +410,14 @@ tests fixture compiler optimization =
                 , ("TextBreakOnEndFalse", UnsafeAt [9])
                 , ("TextBreakOnEndRawBad", UnsafeAt [8])
                 , ("TextBreakOnEndEmptyBad", UnsafeAt [8])
+                , ("TextBreakStripSplitGood", Safe)
+                , ("TextBreakOnFalse", UnsafeAt [9])
+                , ("TextBreakOnEmptyBad", UnsafeAt [8])
+                , ("TextStripFalse", UnsafeAt [8])
+                , ("TextStripRawBad", UnsafeAt [8])
+                , ("TextSplitOnFalse", UnsafeAt [9])
+                , ("TextSplitOnEmptyBad", UnsafeAt [8])
+                , ("TextSplitOnRawBad", UnsafeAt [8])
                 , -- GHC-generated dictionary binders have no position of their
                   -- own; their obligations belong to the use that demands them.
                   ("TextGeneratedOrdGood", Safe)
