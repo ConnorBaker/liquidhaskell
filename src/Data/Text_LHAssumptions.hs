@@ -9,7 +9,7 @@ module Data.Text_LHAssumptions where
 
 import Data.Maybe_LHAssumptions ()
 import Data.Primitive.ByteArray (ByteArray, sizeofByteArray)
-import Data.Text (Text, append, breakOnEnd, count, drop, empty, length, null, pack, singleton, span, split, stripPrefix, stripSuffix, toCaseFold, uncons)
+import Data.Text (Text, append, breakOn, breakOnEnd, count, drop, empty, length, null, pack, singleton, span, split, splitOn, strip, stripPrefix, stripSuffix, toCaseFold, uncons)
 import qualified Data.Text.Internal
 import qualified Data.Text.Unsafe
 import Data.Tuple_LHAssumptions ()
@@ -277,4 +277,36 @@ assume Data.Text.breakOnEnd
   :: pat:{Text | tvalid pat && 0 < tbytes pat}
   -> src:{Text | tvalid src}
   -> ({v:Text | tvalid v}, {v:Text | tvalid v})
+@-}
+
+-- text-2.1.3 Data/Text.hs:1774-1780: breakOn raises emptyError when the
+-- pattern's stored byte length is zero; otherwise it searches bytes with
+-- indices (Internal/Search.hs:49-92) and slices the source at the first match,
+-- or returns the source and empty. Nothing is decoded, so any bounded source
+-- is accepted. Only when both inputs are valid does the match, which begins at
+-- the pattern's leader byte, fall on a scalar boundary of the source.
+--
+-- strip (1483-1484) is dropAround isSpace: dropWhile (1434-1440) and
+-- dropWhileEnd (1450-1456) decode scalars forward with iter and backward with
+-- reverseIter (Unsafe.hs:111-124), reading continuation bytes without checks,
+-- so the input must be valid; the result is a slice cut at scalar boundaries.
+--
+-- splitOn (1652-1666) raises emptyError for an empty pattern, splits on a
+-- one-scalar pattern with split, which decodes the source, and otherwise
+-- slices at the indices matches. isSingleton (617-618) streams the pattern.
+-- Both inputs must be valid; every piece is then a valid slice. Pieces may be
+-- empty, and their number is not stated.
+{-@
+assume Data.Text.breakOn
+  :: pat:{Text | 0 < tbytes pat}
+  -> src:Text
+  -> ({v:Text | tvalid pat && tvalid src => tvalid v},
+      {v:Text | tvalid pat && tvalid src => tvalid v})
+
+assume Data.Text.strip :: t:{Text | tvalid t} -> {v:Text | tvalid v}
+
+assume Data.Text.splitOn
+  :: pat:{Text | tvalid pat && 0 < tbytes pat}
+  -> src:{Text | tvalid src}
+  -> [{v:Text | tvalid v}]
 @-}
