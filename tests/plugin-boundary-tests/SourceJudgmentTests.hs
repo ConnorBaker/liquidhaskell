@@ -576,6 +576,21 @@ tests fixture compiler optimization =
                 ]
             )
         ,
+            ( "derived-enumerations"
+            , []
+            ,
+                [ ("DerivedEnumGood", Safe)
+                , ("DerivedIxGood", Safe)
+                , ("TagDecoderWideBad", UnsafeAt [10])
+                , ("EnumFromToGood", Safe)
+                , ("EnumFromToFalse", UnsafeAt [5])
+                , ("EnumFromThenToGood", Safe)
+                , ("EnumFromThenToFalse", UnsafeAt [5])
+                , ("EnumIntToWordGood", Safe)
+                , ("EnumIntToWordFalse", UnsafeAt [7])
+                ]
+            )
+        ,
             ( "logical-measure-values"
             , []
             ,
