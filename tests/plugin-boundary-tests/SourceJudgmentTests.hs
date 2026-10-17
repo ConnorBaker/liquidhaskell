@@ -555,6 +555,8 @@ tests fixture compiler optimization =
             ,
                 [ ("HigherKindedCallbackGood", Safe)
                 , ("HigherKindedCallbackBad", UnsafeAt [18])
+                , ("ApplicationCarrierGood", Safe)
+                , ("ApplicationCarrierFalse", UnsafeAt [5, 9])
                 ]
             )
         ,
