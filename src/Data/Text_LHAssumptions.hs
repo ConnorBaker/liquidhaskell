@@ -86,10 +86,22 @@ assume Data.Text.null
 
 @-}
 
--- text-2.1.3 Data/Text/Show.hs:145-159 implements singleton by sanitizing one
--- character, allocating its exact UTF-8 width, writing it, and freezing the
--- array. ASCII is unchanged and occupies one byte. This deliberately admits
--- only that bounded character domain, not arbitrary primitive Char values.
+-- text-2.1.3 Data/Text/Show.hs:157-171 implements singleton for every Char:
+-- it replaces the character with safe c, allocates exactly utf8Length (safe c)
+-- bytes, writes that scalar with unsafeWrite, and freezes the array.
+-- Data/Text/Internal.hs:146-150 defines safe as c unless
+-- ord c .&. 0x1ff800 == 0xd800, and then U+FFFD. Every GHC Char is a code
+-- point in [0, 0x10FFFF] (ghc-internal-9.1401 GHC/Internal/Char.hs:17-21, chr
+-- rejects larger ordinals; GHC/Internal/Enum.hs:436, maxBound), below 2^21,
+-- where that mask test selects exactly the surrogates [0xD800, 0xDFFF].
+-- Data/Text/Internal/Encoding/Utf8.hs:71-81 gives the width: 1 below 0x80,
+-- 2 below 0x800, 3 below 0x10000, otherwise 4; U+FFFD and the surrogates it
+-- replaces both take 3. unsafeWrite (Data/Text/Internal/Unsafe/Char.hs:57-85)
+-- writes the standard UTF-8 encoding of the non-surrogate scalar, so the
+-- result is one valid scalar.
+-- The contract states those cases over the logical Char ordering; it relies on
+-- no Char range fact, since its byte-width and replacement cases are
+-- exhaustive over every ordinal, including ones no Char has.
 -- Data/Text/Internal.hs:89-103 implements append by returning an operand when
 -- the other is empty, otherwise allocating the byte sum and copying both
 -- bounded slices. The dependent bound excludes its size-overflow branch.
@@ -101,8 +113,14 @@ assume Data.Text.null
 -- replace pack on literals, and grant no validity to unchecked addresses.
 {-@
 assume Data.Text.singleton
-  :: c:{Char | (lit "0" Char) <= c && c <= (lit "127" Char)}
-  -> {t:Text | tvalid t && tlen t == 1 && tbytes t == 1 && thead t == c}
+  :: c:Char
+  -> {t:Text | tvalid t && tlen t == 1
+       && ((c < (lit "128" Char)) => tbytes t == 1)
+       && (((lit "128" Char) <= c && c < (lit "2048" Char)) => tbytes t == 2)
+       && (((lit "2048" Char) <= c && c < (lit "65536" Char)) => tbytes t == 3)
+       && (((lit "65536" Char) <= c) => tbytes t == 4)
+       && ((c < (lit "55296" Char) || (lit "57343" Char) < c) => thead t == c)
+       && (((lit "55296" Char) <= c && c <= (lit "57343" Char)) => thead t == (lit "65533" Char))}
 
 assume Data.Text.pack :: String -> {t:Text | tvalid t}
 
