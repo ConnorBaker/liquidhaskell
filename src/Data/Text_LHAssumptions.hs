@@ -9,7 +9,7 @@ module Data.Text_LHAssumptions where
 
 import Data.Maybe_LHAssumptions ()
 import Data.Primitive.ByteArray (ByteArray, sizeofByteArray)
-import Data.Text (Text, append, count, drop, empty, length, null, pack, singleton, span, split, stripPrefix, stripSuffix, toCaseFold, uncons)
+import Data.Text (Text, append, breakOnEnd, count, drop, empty, length, null, pack, singleton, span, split, stripPrefix, stripSuffix, toCaseFold, uncons)
 import qualified Data.Text.Internal
 import qualified Data.Text.Unsafe
 import Data.Tuple_LHAssumptions ()
@@ -261,4 +261,20 @@ assume Data.Text.count
   :: pat:{Text | tvalid pat && 0 < tbytes pat}
   -> t:{Text | tvalid t}
   -> {v:Int | 0 <= v}
+@-}
+
+-- text-2.1.3 Data/Text.hs:1791-1794: breakOnEnd pat src reverses both inputs,
+-- applies breakOn, and reverses the two pieces. reverse (Internal/Reverse.hs:
+-- 37-91) copies each scalar by its leader-declared width, so both inputs need
+-- valid slices; it returns a valid slice of the same scalars. breakOn
+-- (1774-1780) raises emptyError on an empty pattern; otherwise it splits at the
+-- first byte match of indices (Internal/Search.hs:49-92), or returns the whole
+-- source and empty. The reversed pattern is valid and so begins with a leader
+-- byte, and a leader byte in a valid source begins a scalar, so both pieces are
+-- valid. Their sizes are not stated.
+{-@
+assume Data.Text.breakOnEnd
+  :: pat:{Text | tvalid pat && 0 < tbytes pat}
+  -> src:{Text | tvalid src}
+  -> ({v:Text | tvalid v}, {v:Text | tvalid v})
 @-}
