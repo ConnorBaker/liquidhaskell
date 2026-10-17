@@ -51,6 +51,7 @@ library
                       Foreign.Ptr_LHAssumptions
                       Foreign.Storable_LHAssumptions
                       GHC.Base_LHAssumptions
+                      GHC.Enum_LHAssumptions
                       GHC.Exts_LHAssumptions
                       GHC.Float_LHAssumptions
                       GHC.ForeignPtr_LHAssumptions
@@ -87,6 +88,7 @@ library
                       liquidhaskell-boot   == 0.9.14.1.2,
                       bytestring,
                       containers,
+                      ghc-internal,
                       ghc-prim,
                       primitive            >= 0.9 && < 0.10,
                       text                 >= 2.1 && < 2.2
