@@ -386,9 +386,13 @@ substPred msg (p, tp) (RAllP q@PV{} t)
 substPred msg su@(rp, _) (RAllT a t r)
     | null (snd (splitRPvar rp r)) = RAllT a (substPred msg su t) r
     | otherwise = errorP "substPred unsupported concrete quantified carrier: " msg
-substPred msg su@(rp, _) (RAppTy t1 t2 r)
-    | null (snd (splitRPvar rp r)) = RAppTy (substPred msg su t1) (substPred msg su t2) r
-    | otherwise = errorP "substPred unsupported concrete application carrier: " msg
+substPred msg su@(rp, prop) (RAppTy t1 t2 r)
+    | null πs = t'
+    | RProp _ RAppTy{} <- prop = substRCon msg su t' πs r'
+    | otherwise = errorP "substPred unsupported concrete application carrier presentation: " msg
+  where
+    t' = RAppTy (substPred msg su t1) (substPred msg su t2) r
+    (r', πs) = splitRPvar rp r
 substPred msg su@(rp, prop) (RFun x i rt rt' r)
     --                        = RFun x (substPred msg su t) (substPred msg su t') r
     | null πs = RFun x i (substPred msg su rt) (substPred msg su rt') r
@@ -454,12 +458,26 @@ substRCon msg (rp, RProp ss t1@(RApp c1 ts1 rs1 r1)) t2@(RApp c2 ts2 rs2 _) πs 
     (rs1', rs2') = pad "substRCon" top rs1 rs2
     strSub x r2 = meetListWithPSubs defaults πs ss x r2
     strSubR x r2 = meetListWithPSubsRef πs ss x r2
+    su = carrierBinderSubst t1 t2
+-- An application carrier instantiated with an application property conjoins
+-- the property's function, argument, and top refinement with the target's,
+-- renaming the property's binders to the target's, as for constructor
+-- applications. Other presentations of an equal carrier are refused above.
+substRCon _ (rp, RProp ss t1@(RAppTy f1 x1 r1)) t2@(RAppTy f2 x2 _) πs r2' =
+    RAppTy (F.subst su (strSub f1 f2)) (F.subst su (strSub x1 x2)) (meetListWithPSubs defaults πs ss r1 r2')
+  where
+    defaults = thd3 <$> pargs rp
+    strSub x r2 = meetListWithPSubs defaults πs ss x r2
+    su = carrierBinderSubst t1 t2
+substRCon msg su t _ _ = {- panic Nothing -} errorP "substRCon: " $ msg ++ " " ++ showpp (su, t)
 
-    su = F.mkSubst $ zipWith (\s1 s2 -> (s1, F.EVar s2)) (rvs t1) (rvs t2)
-
+-- Rename the value binders of an instantiated predicate carrier to those of the
+-- target carrier, in their common traversal order.
+carrierBinderSubst :: SpecType -> SpecType -> F.Subst
+carrierBinderSubst t1 t2 = F.mkSubst $ zipWith (\s1 s2 -> (s1, F.EVar s2)) (rvs t1) (rvs t2)
+  where
     rvs = foldReft False (\_ r acc -> rvReft r : acc) []
     rvReft r = let F.Reft (s, _) = toReft r in s
-substRCon msg su t _ _ = {- panic Nothing -} errorP "substRCon: " $ msg ++ " " ++ showpp (su, t)
 
 pad :: [Char] -> (a -> a) -> [a] -> [a] -> ([a], [a])
 pad _ f [] ys   = (f <$> ys, ys)
