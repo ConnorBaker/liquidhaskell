@@ -469,6 +469,8 @@ tests fixture compiler optimization =
                 , ("DefaultDomain", UnsafeAt [10])
                 , ("DefaultHoleGood", Safe)
                 , ("DerivedDefaultGood", Safe)
+                , ("InferredOrderedBoolGood", Safe)
+                , ("InferredOrderedBoolFalse", UnsafeAt [10])
                 ]
             )
         ,
