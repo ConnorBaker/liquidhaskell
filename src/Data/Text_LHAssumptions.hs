@@ -9,7 +9,7 @@ module Data.Text_LHAssumptions where
 
 import Data.Maybe_LHAssumptions ()
 import Data.Primitive.ByteArray (ByteArray, sizeofByteArray)
-import Data.Text (Text, append, drop, empty, length, null, pack, singleton, span, split, uncons)
+import Data.Text (Text, append, count, drop, empty, length, null, pack, singleton, span, split, stripPrefix, stripSuffix, toCaseFold, uncons)
 import qualified Data.Text.Internal
 import qualified Data.Text.Unsafe
 import Data.Tuple_LHAssumptions ()
@@ -212,4 +212,53 @@ assume Data.Text.split
   :: (Char -> Bool)
   -> {t:Text | tvalid t}
   -> [{piece:Text | tvalid piece}]
+@-}
+
+-- text-2.1.3 Data/Text.hs:2027-2030: stripPrefix p t returns, when
+-- isPrefixOf p t, the slice of t after plen bytes (Internal.hs:116-130 text).
+-- isPrefixOf (1969-1972) compares lengths and then the decoded scalar streams;
+-- stream' (Internal/Fusion.hs:101-120) reads a leader's continuation bytes
+-- without checking the slice end, so both inputs need valid slices. Equal
+-- scalars have equal UTF-8 encodings, so on success the first plen bytes of t
+-- are p's bytes and the remainder starts on a scalar boundary.
+--
+-- stripSuffix (2093-2096) returns the first len - plen bytes of t when
+-- isSuffixOf p t, which (1976-1982) compares the last plen bytes of t with p
+-- by byte equality (Eq Text, 360-363), within bounds and without decoding.
+-- Any bounded inputs are therefore accepted. Only when both are valid does the
+-- cut fall on a scalar boundary: a nonempty valid p begins with a leader byte,
+-- and a leader byte in valid t begins a scalar.
+--
+-- toCaseFold (895-898) returns empty for empty input, and otherwise caseConvert
+-- (Internal/Transformation.hs:82-160, with foldMapping at 163-164), which
+-- decodes each scalar of a valid slice and writes the UTF-8 encoding of its
+-- case folding. The result is valid; it may hold more scalars and a different
+-- number of bytes than the input, so no length relation is stated.
+--
+-- count (1864-1869) raises emptyError on an empty pattern (null compares the
+-- stored byte length). A one-scalar pattern is counted by countChar, which
+-- streams t; longer patterns by the length of the indices list
+-- (Internal/Search.hs:49-56). isSingleton (617-618) streams the pattern. The
+-- result is a list length or a count, so it is nonnegative.
+{-@
+assume Data.Text.stripPrefix
+  :: p:{Text | tvalid p}
+  -> t:{Text | tvalid t}
+  -> Maybe {r:Text | tvalid r
+                  && tbytes r == tbytes t - tbytes p
+                  && tlen r == tlen t - tlen p}
+
+assume Data.Text.stripSuffix
+  :: p:Text
+  -> t:Text
+  -> Maybe {r:Text | tbytes r == tbytes t - tbytes p
+                  && (tvalid p && tvalid t =>
+                        (tvalid r && tlen r == tlen t - tlen p))}
+
+assume Data.Text.toCaseFold :: t:{Text | tvalid t} -> {v:Text | tvalid v}
+
+assume Data.Text.count
+  :: pat:{Text | tvalid pat && 0 < tbytes pat}
+  -> t:{Text | tvalid t}
+  -> {v:Int | 0 <= v}
 @-}
