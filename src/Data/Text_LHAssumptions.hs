@@ -143,6 +143,24 @@ instance Ord Text where
   assume max :: x:Text -> y:Text -> {v:Text | v == x || v == y}
 @-}
 
+-- text-2.1.3 Data/Text.hs:360-364: Text's (==) is True exactly when the stored
+-- byte lengths agree and A.equal finds the two byte slices identical
+-- (Data/Text/Array.hs:309-313: compareInternal over that length is 0); it
+-- does not compare arrays or offsets. (/=) is the class default.
+-- Logical Text values are representations (array, offset, length), so (==)
+-- is not their equality: equal content at different offsets compares True.
+-- Only what follows from the definition is stated: equal representations
+-- compare True, and True means equal byte lengths and identical slices, so
+-- equal validity (every Text is bounded, and tutf8 is a property of the
+-- slice) and, for valid slices, equal scalar counts.
+{-@
+instance Eq Text where
+  assume (==) :: x:Text -> y:Text
+    -> {v:Bool | (x == y => v)
+                 && (v => (tbytes x == tbytes y && (tvalid x <=> tvalid y)
+                           && (tvalid x => tlen x == tlen y)))}
+@-}
+
 -- text-2.1.3 Data/Text/Unsafe.hs:150-165: lengthWord8 reads the stored byte
 -- length; takeWord8 and dropWord8 slice without checking, keeping their
 -- argument's array and adjusting offset and length by k. unsafeTail (59-66)
