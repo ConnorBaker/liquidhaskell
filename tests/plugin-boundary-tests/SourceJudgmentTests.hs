@@ -26,6 +26,7 @@ tests fixture compiler optimization =
                , checkedInterfaces ObjectCode "logical-measure interfaces" "lh-logical-interface" "assumed-predicates" "LogicalCarrierGood" ["--adt"] [("LogicalCarrierClient", Safe), ("LogicalCarrierClientFalse", UnsafeAt [7, 11])]
                , checkedInterfaces ObjectCode "local map laws and imported counterclaim" "lh-map-composition" "map-composition" "MapCompositionLaws" ["--adt"] [("MapCompositionFalse", UnsafeAt [9])]
                , checkedInterfaces ObjectCode "imported opaque identity, explicit trust, and counterclaim" "lh-opaque-interface" "opaque-reflection" "OpaqueProducer" [] [("OpaqueClient", Safe), ("OpaqueClientAssumed", Safe), ("OpaqueClientFalse", UnsafeAt [8])]
+               , checkedInterfaces ObjectCode "imported derived equality" "lh-derived-equality" "derived-equality" "DerivedEqProducer" [] [("DerivedEqClient", Safe), ("DerivedEqClientFalse", UnsafeAt [7])]
                , checkedInterfaces ObjectCode "imported first-order measure selectors" "lh-selector-interface" "callback-projections" "SelectorProducer" [] [("SelectorClientGood", Safe), ("SelectorClientFalse", UnsafeAt [8])]
                , checkedInterfaces ObjectCode "imported higher-order callback selectors" "lh-callback-interface" "callback-projections" "CallbackProducer" [] [("CallbackClientGood", Safe), ("CallbackClientFalse", UnsafeAt [13])]
                , checkedInterfaces InterfaceOnly "interface-only higher-order callback publication" "lh-callback-interface-only" "callback-projections" "CallbackProducer" [] [("CallbackClientGood", Safe), ("CallbackClientFalse", UnsafeAt [13])]
@@ -419,6 +420,9 @@ tests fixture compiler optimization =
                 , ("TextSplitOnFalse", UnsafeAt [9])
                 , ("TextSplitOnEmptyBad", UnsafeAt [8])
                 , ("TextSplitOnRawBad", UnsafeAt [8])
+                , ("TextEqGood", Safe)
+                , ("TextEqFalse", UnsafeAt [7, 11, 15, 19, 24, 29])
+                , ("TextEqRepresentationProbe", UnsafeAt [15])
                 , -- GHC-generated dictionary binders have no position of their
                   -- own; their obligations belong to the use that demands them.
                   ("TextGeneratedOrdGood", Safe)
@@ -755,6 +759,15 @@ tests fixture compiler optimization =
             ,
                 [ ("IntegerOrderingGood", Safe)
                 , ("IntegerOrderingBad", UnsafeAt [5])
+                ]
+            )
+        ,
+            ( "derived-equality"
+            , []
+            ,
+                [ ("DerivedEqGood", Safe)
+                , ("DerivedEqFalse", UnsafeAt [9, 13, 17])
+                , ("DerivedEqExcluded", UnsafeAt [14, 21, 31, 43, 50])
                 ]
             )
         ,
