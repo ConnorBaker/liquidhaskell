@@ -304,7 +304,7 @@ makeGhcSpec0 boxes stratNames cfg ghcTyLookupEnv tcg instEnvs lenv localVars src
         (completeMeasures : M.elems resolvedDeclarations)
   ((dg1, measEnv0), constructorSupport) <- makeMeasEnv coreToLg elaborate env tycEnv sigEnv specs allMeasures formationMeasures
   let logicalCatalog = prepareLogicalCatalog (Bare.meMeasureSpec measEnv0)
-  dictionaries <- Bare.makeSpecDictionaries env sigEnv (name, mySpec) (M.toList iSpecs2)
+  dictionaries <- Bare.makeSpecDictionaries tcg env sigEnv (name, mySpec) (M.toList iSpecs2)
   let (dg2, (specInstances, sig, generatedSigs, sourceAssumptions, sourceOwners)) = withDiagnostics $ makeSpecSig dictionaries stratNames cfg name mySpec iSpecs2 env sigEnv tycEnv measEnv0 (_giCbs src)
   auxiliaryChecks <- Ghc.liftIO $ IORef.newIORef []
   let elaborateOwned owner location ty =

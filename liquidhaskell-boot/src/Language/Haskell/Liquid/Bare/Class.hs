@@ -56,6 +56,15 @@ import           Language.Haskell.Liquid.Bare.Resolve       as Bare
 import           Language.Haskell.Liquid.Bare.Expand        as Bare
 import           Language.Haskell.Liquid.Bare.Misc         as Bare
 
+import           Language.Haskell.Liquid.Bare.ToBare (specToBare)
+import qualified GHC.Builtin.Names        as Names (eqClassName)
+import qualified GHC.Core.Class           as Class (Class (..), classMethods)
+import qualified GHC.Core.DataCon         as DataCon (dataConOrigArgTys, isVanillaDataCon)
+import qualified GHC.Core.InstEnv         as InstEnv (ClsInst (..))
+import qualified GHC.Core.TyCo.Rep        as Rep (mkVisFunTysMany, scaledThing)
+import qualified GHC.Hs                   as Hs
+import qualified GHC.Tc.Types             as Tc (TcGblEnv (..))
+import           GHC.Types.Name.Reader (unLocWithUserRdr)
 import           Text.PrettyPrint.HughesPJ (Doc, text)
 import qualified Control.Exception                 as Ex
 import Control.Monad (forM, guard)
@@ -402,6 +411,7 @@ makeMethod env sigEnv name (lx, bt) = (name, mbV,) <$> Bare.cookSpecTypeE env si
 
 -------------------------------------------------------------------------------
 makeSpecDictionaries ::
+    Tc.TcGblEnv ->
     Bare.Env ->
     Bare.SigEnv ->
     (ModName, Ms.BareSpec) ->
@@ -411,10 +421,14 @@ makeSpecDictionaries ::
 -- The module's own instance declarations, then those it may use: its own and
 -- imported ones. An imported declaration is a premise its owner established
 -- (or, under --compile-spec, trusted); only the declaring module checks it.
-makeSpecDictionaries env sigEnv spec0 specs =
+makeSpecDictionaries tcg env sigEnv spec0 specs =
     do
         (instances, specDicts, dictionaryTypes) <- makeSpecDictionary env sigEnv spec0
         imported <- mapM (makeSpecDictionary env sigEnv) specs
+        instEnvs <- Ghc.tcGetInstEnvs
+        -- Assumed, so not among the declared (checked) dictionaries.
+        let derived = derivedEqualityInstances tcg instEnvs (dfromList $ specDicts ++ concatMap (\(_, dictionaries, _) -> dictionaries) imported)
+        derivedDicts <- resolveDictionaries env (map (makeSpecDictionaryOne env sigEnv (fst spec0)) derived)
         let allDictionaryTypes = dictionaryTypes ++ concatMap (\(_, _, signatures) -> signatures) imported
             declarations = M.fromListWith (flip (++)) [(dictionary, [GM.fSrcSpan signature]) | (dictionary, signature) <- allDictionaryTypes]
             duplicates = [errDupSpecs (pprint dictionary) locations :: Error | (dictionary, locations@(_ : _ : _)) <- M.toList declarations]
@@ -422,11 +436,116 @@ makeSpecDictionaries env sigEnv spec0 specs =
             err : _ -> Ghc.liftIO $ Ex.throwIO err
             [] -> pure ()
         pure
-            ( instances
+            ( instances ++ derived
             , dfromList specDicts
-            , dfromList $ specDicts ++ concatMap (\(_, dictionaries, _) -> dictionaries) imported
+            , dfromList $ specDicts ++ derivedDicts ++ concatMap (\(_, dictionaries, _) -> dictionaries) imported
             , allDictionaryTypes
             )
+
+-- | Stock-derived equality. Haskell 2010 Report, chapter 11 (Specification
+-- of Derived Instances), section 11.1: a derived (==) holds exactly when both
+-- values have the same constructor and their corresponding fields are (==).
+-- GHC 9.14.1 generates only (==) for stock Eq (GHC/Tc/Deriv/Generate.hs:
+-- 218-261), and for a data declaration a deriving clause without a strategy
+-- derives a stock class by stock deriving (GHC/Tc/Deriv.hs:1524-1576,
+-- GHC/Tc/Deriv/Utils.hs:857-881).
+--
+-- When every field's (==) is the logical equality of its values, the derived
+-- (==) is therefore the logical equality of the datatype's values. This
+-- module's monomorphic data types whose own deriving clause derives Eq by the
+-- stock strategy, and whose constructors are vanilla, receive that contract as
+-- an assumed instance method, published to importers. A field type qualifies
+-- when its Eq instance contract is exactly @x:t -> y:t -> {v | v <=> x = y}@
+-- or it is such a derived type of this module; the least fixed point leaves
+-- recursive types out. An authored instance specification takes precedence.
+-- No other instance, e.g. one derived via another type, a newtype, a type
+-- with a parameter, or one whose field's (==) is not logical equality (such
+-- as Text's, which compares content while its logical values are
+-- representations), receives a contract.
+derivedEqualityInstances :: Tc.TcGblEnv -> Ghc.InstEnvs -> DEnv Ghc.Var LocSpecType -> [RInstance LocBareType]
+derivedEqualityInstances tcg instEnvs (DEnv known) = map instanceOf (accept [])
+  where
+    candidates =
+        [ (InstEnv.is_cls inst, ty, tc, InstEnv.is_dfun inst)
+        | inst <- Tc.tcg_insts tcg
+        , Class.className (InstEnv.is_cls inst) == Names.eqClassName
+        , null (InstEnv.is_tvs inst)
+        , [ty] <- [InstEnv.is_tys inst]
+        , Just (tc, []) <- [Ghc.splitTyConApp_maybe ty]
+        , Ghc.getName tc `elem` stockEqualities
+        , not (M.member (InstEnv.is_dfun inst) known)
+        , all DataCon.isVanillaDataCon (Ghc.tyConDataCons tc)
+        ]
+    accept accepted = case [candidate | candidate@(cls, _, tc, _) <- candidates, tc `notElem` accepted, all (qualifies cls accepted) (fields tc)] of
+        [] -> [candidate | candidate@(_, _, tc, _) <- candidates, tc `elem` accepted]
+        new -> accept (accepted ++ [tc | (_, _, tc, _) <- new])
+    fields tc = [Rep.scaledThing field | constructor <- Ghc.tyConDataCons tc, field <- DataCon.dataConOrigArgTys constructor]
+    qualifies cls accepted ty = case Ghc.splitTyConApp_maybe ty of
+        Just (tc, []) | tc `elem` accepted -> True
+        _ -> case Ghc.lookupInstEnv False instEnvs cls [ty] of
+            ([(inst, _)], _, _)
+                | Just methods <- M.lookup (Ghc.is_dfun inst) known
+                , Just signature <- M.lookup equalitySymbol methods ->
+                    meansEquality (val (fromRISig signature))
+            _ -> False
+    instanceOf (cls, ty, _, dfun) =
+        RI
+            { riclass = tyConBTyCon (Class.classTyCon cls)
+            , riDictName = Just (makeGHCLHNameLocatedFromId dfun)
+            , ritype = [located (specToBare (ofType ty :: SpecType))]
+            , risigs =
+                -- Instance method keys are the method's occurrence name.
+                [ (located (makeGHCLHName (Ghc.getName selector) equalitySymbol), RIAssumed (located (specToBare (equalityContract ty))))
+                | selector <- Class.classMethods cls
+                , F.symbol (Ghc.getOccString selector) == equalitySymbol
+                ]
+            }
+      where
+        located = F.atLoc (GM.locNamedThing dfun)
+    stockEqualities =
+        [ Ghc.unLoc (Hs.tcdLName declaration)
+        | Just group <- [Tc.tcg_rn_decls tcg]
+        , Ghc.L _ declaration@Hs.DataDecl{Hs.tcdDataDefn = Hs.HsDataDefn{Hs.dd_cons = Hs.DataTypeCons False _, Hs.dd_derivs = clauses}} <- Hs.tyClGroupTyClDecls (Hs.hs_tyclds group)
+        , Ghc.L _ clause <- clauses
+        , maybe True (stock . Ghc.unLoc) (Hs.deriv_clause_strategy clause)
+        , Ghc.L _ Hs.HsSig{Hs.sig_body = body} <- derivedClasses (Ghc.unLoc (Hs.deriv_clause_tys clause))
+        , Just name <- [Hs.hsTyGetAppHead_maybe body]
+        , unLocWithUserRdr name == Names.eqClassName
+        ]
+    stock Hs.StockStrategy{} = True
+    stock _ = False
+    derivedClasses (Hs.DctSingle _ ty) = [ty]
+    derivedClasses (Hs.DctMulti _ tys) = tys
+
+equalitySymbol :: F.Symbol
+equalitySymbol = "=="
+
+equalityContract :: Ghc.Type -> SpecType
+equalityContract ty =
+    fromRTypeRep
+        representation
+            { ty_binds = [x, y]
+            , ty_res = strengthen (ty_res representation) (ofReft (F.Reft (F.vv_, F.PIff (F.EVar F.vv_) (F.PAtom F.Eq (F.EVar x) (F.EVar y)))))
+            }
+  where
+    representation = toRTypeRep (ofType (Rep.mkVisFunTysMany [ty, ty] Ghc.boolTy) :: SpecType)
+    x = "x"
+    y = "y"
+
+-- | The contract @x:t -> y:t -> {v:Bool | v <=> x = y}@, up to binder names
+-- and the orientation of each connective.
+meansEquality :: SpecType -> Bool
+meansEquality ty = case (ty_binds representation, ty_args representation, rTypeReft (ty_res representation)) of
+    ([x, y], [left, right], F.Reft (v, predicate)) ->
+        null (ty_vars representation)
+            && null (ty_preds representation)
+            && all isTauto left
+            && all isTauto right
+            && F.conjuncts predicate `elem` [[F.PIff a b] | equal <- equalities x y, (a, b) <- [(F.EVar v, equal), (equal, F.EVar v)]]
+    _ -> False
+  where
+    representation = toRTypeRep ty
+    equalities x y = [F.PAtom relation a b | relation <- [F.Eq, F.Ueq], (a, b) <- [(F.EVar x, F.EVar y), (F.EVar y, F.EVar x)]]
 
 makeSpecDictionary ::
     Bare.Env ->
