@@ -430,8 +430,11 @@ splitsCWithVariance ::
     [CheckedSpecType] ->
     [Variance] ->
     CG [FixSubC]
+-- A variance list is a partial description: an argument it does not cover has
+-- unknown variance, not none. Primitive tycons (TVar#, MutVar#, ...) report no
+-- type variables, so their arguments are related in both directions.
 splitsCWithVariance emit γ t1s t2s variants =
-    concatMapM (\(t1, t2, v) -> splitfWithVariance (\s1 s2 -> splitCheckedCWith emit (typeclass (getConfig γ)) (SubC γ s1 s2)) t1 t2 v) (zip3 t1s t2s variants)
+    concatMapM (\(t1, t2, v) -> splitfWithVariance (\s1 s2 -> splitCheckedCWith emit (typeclass (getConfig γ)) (SubC γ s1 s2)) t1 t2 v) (zip3 t1s t2s (variants ++ repeat Bivariant))
 
 rsplitsCWithVariance ::
     ([RPVar] -> CGEnv -> CheckedSpecType -> CheckedSpecType -> CG [FixSubC]) ->
