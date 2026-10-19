@@ -431,6 +431,21 @@ tests fixture compiler optimization =
                 ]
             )
         ,
+            -- Strict TVar/IORef fields unpack, under optimization, to primitive
+            -- tycons that report no type variables. Their element types must
+            -- still be related, or a callback's environment is solved to false.
+            ( "primitive-variance"
+            , ["--check-derived", "--total-Haskell", "--check-refinements", "--environment-reduction"]
+            ,
+                [ ("TVarCallbackBad", UnsafeAt [27])
+                , ("TVarCallbackGood", Safe)
+                , ("TVarParameterBad", UnsafeAt [27])
+                , ("IORefCallbackBad", UnsafeAt [24])
+                , ("IORefCallbackGood", Safe)
+                , ("LocalRefCallbackBad", UnsafeAt [33])
+                ]
+            )
+        ,
             ( "bounds"
             , []
             ,
