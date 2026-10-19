@@ -446,6 +446,19 @@ tests fixture compiler optimization =
                 ]
             )
         ,
+            -- An instance method's inferred type is solved in its own query and
+            -- carried into later ones. Its eliminated solution must not name a
+            -- formal of another kvar whose actual was a do-bound local.
+            ( "noncut-export"
+            , ["--check-derived", "--total-Haskell", "--check-refinements", "--environment-reduction"]
+            ,
+                [ ("NoncutExportShow", Safe)
+                , ("NoncutExportNoShow", Safe)
+                , ("NoncutExportNoShowBad", UnsafeAt [71])
+                , ("NoncutExportTopLevel", Safe)
+                ]
+            )
+        ,
             ( "bounds"
             , []
             ,
