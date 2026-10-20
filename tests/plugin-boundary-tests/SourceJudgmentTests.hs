@@ -507,7 +507,9 @@ tests fixture compiler optimization =
             )
         ,
             -- A failing proof group does not hide later groups' diagnostics.
-            -- Each expectation is upstream's report for the same source.
+            -- Each expectation is upstream's report for the same source, except
+            -- that a false value does not hide a group that does not depend on
+            -- it, whichever its source order (upstream reports [5] for First).
             ( "group-failures"
             , []
             ,
@@ -516,6 +518,8 @@ tests fixture compiler optimization =
                 , ("GroupFailuresExpectedSafe", UnsafeAt [10, 13, 15])
                 , ("GroupFailuresAuthoredResult", UnsafeAt [11, 17])
                 , ("GroupFailuresAuthoredBody", UnsafeAt [11, 17])
+                , ("GroupFailuresFalseValueFirst", UnsafeAt [5, 9])
+                , ("GroupFailuresFalseValueLast", UnsafeAt [5, 9])
                 ]
             )
         ,
@@ -829,12 +833,15 @@ tests fixture compiler optimization =
             , ["--reflection", "--ple"]
             ,
                 [ ("TransitiveRewriteContractGood", Safe)
+                , ("RewriteUserFirstGood", Safe)
                 , -- Rejected callees retain only their independently checked
                   -- contracts, so their callers cannot borrow the false claim.
                   ("TransitiveRewriteFalse", UnsafeAt [18])
                 , ("MutualRewriteFalse", UnsafeAt [10, 16])
-                , ("ExplicitRewriteCycleFalse", UnsafeAt [15])
-                , ("MediatedRewriteCycleFalse", UnsafeAt [23])
+                , -- Each pair of false claims is independent: neither rule may
+                  -- justify the other, so neither group assumes the other's claim.
+                  ("ExplicitRewriteCycleFalse", UnsafeAt [10, 15])
+                , ("MediatedRewriteCycleFalse", UnsafeAt [14, 23])
                 , -- A rule's precondition names its value, not the argument binder.
                   ("RewritePreconditionBinderGood", Safe)
                 , ("RewritePreconditionBinderFalse", UnsafeAt [25])

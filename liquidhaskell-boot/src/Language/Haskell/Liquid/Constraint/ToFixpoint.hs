@@ -8,6 +8,7 @@ module Language.Haskell.Liquid.Constraint.ToFixpoint
   , sourceNativeEnv
   , refinementEQs
   , canRewrite
+  , rewriteCandidates
   ) where
 
 import           Prelude hiding (error)
@@ -348,14 +349,18 @@ makeRewrites sigs info sub = concatMap (makeRewriteOne tce) $ filter ((`S.member
 
     forbiddenRWs owner = proofDependents (giCbs (giSrc info)) rewrites [owner]
 
-    rewrites owner
-        | owner `S.member` globalRws = S.empty
-        | otherwise =
-            S.union globalRws $
-                S.fromList $
-                    M.lookupDefault [] owner (gsRewritesWith (gsRefl spec))
+    rewrites = rewriteCandidates (gsRefl spec)
 
     globalRws = S.map val $ gsRewrites $ gsRefl spec
+
+-- | The rewrite theorems an owner may use, before excluding those whose own
+-- proof depends on that owner. A global theorem uses none.
+rewriteCandidates :: GhcSpecRefl -> Var -> S.HashSet Var
+rewriteCandidates refl owner
+    | owner `S.member` globalRws = S.empty
+    | otherwise = S.union globalRws (S.fromList (M.lookupDefault [] owner (gsRewritesWith refl)))
+  where
+    globalRws = S.map val (gsRewrites refl)
 
 
 canRewrite :: S.HashSet F.Symbol -> F.Expr -> F.Expr -> Bool

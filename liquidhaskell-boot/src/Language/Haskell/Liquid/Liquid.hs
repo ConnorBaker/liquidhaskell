@@ -209,14 +209,22 @@ checkSourceTarget info = do
     -- Every group is checked, in proof-dependency order. A rejected claim stays
     -- an error, and later groups assume its checking target, as upstream's
     -- single query does. The verdict is safe only when every query is.
+    -- A group assumes only the callables its proof depends on, so a rejected
+    -- claim cannot make an unrelated group's query vacuous.
+    dependencies = sourceDependencies sourceInfo
+    dependencyEdges = HashMap.fromList [(key, map snd edges) | (key, _, edges) <- dependencies]
+    ownerKeys = HashMap.fromListWith (++) [(owner, [key]) | (key, cb, _) <- dependencies, owner <- letVars cb]
+    proofScope group =
+        let reached = reachable dependencyEdges [key | owner <- letVars group, key <- HashMap.lookupDefault [] owner ownerKeys]
+         in S.fromList [owner | (key, cb, _) <- dependencies, key `S.member` reached, owner <- letVars cb]
     go _ result callables available interfaces [] = pure (result, callables, available, interfaces)
     go phase result callables available interfaces ((number, component) : groups)
         | Just ordered <- directGroup component = do
-            (body, established, _) <- query checking [] callables available interfaces [] ordered AuthoredBodyAndFormation False
+            (body, established, _) <- query checking [] scoped available interfaces [] ordered AuthoredBodyAndFormation False
             continue (result <> body) established
         | otherwise = do
-            (admission, inferred, _) <- query admissionName [] callables available interfaces [] group IndependentBodyAndFormation False
-            let assumed = callables ++ filter ((`S.member` expected) . fst) inferred
+            (admission, inferred, _) <- query admissionName [] scoped available interfaces [] group IndependentBodyAndFormation False
+            let assumed = scoped ++ filter ((`S.member` expected) . fst) inferred
             (body, established, _) <- query checking [] assumed available' interfaces [] group AuthoredBody False
             -- Without an authored checking target, the body establishes no
             -- stronger claim than admission. Keep that inferred callable
@@ -229,6 +237,8 @@ checkSourceTarget info = do
             continue (result <> admission <> body) reusable
       where
         group = Graph.flattenSCC (fst component)
+        scope = proofScope group
+        scoped = filter ((`S.member` scope) . fst) callables
         available' = available `S.union` S.fromList (concatMap bindersOf group)
         admissionName = phase ++ ".admission." ++ show number
         checking = phase ++ ".checking." ++ show number
@@ -261,7 +271,7 @@ checkSourceTarget info = do
             (proof, _, completed) <-
                 if null rows
                     then pure (mempty, [], [])
-                    else query (checking ++ ".interfaces") (privateClaims ++ rows) (callables ++ established) available' interfaces [] [] IndependentBodyAndFormation False
+                    else query (checking ++ ".interfaces") (privateClaims ++ rows) (scoped ++ established) available' interfaces [] [] IndependentBodyAndFormation False
             let granted =
                     [ row
                     | row@(owner, method@MT{}) <- completed
@@ -537,11 +547,7 @@ compatibilityPrerequisites info = (before, after, blocked)
             (++)
             [(F.symbol owner, [key]) | (key, cb, _) <- indexed, owner <- S.toList (S.fromList (letVars cb))]
     edges = HashMap.fromList [(key, map snd dependencies) | (key, _, dependencies) <- indexed]
-    required = close S.empty [key | name <- S.toList roots, key <- HashMap.lookupDefault [] name owners]
-    close seen [] = seen
-    close seen (key : keys)
-        | key `S.member` seen = close seen keys
-        | otherwise = close (S.insert key seen) (HashMap.lookupDefault [] key edges ++ keys)
+    required = reachable edges [key | name <- S.toList roots, key <- HashMap.lookupDefault [] name owners]
     before = [cb | (key, cb, _) <- indexed, key `S.member` required]
     after = [cb | (key, cb, _) <- indexed, not (key `S.member` required)]
     methodOwners = S.fromList [owner | (owner, MT{}) <- methods]
@@ -550,6 +556,15 @@ compatibilityPrerequisites info = (before, after, blocked)
             `S.union` S.fromList
                 [dictionary | (dictionary, _) <- flattenBinds (giCbs (giSrc info)), isId dictionary, isDFunId dictionary]
     blocked = L.sortOn (not . isDFunId) (S.toList (pending `S.intersection` S.fromList (letVars before)))
+
+-- The keys reachable from the given keys, including those keys.
+reachable :: HashMap.HashMap Int [Int] -> [Int] -> S.HashSet Int
+reachable edges = go S.empty
+  where
+    go seen [] = seen
+    go seen (key : keys)
+        | key `S.member` seen = go seen keys
+        | otherwise = go (S.insert key seen) (HashMap.lookupDefault [] key edges ++ keys)
 
 -- A fixed checking interface permits separate inference. Without one, keep
 -- the definition and all its consumers in the same query: its input domain
@@ -592,12 +607,24 @@ proofGroups info = map ordered (Graph.stronglyConnComp vertices)
     acyclic (Graph.AcyclicSCC cb) = Just cb
     acyclic Graph.CyclicSCC{} = Nothing
 
--- The same directed proof dependencies serve body inference and compatibility
--- prerequisites. Consumer coupling is a separate inference choice in proofGroups.
+-- The same directed proof dependencies serve body inference, each group's
+-- assumed callables and compatibility prerequisites. Consumer coupling is a
+-- separate inference choice in proofGroups.
 sourceDependencies :: TargetInfo -> [(Int, CoreBind, [(F.Symbol, Int)])]
-sourceDependencies info = [(key, cb, dependencies key cb) | (key, cb) <- numbered]
+sourceDependencies info = [(key, cb, dependencies key cb ++ filter (usable key . snd) (rules cb)) | (key, cb) <- numbered]
   where
     spec = giSpec info
+    -- A rewrite theorem justifies its users without a Core call, so it is
+    -- established before them, unless its own proof support reaches that
+    -- user: no rule edge closes a cycle.
+    rules cb =
+        [ (F.symbol rule, key)
+        | rule <- S.toList (S.unions (map (rewriteCandidates (gsRefl spec)) (letVars cb)))
+        , key <- HashMap.lookupDefault [] (F.symbol rule) owners
+        ]
+    usable key rule = not (key `S.member` HashMap.lookupDefault S.empty rule support)
+    support = HashMap.fromList [(rule, reachable candidates [rule]) | rule <- S.toList (S.fromList [rule | (_, cb) <- numbered, (_, rule) <- rules cb])]
+    candidates = HashMap.fromList [(key, map snd (dependencies key cb ++ rules cb)) | (key, cb) <- numbered]
     numbered = zip [0 :: Int ..] (giCbs (giSrc info))
     owners =
         HashMap.fromListWith
