@@ -1071,21 +1071,26 @@ primitiveQuery flags native location embeddings measures projections instances s
     lowerAs expected expression = case expression of
         F.EVar name | isSource name -> pure (variable name)
         _
-            | (F.EVar name, [argument]) <- application expression
+            | (F.EVar name, arguments@(_ : _)) <- application expression
             , isSource name -> do
                 -- A source function (e.g. a lifted measure) applied to a
                 -- logical carrier has no source value to consume. The
                 -- application keeps its logical reading, sorted by fixpoint
                 -- against the function's source sort like any primitive.
-                lowered <- lower argument
-                logical <- logicalOperand lowered
+                -- The reading belongs to the whole application: a curried
+                -- prefix of a multi-argument function would be a function-
+                -- sorted logical result, which has no carrier.
+                lowered <- traverse lower arguments
+                logical <- or <$> traverse logicalOperand lowered
                 if logical
                     then case F.lookupSEnv name declarations of
-                        Just schema -> logicalOperationOn False Nothing [(name, schema)] (apply name) [lowered]
+                        Just schema -> logicalOperationOn False Nothing [(name, schema)] (apply name) lowered
                         Nothing -> die ("no source sort for " ++ F.showpp name)
-                    else do
-                        argument' <- if logicalInteger argument then integerArgument (variable name) lowered else pure lowered
-                        pure (applyQuery (variable name) argument')
+                    else
+                        let step function (argument, argument') = do
+                                argument'' <- if logicalInteger argument then integerArgument function argument' else pure argument'
+                                pure (applyQuery function argument'')
+                         in foldM step (variable name) (zip arguments lowered)
         _
             | (F.EVar name, argument : extras) <- application expression
             , not (isSource name)
