@@ -673,11 +673,14 @@ primitiveQuery flags native location embeddings measures projections instances s
                 (Just (typeSort embeddings resultType))
                 original
       where
-        -- These rows declare term values, including lexical captures. None
-        -- declares a sort alias: a term label cannot give an FObj its meaning.
-        environment =
-            F.fromListSEnv [(name, typeSort embeddings (specTypeToQueryType ty)) | (name, ty) <- telescope signature]
-                <> declarations
+        environment = schemas
+    -- These rows declare term values, including lexical captures. None
+    -- declares a sort alias: a term label cannot give an FObj its meaning.
+    -- A bound callback's row is its telescope sort, as for a declaration.
+    schemas =
+        F.fromListSEnv [(name, typeSort embeddings (specTypeToQueryType ty)) | (name, ty) <- telescope signature]
+            <> declarations
+      where
         telescope (RAllT _ rest _) = telescope rest
         telescope (RAllP _ rest) = telescope rest
         telescope (RFun binder _ domain rest _) = (binder, domain) : telescope rest
@@ -1083,7 +1086,7 @@ primitiveQuery flags native location embeddings measures projections instances s
                 lowered <- traverse lower arguments
                 logical <- or <$> traverse logicalOperand lowered
                 if logical
-                    then case F.lookupSEnv name declarations of
+                    then case F.lookupSEnv name schemas of
                         Just schema -> logicalOperationOn False Nothing [(name, schema)] (apply name) lowered
                         Nothing -> die ("no source sort for " ++ F.showpp name)
                     else
