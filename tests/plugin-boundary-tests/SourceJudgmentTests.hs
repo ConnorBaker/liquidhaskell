@@ -459,6 +459,18 @@ tests fixture compiler optimization =
                 ]
             )
         ,
+            ( "source-application"
+            , ["--check-refinements"]
+            ,
+                [ ("LogicalOperandsGood", Safe)
+                , ("LogicalOperandsFalse", UnsafeAt [14])
+                , ("MixedOperandsGood", Safe)
+                , ("MixedOperandsFalse", UnsafeAt [12])
+                , ("CallbackOperandsGood", Safe)
+                , ("CallbackOperandsFalse", UnsafeAt [11])
+                ]
+            )
+        ,
             ( "bounds"
             , []
             ,
