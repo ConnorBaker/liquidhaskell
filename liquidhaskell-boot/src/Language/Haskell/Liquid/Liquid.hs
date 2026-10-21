@@ -217,15 +217,19 @@ checkSourceTarget info = do
     proofScope group =
         let reached = reachable dependencyEdges [key | owner <- letVars group, key <- HashMap.lookupDefault [] owner ownerKeys]
          in S.fromList [owner | (key, cb, _) <- dependencies, key `S.member` reached, owner <- letVars cb]
+    -- Its admitted interfaces are limited the same way. A row is read only
+    -- where a dictionary body under check supplies the row's method owner as
+    -- a field (admittedField), and that owner is then a free variable of the
+    -- group, so in its scope: no group loses a row it could read.
     go _ result callables available interfaces [] = pure (result, callables, available, interfaces)
     go phase result callables available interfaces ((number, component) : groups)
         | Just ordered <- directGroup component = do
-            (body, established, _) <- query checking [] scoped available interfaces [] ordered AuthoredBodyAndFormation False
+            (body, established, _) <- query checking [] scoped available scopedInterfaces [] ordered AuthoredBodyAndFormation False
             continue (result <> body) established
         | otherwise = do
-            (admission, inferred, _) <- query admissionName [] scoped available interfaces [] group IndependentBodyAndFormation False
+            (admission, inferred, _) <- query admissionName [] scoped available scopedInterfaces [] group IndependentBodyAndFormation False
             let assumed = scoped ++ filter ((`S.member` expected) . fst) inferred
-            (body, established, _) <- query checking [] assumed available' interfaces [] group AuthoredBody False
+            (body, established, _) <- query checking [] assumed available' scopedInterfaces [] group AuthoredBody False
             -- Without an authored checking target, the body establishes no
             -- stronger claim than admission. Keep that inferred callable
             -- rather than its weaker reflected/default view.
@@ -239,7 +243,8 @@ checkSourceTarget info = do
         group = Graph.flattenSCC (fst component)
         scope = proofScope group
         scoped = filter ((`S.member` scope) . fst) callables
-        available' = available `S.union` S.fromList (concatMap bindersOf group)
+        scopedInterfaces = let AdmittedInterfaces rows = interfaces in AdmittedInterfaces (filter ((`S.member` scope) . fst) rows)
+        available' =available `S.union` S.fromList (concatMap bindersOf group)
         admissionName = phase ++ ".admission." ++ show number
         checking = phase ++ ".checking." ++ show number
         continue checked established = do
@@ -271,7 +276,7 @@ checkSourceTarget info = do
             (proof, _, completed) <-
                 if null rows
                     then pure (mempty, [], [])
-                    else query (checking ++ ".interfaces") (privateClaims ++ rows) (scoped ++ established) available' interfaces [] [] IndependentBodyAndFormation False
+                    else query (checking ++ ".interfaces") (privateClaims ++ rows) (scoped ++ established) available' scopedInterfaces [] [] IndependentBodyAndFormation False
             let granted =
                     [ row
                     | row@(owner, method@MT{}) <- completed
