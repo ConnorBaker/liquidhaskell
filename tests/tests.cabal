@@ -2912,6 +2912,7 @@ test-suite plugin-boundary-tests
     Paths_tests
     PublicationTests
     QueryAssertions
+    QueryJobsTests
     SourceJudgmentTests
     SourceImportTests
     SourceVariantFixtures

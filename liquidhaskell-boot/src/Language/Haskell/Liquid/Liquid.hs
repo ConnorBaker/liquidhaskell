@@ -16,6 +16,7 @@ import qualified Data.HashMap.Strict as HashMap
 import qualified Data.Maybe as Mb
 import qualified Data.List  as L
 import qualified Data.Graph as Graph
+import qualified Data.IntSet as IntSet
 import qualified Language.Haskell.Liquid.UX.DiffCheck as DC
 import           Language.Haskell.Liquid.Misc
 import qualified Language.Fixpoint.Misc as F
@@ -46,6 +47,7 @@ import           Language.Haskell.Liquid.Constraint.Fresh (specTypeKVars)
 import           Language.Haskell.Liquid.Constraint.Template (derivedVar, sourceCallableIdentity)
 import           Language.Haskell.Liquid.Constraint.Init (defaultTopVars, initCGI, prepareDefaultTypes)
 import           Language.Haskell.Liquid.Constraint.Qualifier (giQuals)
+import           Language.Haskell.Liquid.Constraint.Schedule (Node (..), runNodes)
 import qualified Language.Fixpoint.Types.Config as FC
 import           Language.Haskell.Liquid.Constraint.ToFixpoint
 import           Language.Haskell.Liquid.Constraint.Types
@@ -139,6 +141,15 @@ data SourceObligation
   | AuthoredBodyAndFormation
   deriving (Eq)
 
+-- What a node of a module's query sequence reports, and what later nodes may
+-- consume: the callables its group established and the interface rows its
+-- group was granted. The output of every node joins in sequence order.
+data Checked = Checked
+  { checkedOutput :: (Output Doc, AnnInfo SpecType, PublicationCheck)
+  , checkedCallables :: [(Var, SpecType)]
+  , checkedInterfaces :: [(Var, MethodType LocSpecType)]
+  }
+
 checkSourceTarget :: TargetInfo -> IO (Output Doc, AnnInfo SpecType, Maybe PublicationCheck)
 checkSourceTarget info = do
     if not (null blockedPrerequisites)
@@ -148,13 +159,9 @@ checkSourceTarget info = do
                 failure = F.Crash [(ErrOther location (text diagnostic), Nothing)] diagnostic
             pure (mempty{o_result = failure}, mempty, Nothing)
         else do
+            checked <- runNodes (queryJobs (getConfig info)) querySequence
             let initial = (mempty{o_result = F.Safe mempty}, mempty, F.Safe mempty)
-            (before, callables, available, interfaces) <- go ".prerequisite" initial [] S.empty mempty (numberedGroups prerequisiteBodies)
-            (declarations, _, _) <- query ".declarations" [] callables available interfaces declarationOwners [] IndependentBodyAndFormation False
-            (compatibility, _, _) <- query ".compatibility" closedMethods callables available interfaces [] [] IndependentBodyAndFormation False
-            (bodies, established, visible, completedInterfaces) <- go "" (before <> declarations <> compatibility) callables available interfaces (numberedGroups remainingBodies)
-            (admission, _, _) <- query ".admission" [] established visible completedInterfaces [] [] IndependentBodyAndFormation True
-            let (out, types, publication) = bodies <> admission
+                (out, types, publication) = L.foldl' (<>) initial (map checkedOutput checked)
                 checkedOwners = S.fromList (letVars (giCbs (giSrc sourceInfo)))
                 unowned = filter (not . (`S.member` checkedOwners) . F.val) (S.toList (gsFail (gsTerm (giSpec info))))
                 complete = out{o_result = o_result out `addErrors` makeFailErrors unowned []}
@@ -217,19 +224,63 @@ checkSourceTarget info = do
     proofScope group =
         let reached = reachable dependencyEdges [key | owner <- letVars group, key <- HashMap.lookupDefault [] owner ownerKeys]
          in S.fromList [owner | (key, cb, _) <- dependencies, key `S.member` reached, owner <- letVars cb]
-    -- Its admitted interfaces are limited the same way. A row is read only
-    -- where a dictionary body under check supplies the row's method owner as
-    -- a field (admittedField), and that owner is then a free variable of the
+
+    -- The module's queries, in checking order: the prerequisite groups, the
+    -- declarations and compatibility queries, the remaining groups and the
+    -- bodyless admission. Each node consumes what earlier nodes established:
+    -- the callables of their groups, and the interface rows their groups were
+    -- granted. A group reads only what its proof scope selects, so it depends
+    -- only on the earlier groups owning something in that scope (a group's
+    -- callables and rows are its own binders). The other queries read
+    -- everything their predecessors established. With one job each node reads
+    -- every earlier node, which is the sequential fold; with more, only its
+    -- dependencies (Schedule). The visible local facts (available) are fixed
+    -- by this order alone, never by a result, so they constrain no schedule.
+    querySequence =
+        [groupNode index group availableBefore | (index, group, availableBefore) <- zip3 [0 ..] prerequisiteGroups availability]
+            ++ [ Node [0 .. prerequisiteCount - 1] (preflight ".declarations" [] declarationOwners)
+               , Node [0 .. prerequisiteCount - 1] (preflight ".compatibility" closedMethods [])
+               ]
+            ++ [groupNode index group availableBefore | (index, group, availableBefore) <- zip3 [prerequisiteCount + 2 ..] sourceGroups (drop prerequisiteCount availability)]
+            ++ [Node (map fst indexedGroups) bodyless]
+      where
+        prerequisiteGroups = [(".prerequisite", group) | group <- numberedGroups prerequisiteBodies]
+        sourceGroups = [("", group) | group <- numberedGroups remainingBodies]
+        prerequisiteCount = length prerequisiteGroups
+        indexedGroups = zip [0 ..] prerequisiteGroups ++ zip [prerequisiteCount + 2 ..] sourceGroups
+        members (_, (_, component)) = Graph.flattenSCC (fst component)
+        -- The source facts visible before each group, and after the last.
+        availability = scanl (\available group -> available `S.union` S.fromList (concatMap bindersOf (members group))) S.empty (prerequisiteGroups ++ sourceGroups)
+        afterPrerequisites = availability !! prerequisiteCount
+        owners = HashMap.fromListWith (++) [(owner, [index]) | (index, group) <- indexedGroups, owner <- S.toList (S.fromList (letVars (members group)))]
+        groupNode index (phase, (number, component)) available =
+            Node
+                (IntSet.toAscList (IntSet.fromList [earlier | owner <- S.toList scope, earlier <- HashMap.lookupDefault [] owner owners, earlier < index]))
+                (\observed -> checkGroup phase number component available (scoped (concatMap checkedCallables observed)) (AdmittedInterfaces (scoped (rows observed))))
+          where
+            scope = proofScope (Graph.flattenSCC (fst component))
+            scoped = filter ((`S.member` scope) . fst)
+        -- Most groups are granted no row, and replacing by none changes nothing.
+        rows observed = let AdmittedInterfaces granted = L.foldl' replaceInterfaces mempty (filter (not . null) (map checkedInterfaces observed)) in granted
+        preflight suffix compatibilityRows declarations observed = do
+            (output, _, _) <- query suffix compatibilityRows (concatMap checkedCallables observed) afterPrerequisites (AdmittedInterfaces (rows observed)) declarations [] IndependentBodyAndFormation False
+            pure (Checked output [] [])
+        bodyless observed = do
+            (output, _, _) <- query ".admission" [] (concatMap checkedCallables observed) (last availability) (AdmittedInterfaces (rows observed)) [] [] IndependentBodyAndFormation True
+            pure (Checked output [] [])
+
+    -- A group's admitted interfaces are limited by its scope too. A row is read
+    -- only where a dictionary body under check supplies the row's method owner
+    -- as a field (admittedField), and that owner is then a free variable of the
     -- group, so in its scope: no group loses a row it could read.
-    go _ result callables available interfaces [] = pure (result, callables, available, interfaces)
-    go phase result callables available interfaces ((number, component) : groups)
+    checkGroup phase number component available callables interfaces
         | Just ordered <- directGroup component = do
-            (body, established, _) <- query checking [] scoped available scopedInterfaces [] ordered AuthoredBodyAndFormation False
-            continue (result <> body) established
+            (body, established, _) <- query checking [] callables available interfaces [] ordered AuthoredBodyAndFormation False
+            continue body established
         | otherwise = do
-            (admission, inferred, _) <- query admissionName [] scoped available scopedInterfaces [] group IndependentBodyAndFormation False
-            let assumed = scoped ++ filter ((`S.member` expected) . fst) inferred
-            (body, established, _) <- query checking [] assumed available' scopedInterfaces [] group AuthoredBody False
+            (admission, inferred, _) <- query admissionName [] callables available interfaces [] group IndependentBodyAndFormation False
+            let assumed = callables ++ filter ((`S.member` expected) . fst) inferred
+            (body, established, _) <- query checking [] assumed available' interfaces [] group AuthoredBody False
             -- Without an authored checking target, the body establishes no
             -- stronger claim than admission. Keep that inferred callable
             -- rather than its weaker reflected/default view.
@@ -238,13 +289,10 @@ checkSourceTarget info = do
                     [ (owner, if owner `HashMap.member` asserted && not (owner `S.member` expected) then ty else HashMap.lookupDefault ty owner inferredTypes)
                     | (owner, ty) <- established
                     ]
-            continue (result <> admission <> body) reusable
+            continue (admission <> body) reusable
       where
         group = Graph.flattenSCC (fst component)
-        scope = proofScope group
-        scoped = filter ((`S.member` scope) . fst) callables
-        scopedInterfaces = let AdmittedInterfaces rows = interfaces in AdmittedInterfaces (filter ((`S.member` scope) . fst) rows)
-        available' =available `S.union` S.fromList (concatMap bindersOf group)
+        available' = available `S.union` S.fromList (concatMap bindersOf group)
         admissionName = phase ++ ".admission." ++ show number
         checking = phase ++ ".checking." ++ show number
         continue checked established = do
@@ -276,7 +324,7 @@ checkSourceTarget info = do
             (proof, _, completed) <-
                 if null rows
                     then pure (mempty, [], [])
-                    else query (checking ++ ".interfaces") (privateClaims ++ rows) (scoped ++ established) available' scopedInterfaces [] [] IndependentBodyAndFormation False
+                    else query (checking ++ ".interfaces") (privateClaims ++ rows) (callables ++ established) available' interfaces [] [] IndependentBodyAndFormation False
             let granted =
                     [ row
                     | row@(owner, method@MT{}) <- completed
@@ -284,7 +332,7 @@ checkSourceTarget info = do
                     , Just _ <- [methodOrigin method]
                     , all (\ty -> not (any hasHole (F.val ty)) && null (specTypeKVars (F.val ty))) (Mb.catMaybes [tyInstance method, tyClass method])
                     ]
-            go phase (checked <> proof) (callables ++ established) available' (replaceInterfaces interfaces granted) groups
+            pure Checked{checkedOutput = checked <> proof, checkedCallables = established, checkedInterfaces = granted}
 
     -- Init and checkingSignatures select the last method checking target for an
     -- owner. Body success establishes that target, not every row sharing the

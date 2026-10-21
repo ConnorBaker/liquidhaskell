@@ -9,6 +9,7 @@ import qualified NativeJudgmentTests
 import qualified OpaqueIdentityTests
 import Paths_tests (getDataFileName)
 import qualified PublicationTests
+import qualified QueryJobsTests
 import qualified SourceImportTests
 import qualified SourceJudgmentTests
 import qualified StructuralRecursionTests
@@ -31,6 +32,7 @@ main = defaultMain $
                 , SourceImportTests.tests compiler optimization
                 , StructuralRecursionTests.tests getDataFileName compiler optimization
                 , OpaqueIdentityTests.tests compiler optimization
+                , QueryJobsTests.tests getDataFileName compiler optimization
                 ]
             | optimization <- [O0, O2]
             ]

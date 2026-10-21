@@ -11,6 +11,7 @@ module CompilerFixture (
     writeFixture,
     compile,
     compileHaskell,
+    transcript,
     assertMissingTotalityPolicy,
     assertPublication,
     assertSourceNameAbsent,
@@ -99,35 +100,7 @@ writeFixture relative directory name text = do
 compile :: Compiler -> CheckingMode -> Optimization -> Backend -> FilePath -> String -> [FilePath] -> [String] -> Expectation -> IO Compiled
 compile (Compiler ghc unit environment packageArguments) checking optimization backend directory name imports options expected = do
     let objects = directory </> "objects"
-        arguments =
-            packageArguments
-                ++ [ "-c"
-                   , "-" ++ show optimization
-                   , "-fforce-recomp"
-                   , "-XGHC2024"
-                   , "-no-user-package-db"
-                   , "-hide-package"
-                   , "liquidhaskell"
-                   , "-plugin-package-id"
-                   , unit
-                   , "-fplugin=LiquidHaskell"
-                   , "-fdiagnostics-color=never"
-                   , -- Keep compiler scratch files under the fixture's cleanup bracket.
-                     "-tmpdir"
-                   , objects
-                   , "-i"
-                   , "-i."
-                   ]
-                ++ case backend of
-                    ObjectCode -> []
-                    InterfaceOnly -> ["-fno-code", "-fwrite-interface"]
-                ++ map ("-i" ++) imports
-                ++ map ("-fplugin-opt=LiquidHaskell:" ++) (checkingOptions checking ++ options)
-                ++ ( case backend of
-                        ObjectCode -> ["-o", objects </> name ++ ".o"]
-                        InterfaceOnly -> []
-                   )
-                ++ ["-ohi", objects </> name ++ ".hi", name ++ ".hs"]
+        arguments = fixtureArguments packageArguments unit checking optimization backend objects name imports options
     createDirectoryIfMissing True objects
     (status, output) <- command environment (Just directory) ghc arguments
     let context = takeFileName directory ++ " / " ++ name ++ " / " ++ show optimization ++ " / " ++ show backend ++ "\n" ++ output
@@ -199,6 +172,45 @@ compile (Compiler ghc unit environment packageArguments) checking optimization b
         -- Publication and the independent clients below test admission.
         assertBool context (verdict "SAFE" results)
         assertBool context (not ("panic" `isInfixOf` map toLower context))
+
+fixtureArguments :: [String] -> String -> CheckingMode -> Optimization -> Backend -> FilePath -> String -> [FilePath] -> [String] -> [String]
+fixtureArguments packageArguments unit checking optimization backend objects name imports options =
+    packageArguments
+        ++ [ "-c"
+           , "-" ++ show optimization
+           , "-fforce-recomp"
+           , "-XGHC2024"
+           , "-no-user-package-db"
+           , "-hide-package"
+           , "liquidhaskell"
+           , "-plugin-package-id"
+           , unit
+           , "-fplugin=LiquidHaskell"
+           , "-fdiagnostics-color=never"
+           , -- Keep compiler scratch files under the fixture's cleanup bracket.
+             "-tmpdir"
+           , objects
+           , "-i"
+           , "-i."
+           ]
+        ++ case backend of
+            ObjectCode -> []
+            InterfaceOnly -> ["-fno-code", "-fwrite-interface"]
+        ++ map ("-i" ++) imports
+        ++ map ("-fplugin-opt=LiquidHaskell:" ++) (checkingOptions checking ++ options)
+        ++ ( case backend of
+                ObjectCode -> ["-o", objects </> name ++ ".o"]
+                InterfaceOnly -> []
+           )
+        ++ ["-ohi", objects </> name ++ ".hi", name ++ ".hs"]
+
+-- The exit status and transcript of the same compilation as 'compile', with
+-- further compiler arguments (e.g. RTS options) and no verdict expectation.
+transcript :: Compiler -> CheckingMode -> Optimization -> FilePath -> String -> [String] -> [String] -> IO (ExitCode, String)
+transcript (Compiler ghc unit environment packageArguments) checking optimization directory name options extra = do
+    let objects = directory </> "objects"
+    createDirectoryIfMissing True objects
+    command environment (Just directory) ghc (fixtureArguments packageArguments unit checking optimization ObjectCode objects name [] options ++ extra)
 
 strictOptions :: [String]
 strictOptions = checkingOptions Strict

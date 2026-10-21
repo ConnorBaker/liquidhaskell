@@ -123,6 +123,7 @@ defConfig = Config
   , notruetypes                   = False
   , nototality                    = False
   , cores                         = Just 1
+  , queryJobs                     = 1
   , minPartSize                   = FC.defaultMinPartSize
   , maxPartSize                   = FC.defaultMaxPartSize
   , smtsolver                     = Nothing
@@ -226,6 +227,14 @@ lhOptions =
         , "Use the given number of cores to solve logical constraints (default: 1)."
         , "Warning: unpredictable performance."
         , "See https://github.com/ucsd-progsys/liquidhaskell/issues/2562"
+        ]
+      )
+  , opt [] ["query-jobs"] (ReqArg (fm . setQueryJobs) "N")
+      (unlines
+        [ "Maximum number of a module's proof groups checked at once (default 1)"
+        , "A group is generated and solved once the earlier groups its proof"
+        , "depends on are checked. Verdicts, errors and saved queries are those"
+        , "of N = 1; only the solver's --save notices print as queries finish."
         ]
       )
   , opt [] ["min-part-size"] (ReqArg (fm . setMinPartSize) "N")
@@ -400,6 +409,9 @@ setSmtSolverOpt s c = c { smtsolver = Just (parseSMTSolver s) }
 
 setCores :: String -> Config -> Config
 setCores s c = c { cores = Just (readInt "cores" s) }
+
+setQueryJobs :: String -> Config -> Config
+setQueryJobs s c = c { queryJobs = readInt "query-jobs" s }
 
 setMinPartSize :: String -> Config -> Config
 setMinPartSize s c = c { minPartSize = readInt "min-part-size" s }

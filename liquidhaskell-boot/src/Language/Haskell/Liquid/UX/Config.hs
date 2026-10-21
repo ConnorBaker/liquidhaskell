@@ -59,6 +59,7 @@ data Config = Config
   , nototality               :: Bool       -- ^ disable totality check in definitions
   , pruneUnsorted            :: Bool       -- ^ enable prunning unsorted Refinements
   , cores                    :: Maybe Int  -- ^ number of cores used to solve constraints
+  , queryJobs                :: Int        -- ^ maximum number of a module's proof groups checked at once
   , minPartSize              :: Int        -- ^ Minimum size of a partition
   , maxPartSize              :: Int        -- ^ Maximum size of a partition. Overrides minPartSize
   , maxParams                :: Int        -- ^ the maximum number of parameters to accept when mining qualifiers
