@@ -199,7 +199,7 @@ generateConstraints initialize defaultTypes callables info obligations =
     {-# SCC "ConsGen" #-} runState act $ (initialize info){admittedInterfaces = obligationInterfaces obligations}
   where
     act = do
-        γ <- initEnv defaultTypes callables info
+        γ <- initEnv defaultTypes callables info >>= declareAdmittedNames admitted info
         checked <- consAct γ cfg info obligations
         -- Retain the callable environment after checking, including synthesized
         -- unsigned bindings. Reuse requires the source driver's corresponding
@@ -215,6 +215,32 @@ generateConstraints initialize defaultTypes callables info obligations =
             ]
     cfg = getConfig info
     groups = obligationBodies obligations
+    AdmittedInterfaces rows = obligationInterfaces obligations
+    admitted =
+        map snd callables
+            ++ [F.val ty | (_, method) <- rows, ty <- foldr (:) [] method]
+            ++ [ordinarySpecType (F.val ty) | (_, method) <- obligationMethods obligations, ty <- foldr (:) [] method]
+
+-- | Declare, by its source type alone, each local binder an admitted type names
+-- and the initial environment does not. An assumed callable's type is solved in
+-- its own group's query, whose scope (that of every member) can include
+-- binders the callable does not reach, and that solution can state facts about
+-- them; this query's proof scope need not include them. The declaration
+-- assumes nothing about the binder, whose contract stays unassumed here.
+declareAdmittedNames :: [SpecType] -> TargetInfo -> CGEnv -> CG CGEnv
+declareAdmittedNames admitted info γ =
+    globalize <$> foldM declare γ named
+  where
+    free = S.unions (F.syms <$> admitted)
+    named =
+        [ owner
+        | owner <- S.toList (S.fromList (giDefVars (giSrc info) ++ letVars (giCbs (giSrc info))))
+        , F.symbol owner `S.member` free
+        , not (F.memberSEnv (F.symbol owner) (feEnv (fenv γ)))
+        ]
+    declare env owner = do
+        t <- trueTy (typeclass (getConfig info)) (varType owner)
+        env += ("admitted name", F.symbol owner, t)
 
 consAct :: CGEnv -> Config -> TargetInfo -> ConstraintObligations -> CG CGEnv
 consAct γ cfg info obligations = do

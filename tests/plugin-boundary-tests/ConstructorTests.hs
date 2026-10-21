@@ -82,6 +82,8 @@ tests fixture compiler optimization =
                , ("plugin-boundary-tests/fixtures/tuple-pattern-bindings", "TuplePatternFalse", UnsafeAt [14])
                , ("plugin-boundary-tests/fixtures/section-scopes", "SectionScopesGood", Safe)
                , ("plugin-boundary-tests/fixtures/section-scopes", "SectionScopesFalse", UnsafeAt [13])
+               , ("plugin-boundary-tests/fixtures/assumed-scope", "AssumedScopeGood", Safe)
+               , ("plugin-boundary-tests/fixtures/assumed-scope", "AssumedScopeFalse", UnsafeAt [70])
                , ("plugin-boundary-tests/fixtures/known-instance-methods", "KnownInstanceSignedDivGood", Safe)
                , ("plugin-boundary-tests/fixtures/known-instance-methods", "KnownInstanceSignedDivFalse", UnsafeAt [21, 25, 29])
                ]
