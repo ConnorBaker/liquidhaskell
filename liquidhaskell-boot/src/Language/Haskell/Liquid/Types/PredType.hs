@@ -368,7 +368,7 @@ substPred :: String -> (RPVar, SpecProp) -> SpecType -> SpecType
 substPred msg (rp, RProp ss (RHole replacement)) target =
     substPredAtomicWith (\binder -> Just (binder, pname binder)) id id (\logical _ -> logical) meet msg rp ss replacement target
 substPred _ (rp, RProp ss (RVar a1 r1)) t@(RVar a2 r2)
-    | isPredInReft && a1 == a2 = RVar a1 $ meetListWithPSubs (thd3 <$> pargs rp) πs ss r1 r2'
+    | isPredInReft && a1 == a2 = RVar a1 $ meetListWithPSubs (thd3 <$> pargs rp) πs (propFormals rp ss) r1 r2'
     | isPredInReft = panic Nothing ("substPred RVar Var Mismatch" ++ show (a1, a2))
     | otherwise = t
   where
@@ -450,24 +450,26 @@ substRCon :: String -> (RPVar, SpecType) -> SpecType -> SpecType
 -}
 substRCon :: String -> (RPVar, SpecProp) -> SpecType -> [UsedPVar] -> UReft -> SpecType
 substRCon msg (rp, RProp ss t1@(RApp c1 ts1 rs1 r1)) t2@(RApp c2 ts2 rs2 _) πs r2'
-    | rtc_tc c1 == rtc_tc c2 = RApp c1 ts rs $ meetListWithPSubs defaults πs ss r1 r2'
+    | rtc_tc c1 == rtc_tc c2 = RApp c1 ts rs $ meetListWithPSubs defaults πs formals r1 r2'
   where
     defaults = thd3 <$> pargs rp
+    formals = propFormals rp ss
     ts = F.subst su $ safeZipWith (msg ++ ": substRCon") strSub ts1 ts2
     rs = F.subst su $ safeZipWith (msg ++ ": substRCon2") strSubR rs1' rs2'
     (rs1', rs2') = pad "substRCon" top rs1 rs2
-    strSub x r2 = meetListWithPSubs defaults πs ss x r2
-    strSubR x r2 = meetListWithPSubsRef πs ss x r2
+    strSub x r2 = meetListWithPSubs defaults πs formals x r2
+    strSubR x r2 = meetListWithPSubsRef πs formals x r2
     su = carrierBinderSubst t1 t2
 -- An application carrier instantiated with an application property conjoins
 -- the property's function, argument, and top refinement with the target's,
 -- renaming the property's binders to the target's, as for constructor
 -- applications. Other presentations of an equal carrier are refused above.
 substRCon _ (rp, RProp ss t1@(RAppTy f1 x1 r1)) t2@(RAppTy f2 x2 _) πs r2' =
-    RAppTy (F.subst su (strSub f1 f2)) (F.subst su (strSub x1 x2)) (meetListWithPSubs defaults πs ss r1 r2')
+    RAppTy (F.subst su (strSub f1 f2)) (F.subst su (strSub x1 x2)) (meetListWithPSubs defaults πs formals r1 r2')
   where
     defaults = thd3 <$> pargs rp
-    strSub x r2 = meetListWithPSubs defaults πs ss x r2
+    formals = propFormals rp ss
+    strSub x r2 = meetListWithPSubs defaults πs formals x r2
     su = carrierBinderSubst t1 t2
 substRCon msg su t _ _ = {- panic Nothing -} errorP "substRCon: " $ msg ++ " " ++ showpp (su, t)
 
