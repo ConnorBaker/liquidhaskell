@@ -52,6 +52,7 @@ module Language.Haskell.Liquid.Types.RefType (
   , symbolRTyVar, bareRTyVar
   , tyConBTyCon
   , pdVarReft
+  , propFormals
 
   -- * Substitutions
   , subts, subvPredicate, subvUReft
@@ -759,10 +760,17 @@ mkRTProp pv (RProp ss (RHole r))
   = RProp ss $ ofRSort (pvType pv) `strengthen` r
 
 mkRTProp pv (RProp ss t)
-  | length (pargs pv) == length ss
-  = RProp ss t
-  | otherwise
-  = RProp (pvArgs pv) t
+  = RProp (propFormals pv ss) t
+
+-- | The formal parameters of a property instantiating @pv@. A property lists
+-- them only when it names one for each parameter of @pv@. Otherwise its body
+-- refers to @pv@'s declared parameter names: a constructor's result type
+-- carries @rPropP [] (pdVarReft p)@ for each of its predicates, and
+-- instantiating @p@ there keeps that empty list.
+propFormals :: PVar t -> [(Symbol, t)] -> [(Symbol, t)]
+propFormals pv ss
+  | length (pargs pv) == length ss = ss
+  | otherwise = pvArgs pv
 
 pvArgs :: PVar t -> [(Symbol, t)]
 pvArgs pv = [(s, t) | (t, s, _) <- pargs pv]
