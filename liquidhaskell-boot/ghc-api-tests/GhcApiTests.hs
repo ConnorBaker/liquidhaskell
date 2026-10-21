@@ -84,6 +84,7 @@ import qualified MethodTelescopeTests
 import qualified MeasureApplicabilityTests
 import qualified LogicSupportTests
 import qualified QueryTelescopeTests
+import qualified QueryScheduleTests
 import qualified RefinementRepresentationTests
 import qualified RewriteDependencyTests
 import qualified TypeLiteralIdentityTests
@@ -108,6 +109,7 @@ testTree =
         , MethodTelescopeTests.tests compileToCore
         , LogicSupportTests.tests compileToCore
         , QueryTelescopeTests.tests compileToCore
+        , QueryScheduleTests.tests
         , FamilyPredicateTests.tests compileToCore
         , RewriteDependencyTests.tests compileToCore
         , ConstraintGenerationTests.tests compileToCore

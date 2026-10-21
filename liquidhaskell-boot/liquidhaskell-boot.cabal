@@ -58,6 +58,7 @@ library
                       Language.Haskell.Liquid.Constraint.Termination
                       Language.Haskell.Liquid.Constraint.Types
                       Language.Haskell.Liquid.Constraint.Relational
+                      Language.Haskell.Liquid.Constraint.Schedule
                       Language.Haskell.Liquid.Constraint.RewriteCase
                       Liquid.GHC.API
                       Liquid.GHC.API.Compat
@@ -226,6 +227,7 @@ test-suite ghc-api-tests
     MethodTelescopeTests
     NativeJudgmentTests
     QualifierDecompositionTests
+    QueryScheduleTests
     QueryTelescopeTests
     RefinementRepresentationTests
     SplitJudgmentTests
