@@ -35,6 +35,7 @@ import qualified Text.Printf as Printf
 import           Data.Hashable
 import Data.HashMap.Strict (HashMap)
 import qualified Data.HashMap.Strict as HM
+import qualified Data.HashSet as HS
 import GHC.Core.Coercion (isReflCo, mkAppCo, mkCoVarCo, mkSymCo)
 import GHC.Core.TyCo.Rep (Coercion (AppCo, TransCo))
 import qualified GHC.Core.Opt.Arity as Arity
@@ -92,11 +93,11 @@ normalizeTopBind γ = normalizeTopBind' γ . unfoldFromIntegral
 
 normalizeTopBind' :: AnfEnv -> Bind CoreBndr -> Ghc.DsM ([CoreBind], AnfRenamings)
 normalizeTopBind' γ (NonRec x e)
-  = do (e', state) <- runDsM $ runStateT (rememberScope γ x >> stitch γ e) (DsST [] [])
+  = do (e', state) <- runDsM $ runStateT (rememberScope γ x >> stitch γ e) (DsST [] [] mempty)
        return ([normalizeTyVars $ NonRec x e'], st_scopes state)
 
 normalizeTopBind' γ (Rec xes)
-  = do xes' <- runDsM $ execStateT (normalizeBind γ (Rec xes)) (DsST [] [])
+  = do xes' <- runDsM $ execStateT (normalizeBind γ (Rec xes)) (DsST [] [] mempty)
        return (map normalizeTyVars (st_binds xes'), st_scopes xes')
 
 normalizeTyVars :: Bind Id -> Bind Id
@@ -135,24 +136,68 @@ normalizeForAllTys e = case Core.stripTicksTopE (const True) e of
 newtype DsM a = DsM {runDsM :: Ghc.DsM a}
    deriving (Functor, Monad, MonadUnique, Applicative)
 
-data DsST = DsST { st_binds :: [CoreBind], st_scopes :: AnfRenamings }
+data DsST = DsST
+  { st_binds  :: [CoreBind]
+  , st_scopes :: AnfRenamings
+  , st_bound  :: HS.HashSet StableId
+  -- ^ The term binders already introduced in this top-level binding.
+  }
 
 type DsMW = StateT DsST DsM
 
 ------------------------------------------------------------------
-normalizeBind :: AnfEnv -> CoreBind -> DsMW ()
+normalizeBind :: AnfEnv -> CoreBind -> DsMW AnfEnv
 ------------------------------------------------------------------
 normalizeBind γ (NonRec x e)
   = do rememberScope γ x
        e' <- normalize γ e
-       add [NonRec x e']
+       (γ', x') <- bindUnique γ x
+       add [NonRec x' e']
+       return γ'
 
 normalizeBind γ (Rec xes)
   = do mapM_ (rememberScope γ) xs
-       es' <- mapM (stitch γ) es
-       add [Rec (zip xs es')]
+       (γ', xs') <- bindsUnique γ xs
+       es' <- mapM (stitch γ') es
+       add [Rec (zip xs' es')]
+       return γ'
     where
        (xs, es) = unzip xes
+
+-- | Introduce a term binder, renaming it when this top-level binding already
+-- binds the same variable.
+--
+-- GHC only requires a binder's Unique to be unique within its scope. Inlining
+-- an operator section's compulsory unfolding binds GHC's template locals, so
+-- every section in a binding reuses the same @v_B1@, @v_B2@ and @v_B3@ in
+-- disjoint scopes. Floating lets to the enclosing 'stitch' joins those scopes:
+-- @[(+ 1), (+ 2)]@ becomes one let chain binding @v_B3 = 1@ and then
+-- @v_B3 = 2@. Constraint generation names a variable by its 'F.Symbol' and
+-- keeps a shadowed binding's facts in the fixpoint environment, so the chain
+-- would assume both @v_B3 = 1@ and @v_B3 = 2@, and two sections at different
+-- sorts would give one symbol two sorts. A repeated binder therefore gets a
+-- fresh Unique, and its occurrences follow it through 'aeVarEnv'. Type and
+-- coercion variables also occur in types, which that renaming does not
+-- reach, so they keep their names.
+bindUnique :: AnfEnv -> Var -> DsMW (AnfEnv, Var)
+bindUnique γ x
+  | isTyVar x || isCoVar x
+  = return (γ, x)
+  | otherwise
+  = do bound <- gets st_bound
+       x' <- if StableId x `HS.member` bound
+               then setVarUnique x <$> lift getUniqueM
+               else return x
+       modify $ \s -> s { st_bound = HS.insert (StableId x') (st_bound s) }
+       return (if x' == x then γ else extendAnfEnv γ x x', x')
+
+bindsUnique :: AnfEnv -> [Var] -> DsMW (AnfEnv, [Var])
+bindsUnique γ []
+  = return (γ, [])
+bindsUnique γ (x : xs)
+  = do (γ', x') <- bindUnique γ x
+       (γ'', xs') <- bindsUnique γ' xs
+       return (γ'', x' : xs')
 
 --------------------------------------------------------------------
 normalizeName :: AnfEnv -> CoreExpr -> DsMW CoreExpr
@@ -224,12 +269,13 @@ normalize γ e
 -- Type lambdas scope local bindings just as value lambdas do: a helper's
 -- type may mention the bound variable even when its body has no value use.
 normalize γ (Lam x e)
-  = do e' <- stitch γ e
-       return $ Lam x e'
+  = do (γ', x') <- bindUnique γ x
+       e' <- stitch γ' e
+       return $ Lam x' e'
 
 normalize γ (Let b e)
-  = do normalizeBind γ b
-       normalize γ e
+  = do γ' <- normalizeBind γ b
+       normalize γ' e
        -- Need to float bindings all the way up to the top
        -- Due to GHCs odd let-bindings (see tests/pos/lets.hs)
 
@@ -238,7 +284,9 @@ normalize γ (Case e x t as) =
     n <- normalizeName γ e
     x' <- lift $ freshNormalVar γ τx -- rename "wild" to avoid shadowing
     let γ' = extendAnfEnv γ x x'
-    as' <- forM (map (renameEvidence x') as) $ \(Alt c xs e') -> fmap (Alt c xs) (stitch (incrCaseDepth c γ') e')
+    as' <- forM (map (renameEvidence x') as) $ \(Alt c xs e') -> do
+      (γ'', xs') <- bindsUnique γ' xs
+      Alt c xs' <$> stitch (incrCaseDepth c γ'') e'
     as'' <- lift $ expandDefaultCase γ τx as'
     return $ Case n x' t as''
  where
