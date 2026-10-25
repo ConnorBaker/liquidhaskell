@@ -14,6 +14,7 @@ import qualified QueryJobsTests
 import qualified SourceImportTests
 import qualified SourceJudgmentTests
 import qualified StructuralRecursionTests
+import qualified TextDecodingTests
 import Test.Tasty (defaultMain, testGroup, withResource)
 
 main :: IO ()
@@ -33,6 +34,7 @@ main = defaultMain $
                 , SourceJudgmentTests.tests getDataFileName compiler optimization
                 , SourceImportTests.tests compiler optimization
                 , StructuralRecursionTests.tests getDataFileName compiler optimization
+                , TextDecodingTests.tests getDataFileName compiler optimization
                 , OpaqueIdentityTests.tests compiler optimization
                 , QueryJobsTests.tests getDataFileName compiler optimization
                 ]

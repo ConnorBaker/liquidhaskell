@@ -99,22 +99,33 @@ assume Data.Text.null
 -- replaces both take 3. unsafeWrite (Data/Text/Internal/Unsafe/Char.hs:57-85)
 -- writes the standard UTF-8 encoding of the non-surrogate scalar, so the
 -- result is one valid scalar.
--- The contract states those cases over the logical Char ordering; it relies on
--- no Char range fact, since its byte-width and replacement cases are
--- exhaustive over every ordinal, including ones no Char has.
--- Data/Text/Internal.hs:89-103 implements append by returning an operand when
+-- The contract states those cases over the logical Char ordering. They cover
+-- every ordinal, but they are true only for code points: it rests on the
+-- premise above that c is in [0, 0x10FFFF]. A Char forged with unsafeChr
+-- breaks it; for 0x20D800, safe's mask, which ignores bits above 2^21, gives
+-- U+FFFD, so singleton writes three bytes (Show.hs:164-170) with head U+FFFD,
+-- where the contract states four bytes and thead t == c.
+-- Data/Text/Internal.hs:97-111 implements append by returning an operand when
 -- the other is empty, otherwise allocating the byte sum and copying both
 -- bounded slices. The dependent bound excludes its size-overflow branch.
 -- text-2.1.3 Data/Text/Internal.hs:245-272 implements pack by writing each
 -- sanitized character (safe) as UTF-8 into a growing buffer, then shrinking
 -- it to the bytes written; pack [] is empty. Its result is bounded and valid.
+-- singleton (Data/Text/Show.hs:157-171) and append (Data/Text/Internal.hs:97-111)
+-- are also opaque reflections, as encodeUtf8 and sizeofByteArray are: each
+-- result is the function's own uninterpreted application, so equal arguments
+-- give equal results and nothing else is known. That names the order of a
+-- composition without a content equation: append a b and append b a are
+-- different terms.
 -- The owners here are NOINLINE (pack until phase 0): these contracts state the
 -- functions' own definitions, not the literal rules in Data/Text/Show.hs:145-155 that
 -- replace pack on literals, and grant no validity to unchecked addresses.
 {-@
+opaque-reflect Data.Text.singleton
+
 assume Data.Text.singleton
   :: c:Char
-  -> {t:Text | tvalid t && tlen t == 1
+  -> {t:Text | t == Data.Text.singleton c && tvalid t && tlen t == 1
        && ((c < (lit "128" Char)) => tbytes t == 1)
        && (((lit "128" Char) <= c && c < (lit "2048" Char)) => tbytes t == 2)
        && (((lit "2048" Char) <= c && c < (lit "65536" Char)) => tbytes t == 3)
@@ -124,11 +135,14 @@ assume Data.Text.singleton
 
 assume Data.Text.pack :: String -> {t:Text | tvalid t}
 
+opaque-reflect Data.Text.append
+
 assume Data.Text.append
   :: x:{Text | tvalid x}
   -> y:{Text | tvalid y && tbytes y <= TextMaxInt - tbytes x}
-  -> {t:Text | tvalid t && tbytes t == tbytes x + tbytes y
-                        && tlen t == tlen x + tlen y}
+  -> {t:Text | t == Data.Text.append x y
+                && tvalid t && tbytes t == tbytes x + tbytes y
+                && tlen t == tlen x + tlen y}
 @-}
 
 -- Text's Ord instance inherits the base defaults: min/max return an original
