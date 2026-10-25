@@ -9,6 +9,7 @@ import qualified NativeJudgmentTests
 import qualified OpaqueIdentityTests
 import Paths_tests (getDataFileName)
 import qualified PublicationTests
+import qualified PublishedDataDeclTests
 import qualified QueryJobsTests
 import qualified SourceImportTests
 import qualified SourceJudgmentTests
@@ -28,6 +29,7 @@ main = defaultMain $
                 , ImportedBodyTests.tests getDataFileName compiler optimization
                 , NativeJudgmentTests.tests compiler optimization
                 , PublicationTests.tests getDataFileName compiler optimization
+                , PublishedDataDeclTests.tests getDataFileName compiler optimization
                 , SourceJudgmentTests.tests getDataFileName compiler optimization
                 , SourceImportTests.tests compiler optimization
                 , StructuralRecursionTests.tests getDataFileName compiler optimization

@@ -10,6 +10,7 @@ module CompilerFixture (
     copyFixture,
     writeFixture,
     compile,
+    compileSession,
     compileHaskell,
     transcript,
     assertMissingTotalityPolicy,
@@ -203,6 +204,46 @@ fixtureArguments packageArguments unit checking optimization backend objects nam
                 InterfaceOnly -> []
            )
         ++ ["-ohi", objects </> name ++ ".hi", name ++ ".hs"]
+
+-- Several fixture modules checked in ONE `ghc --make` session (an importer sees
+-- its dependency's names as GHC created them in that session, not as loaded from
+-- an interface), each expected SAFE. Outputs go to the directory's objects/.
+compileSession :: Compiler -> CheckingMode -> Optimization -> FilePath -> [String] -> IO ()
+compileSession (Compiler ghc unit environment packageArguments) checking optimization directory names = do
+    let objects = directory </> "objects"
+        arguments =
+            packageArguments
+                ++ [ "--make"
+                   , "-no-link"
+                   , "-" ++ show optimization
+                   , "-fforce-recomp"
+                   , "-XGHC2024"
+                   , "-no-user-package-db"
+                   , "-hide-package"
+                   , "liquidhaskell"
+                   , "-plugin-package-id"
+                   , unit
+                   , "-fplugin=LiquidHaskell"
+                   , "-fdiagnostics-color=never"
+                   , "-tmpdir"
+                   , objects
+                   , "-odir"
+                   , objects
+                   , "-hidir"
+                   , objects
+                   , "-i"
+                   , "-i."
+                   ]
+                ++ map ("-fplugin-opt=LiquidHaskell:" ++) (checkingOptions checking)
+                ++ map (++ ".hs") names
+    createDirectoryIfMissing True objects
+    (status, output) <- command environment (Just directory) ghc arguments
+    let context = takeFileName directory ++ " / " ++ unwords names ++ " / " ++ show optimization ++ "\n" ++ output
+        safe = [line | line <- lines output, "LIQUID: SAFE" `isInfixOf` line]
+    assertBool context (status == ExitSuccess)
+    assertBool context (null [line | line <- lines output, ": error:" `isInfixOf` line])
+    assertBool context (length safe == length names)
+    assertBool context (not ("panic" `isInfixOf` map toLower output))
 
 -- The exit status and transcript of the same compilation as 'compile', with
 -- further compiler arguments (e.g. RTS options) and no verdict expectation.
