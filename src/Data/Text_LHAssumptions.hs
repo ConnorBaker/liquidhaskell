@@ -9,7 +9,7 @@ module Data.Text_LHAssumptions where
 
 import Data.Maybe_LHAssumptions ()
 import Data.Primitive.ByteArray (ByteArray, sizeofByteArray)
-import Data.Text (Text, append, breakOn, breakOnEnd, count, drop, empty, length, null, pack, singleton, span, split, splitOn, strip, stripPrefix, stripSuffix, toCaseFold, uncons)
+import Data.Text (Text, append, breakOn, breakOnEnd, count, drop, empty, length, null, pack, singleton, span, split, splitOn, strip, stripPrefix, stripSuffix, toCaseFold, toLower, uncons)
 import qualified Data.Text.Internal
 import qualified Data.Text.Unsafe
 import Data.Tuple_LHAssumptions ()
@@ -285,6 +285,11 @@ assume Data.Text.split
 -- case folding. The result is valid; it may hold more scalars and a different
 -- number of bytes than the input, so no length relation is stated.
 --
+-- toLower (908-912) is the same shape: empty for empty input, and otherwise
+-- caseConvert with lowerMapping (Internal/Transformation.hs:170-171) in place
+-- of foldMapping. Its result is likewise valid, with no length relation, and
+-- nothing relates its content to the input's.
+--
 -- count (1864-1869) raises emptyError on an empty pattern (null compares the
 -- stored byte length). A one-scalar pattern is counted by countChar, which
 -- streams t; longer patterns by the length of the indices list
@@ -306,6 +311,8 @@ assume Data.Text.stripSuffix
                         (tvalid r && tlen r == tlen t - tlen p))}
 
 assume Data.Text.toCaseFold :: t:{Text | tvalid t} -> {v:Text | tvalid v}
+
+assume Data.Text.toLower :: t:{Text | tvalid t} -> {v:Text | tvalid v}
 
 assume Data.Text.count
   :: pat:{Text | tvalid pat && 0 < tbytes pat}
