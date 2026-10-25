@@ -418,7 +418,16 @@ makeGhcSpec0 boxes stratNames cfg ghcTyLookupEnv tcg instEnvs lenv localVars src
                     ++ [ (lhNameToResolvedSymbol $ reflectGHCName thisModule $ Ghc.getName v, F.sr_sort $ Bare.varSortedReft embs v)
                        | v <- gsReflects refl
                        ]
-              , dataDecls = Bare.dataDeclSize mySpec $ dataDecls mySpec
+              , -- A module that reflects over another module's type re-derives
+                -- its data declaration (DataReflected) from GHC names, which
+                -- carry positions only when that module was compiled in the same
+                -- session. Publishing it gives a consumer that also sees the
+                -- defining module's declaration a second set of generated
+                -- checkers and selectors at another position ("Multiple
+                -- measures"). Consumers get those measures from
+                -- exportMeasureClosure, so only this module's own types' derived
+                -- declarations are published; authored ones are unchanged.
+                dataDecls = Bare.dataDeclSize mySpec $ filter (not . rederived) (dataDecls mySpec)
               , -- Placing mySpec at the end causes local measures to take precedence over
                 -- imported measures when their names clash.
                 measures =
@@ -490,6 +499,9 @@ makeGhcSpec0 boxes stratNames cfg ghcTyLookupEnv tcg instEnvs lenv localVars src
           ("Conflicting interpreted sorts for" <+> F.pprint symbol) :: UserError)
     thisModule = Ghc.tcg_mod tcg
     expandedAliasesOf myRTE fld = Mb.mapMaybe ((`M.lookup` fld myRTE) . val . rtName)
+    rederived d =
+      tycKind d == DataReflected
+        && not (isLocalLHName thisModule (val (dataNameSymbol (tycName d))))
 
     -- typeclass elaboration
 
@@ -2187,7 +2199,7 @@ makeLiftedSpec name src env refl sData sig qual myRTE lSpec0 = lSpec0
   , Ms.qualifiers = filter (isLocInFile srcF) (gsQualifiers qual)
   }
   where
-    myDCs         = filter (isLocalName . val . fst)
+    myDCs         = filter (isLocalLHName (Ghc.tcg_mod (Bare.reTcGblEnv env)) . val . fst)
       [toBare (v,t) | (v,t) <- gsCtors sData, Just dc <- [Ghc.isDataConId_maybe v]
                    , v == Ghc.dataConWrapId dc
                    , isExportedVar (toTargetSrc src) (Ghc.dataConWorkId dc)]
@@ -2200,11 +2212,13 @@ makeLiftedSpec name src env refl sData sig qual myRTE lSpec0 = lSpec0
     reflVars      = S.fromList (fst <$> reflTySigs)
     srcF          = _giTarget src
 
-    isLocalName = \case
-      LHNResolved (LHRGHC n) _ ->
-        Just (Ghc.tcg_mod (Bare.reTcGblEnv env)) == Ghc.nameModule_maybe n
-      _ ->
-        False
+-- | Whether a resolved name is a GHC name the given module defines.
+isLocalLHName :: Ghc.Module -> LHName -> Bool
+isLocalLHName thisModule = \case
+  LHNResolved (LHRGHC n) _ ->
+    Just thisModule == Ghc.nameModule_maybe n
+  _ ->
+    False
 
 -- Preserve the actual local measure's admissible input at the final export
 -- assignment. Imported definitions keep their already retained input domains.

@@ -2911,6 +2911,7 @@ test-suite plugin-boundary-tests
     OpaqueIdentityTests
     Paths_tests
     PublicationTests
+    PublishedDataDeclTests
     QueryAssertions
     QueryJobsTests
     SourceJudgmentTests
