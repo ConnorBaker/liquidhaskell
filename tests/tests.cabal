@@ -2918,6 +2918,7 @@ test-suite plugin-boundary-tests
     SourceImportTests
     SourceVariantFixtures
     StructuralRecursionTests
+    TextDecodingTests
 
   autogen-modules: Paths_tests
   build-depends:
