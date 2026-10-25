@@ -41,6 +41,9 @@ data Backend = ObjectCode | InterfaceOnly deriving (Show)
 data Expectation
     = Safe
     | UnsafeAt [Int]
+    | -- A mismatch at each line whose required type contains the text. A
+      -- callable-domain failure and a result failure can share a line.
+      UnsafeRequiring [(Int, String)]
     | TerminationAt [Int]
     | TerminationCheckAt [Int]
     | FailureAt [Int]
@@ -135,6 +138,16 @@ compile (Compiler ghc unit environment packageArguments) checking optimization b
                     emitted <- doesFileExist (objects </> name ++ ".o")
                     assertBool (context ++ "\ninterface-only compilation emitted object code") (not emitted)
         UnsafeAt owners -> unsafeResult owners "Liquid Type Mismatch"
+        UnsafeRequiring required -> do
+            unsafeResult (map fst required) "Liquid Type Mismatch"
+            let blocks = [line : takeWhile (not . isInfixOf ": error:") rest | line : rest <- tails (lines output), ": error:" `isInfixOf` line]
+                requiredAt owner =
+                    [ unwords (concatMap words (takeWhile ((/= ["."]) . words) (drop 1 (dropWhile (not . isInfixOf "required type") block))))
+                    | block@(header : _) <- blocks
+                    , Just location <- [after (name ++ ".hs:") header]
+                    , readMaybe (takeWhile isDigit location) == Just owner
+                    ]
+            mapM_ (\(owner, text) -> assertBool (context ++ "\nno required type at line " ++ show owner ++ " contains " ++ show text) (any (isInfixOf text) (requiredAt owner))) required
         TerminationAt owners -> unsafeResult owners "Termination Error"
         TerminationCheckAt owners -> unsafeResult owners "Termination Check"
         FailureAt owners -> unsafeResult owners "Failure Error"
