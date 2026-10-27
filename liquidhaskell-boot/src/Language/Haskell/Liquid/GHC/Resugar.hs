@@ -102,6 +102,7 @@ lift e = exprArgs e (collectArgs e)
 exprArgs :: CoreExpr -> (CoreExpr, [CoreExpr]) -> Maybe Pattern
 exprArgs _e (Var op, [Type m, d, Type a, Type b, e1, Lam x e2])
   | op `is` Ghc.bindMName
+  , isIO m
   = Just (PatBind e1 x e2 m d a b op)
 
 exprArgs (Case (Var xe) x t [Alt (DataAlt c) ys (Var y)]) _
@@ -140,6 +141,15 @@ exprArgs _ _
 
 is :: Var -> Name -> Bool
 is v n = n == getName v
+
+-- | The bind rule types an @IO@ bind as @IO@ of @e2@'s result (consPattern).
+--   That typing has no place for a monad's other arguments (@Either@'s @Left@,
+--   @State@'s state), and checkMonad refuses a list's abstract refinement, so
+--   every other bind takes the ordinary application rule. @IO@ is matched by
+--   its tycon's 'Name', on the monad: a synonym of @IO@ matches, a newtype or
+--   transformer over @IO@ does not.
+isIO :: Type -> Bool
+isIO m = maybe False ((== Ghc.ioTyConName) . getName) (Ghc.tyConAppTyCon_maybe m)
 
 --------------------------------------------------------------------------------
 -- | Lower patterns back into expressions --------------------------------------

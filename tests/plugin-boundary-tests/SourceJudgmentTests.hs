@@ -949,6 +949,33 @@ tests fixture compiler optimization =
                 , ("RecursiveProjectionClaim", TerminationCheckAt [10])
                 ]
             )
+        ,
+            ( "monadic-bind"
+            , []
+            ,
+                [ -- Outside IO a bind takes the ordinary application rule, so
+                  -- the bound action's Left and state reach the result.
+                  ("BindEitherLeftFalse", UnsafeAt [7])
+                , ("BindEitherGood", Safe)
+                , ("BindStateFalse", UnsafeAt [8])
+                , ("BindStateGood", Safe)
+                , ("BindResFalse", UnsafeAt [31])
+                , ("BindListGood", Safe)
+                , -- IO is matched by its tycon, on the monad, not the bound value.
+                  ("BindFakeIOFalse", UnsafeAt [24])
+                , ("BindWrongArgFalse", UnsafeAt [9])
+                , ("BindStateTIOFalse", UnsafeAt [8])
+                , -- An IO bind is IO of e2's result: e2 is checked against it,
+                  -- the action itself is unrefined, and the result cannot name x.
+                  ("BindIOGood", Safe)
+                , ("BindIOFalse", UnsafeAt [10])
+                , ("BindIOOuter", UnsafeAt [25, 30, 37, 44])
+                , ("BindIOLocalGood", Safe)
+                , ("BindIODepGood", Safe)
+                , ("BindIODepFalse", UnsafeAt [14])
+                , ("BindIOLetTwice", UnsafeAt [24])
+                ]
+            )
         ]
 
 importedByteProducer :: String

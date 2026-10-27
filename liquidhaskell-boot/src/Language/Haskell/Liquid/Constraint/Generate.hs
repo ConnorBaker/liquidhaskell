@@ -1748,18 +1748,26 @@ getExprDict γ           =  go
 --------------------------------------------------------------------------------
 consPattern :: CGEnv -> Rs.Pattern -> Type -> CG SpecType
 
-{- [NOTE] special type rule for monadic-bind application
+{- [NOTE] special type rule for monadic-bind application (IO only, see Rs.lift)
 
-    G |- e1 ~> m tx     G, x:tx |- e2 ~> m t
-    -----------------------------------------
-          G |- (e1 >>= \x -> e2) ~> m t
+    G |- e1 ~> IO tx     G, x:tx |- e2 <: IO t     t fresh, well-formed in G
+    -------------------------------------------------------------------------
+                       G |- (e1 >>= \x -> e2) ~> IO t
  -}
 
-consPattern γ (Rs.PatBind e1 x e2 _ _ _ _ _) _ = do
+consPattern γ (Rs.PatBind e1 x e2 m _ _ b _) t = do
   tx <- checkMonad (msg, e1) γ <$> consE γ e1
   γ' <- γ += ("consPattern", F.symbol x, tx)
   addIdA x (AnnDef tx)
-  consE γ' e2
+  -- The result template cannot name x, and the action gets no refinement:
+  -- e1 runs before e2, so e2's own outer refinement need not hold of the bind.
+  tb <- freshTyType (typeclass (getConfig γ)) LetE e2 b
+  mt <- trueTy (typeclass (getConfig γ)) m
+  tt <- trueTy (typeclass (getConfig γ)) t
+  let tr = mkRAppTy mt tb tt
+  addW $ WfC γ tr
+  cconsE γ' e2 tr
+  return tr
   where
     msg = "This expression has a refined monadic type; run with --no-pattern-inline: "
 

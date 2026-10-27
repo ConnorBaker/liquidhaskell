@@ -185,6 +185,7 @@ import GHC.Builtin.Names              as Ghc
     , fractionalClassKeys
     , getUnique
     , hasKey
+    , ioTyConName
     , isStringClassName
     , itName
     , le_RDR
